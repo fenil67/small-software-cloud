@@ -1,0 +1,29 @@
+# Railway config for apps/api (Node/Express)
+# Docs: https://docs.railway.com/reference/config-as-code
+#
+# Note: Railway config-as-code is deprecated in favour of IaC as of 2026.
+# This file keeps working until 2026-12-01. Migrate when Railway's IaC
+# supports per-service deploy settings equivalently.
+#
+# IMPORTANT (monorepo): Railway does NOT auto-find this file when root directory
+# is set to /apps/api. In the service Settings → Config file path, set it to:
+#   /apps/api/railway.toml
+#
+# Railway reads this AFTER applying the root directory setting, so all paths
+# here are relative to apps/api/ (the service root).
+
+[build]
+# pnpm install reads apps/api/pnpm-lock.yaml (standalone lockfile, not root)
+buildCommand = "pnpm install --frozen-lockfile && pnpm run build"
+
+[deploy]
+# migrate runs after build, before the server starts; exits non-zero on failure
+# which halts the deployment — exactly what we want
+preDeployCommand = ["node dist/db/migrate.js"]
+startCommand    = "node dist/index.js"
+
+healthcheckPath    = "/health"
+healthcheckTimeout = 120   # seconds; migrations on a fresh DB can be slow
+
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 3

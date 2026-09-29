@@ -1,0 +1,28 @@
+# Railway config for apps/web (Next.js 16)
+# Docs: https://docs.railway.com/reference/config-as-code
+#
+# Note: Railway config-as-code is deprecated in favour of IaC as of 2026.
+# This file keeps working until 2026-12-01.
+#
+# IMPORTANT (monorepo): In the service Settings → Config file path, set it to:
+#   /apps/web/railway.toml
+#
+# No pre-deploy step needed for web — Clerk and env vars are baked in at
+# build time; there is no database migration for this service.
+
+[build]
+# NODE_ENV is force-set to "production" for the next build step only.
+# pnpm (unlike npm/yarn) does NOT skip devDependencies when NODE_ENV=production,
+# so install is safe. The override prevents Railway from passing a non-standard
+# environment name (e.g. "staging") that triggers Next.js's NODE_ENV warning
+# and can cause subtle prerender failures.
+buildCommand = "pnpm install --frozen-lockfile && NODE_ENV=production pnpm run build"
+
+[deploy]
+startCommand = "pnpm run start"
+
+healthcheckPath    = "/"
+healthcheckTimeout = 60
+
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 3
