@@ -13,7 +13,8 @@ import { deployStreamRouter } from "./routes/deployStream";
 import { deploymentsRouter } from "./routes/deployments";
 
 const app = express();
-const PORT = process.env.API_PORT ? parseInt(process.env.API_PORT) : 4000;
+// Railway injects PORT; API_PORT is the local-dev fallback
+const PORT = parseInt(process.env.PORT ?? process.env.API_PORT ?? "4000");
 
 // ─── Security & logging ──────────────────────────────────────────────────────
 app.use(helmet());
