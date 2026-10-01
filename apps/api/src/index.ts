@@ -8,6 +8,9 @@ import { clerkMiddleware } from "@clerk/express";
 import { healthRouter } from "./routes/health";
 import { appsRouter } from "./routes/apps";
 import { orgsRouter } from "./routes/orgs";
+import { intakeRouter } from "./routes/intake";
+import { deployStreamRouter } from "./routes/deployStream";
+import { deploymentsRouter } from "./routes/deployments";
 
 const app = express();
 const PORT = process.env.API_PORT ? parseInt(process.env.API_PORT) : 4000;
@@ -30,6 +33,9 @@ app.use(clerkMiddleware());
 app.use("/health", healthRouter);
 app.use("/v1/apps", appsRouter);
 app.use("/v1/orgs", orgsRouter);
+app.use("/v1/deployments/intake", intakeRouter);
+app.use("/v1/deployments", deployStreamRouter);
+app.use("/v1/deployments", deploymentsRouter);
 
 // ─── 404 fallback ────────────────────────────────────────────────────────────
 app.use((_req, res) => {

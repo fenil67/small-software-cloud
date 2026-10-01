@@ -13,8 +13,9 @@
 # here are relative to apps/api/ (the service root).
 
 [build]
-# pnpm install reads apps/api/pnpm-lock.yaml (standalone lockfile, not root)
-buildCommand = "pnpm install --frozen-lockfile && pnpm run build"
+# Use the Dockerfile in apps/api/ — needed so flyctl + git are available at runtime
+builder        = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 # migrate runs after build, before the server starts; exits non-zero on failure
