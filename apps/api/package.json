@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "migrate": "node dist/db/migrate.js",
-    "migrate:dev": "tsx src/db/migrate.ts"
+    "migrate:dev": "tsx src/db/migrate.ts",
+    "get-token": "tsx scripts/get-test-token.ts"
   },
   "dependencies": {
     "@clerk/express": "^2.0.0",

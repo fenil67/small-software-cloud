@@ -15,9 +15,115 @@ import { Router, Request, Response } from "express";
 import multer from "multer";
 import { getAuth } from "@clerk/express";
 import { clerkClient } from "@clerk/express";
+import axios from "axios";
 import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
 import { runDeploy } from "../services/deployRunner";
+
+// ─── Error helpers ────────────────────────────────────────────────────────────
+
+type IntakeErrorCode =
+  | "clerk_api_error"
+  | "db_error"
+  | "fly_api_error"
+  | "internal_error";
+
+interface IntakeError {
+  code: IntakeErrorCode;
+  message: string;
+  /** HTTP status code to reply with */
+  status: number;
+  /** Raw upstream detail for server-side logging only */
+  detail?: unknown;
+}
+
+/**
+ * Classify a thrown value into a structured IntakeError.
+ * Covers:
+ *   - Clerk SDK errors (wrapped Axios internally)
+ *   - Fly Machines API errors (direct Axios calls)
+ *   - node-postgres errors (ERR_INVALID_URL, connection refused, constraint violations)
+ *   - Generic Error
+ */
+function classifyError(err: unknown, step: string): IntakeError {
+  // Axios error (Fly API or Clerk HTTP layer)
+  if (axios.isAxiosError(err)) {
+    const status = err.response?.status;
+    const body = err.response?.data;
+    const bodyMsg =
+      typeof body === "object" && body !== null
+        ? (body as Record<string, unknown>).error ??
+          (body as Record<string, unknown>).message ??
+          JSON.stringify(body)
+        : String(body ?? err.message);
+
+    if (step.startsWith("clerk")) {
+      return {
+        code: "clerk_api_error",
+        message: `Clerk API error in ${step}: ${status} ${bodyMsg}`,
+        status: 502,
+        detail: body,
+      };
+    }
+    return {
+      code: "fly_api_error",
+      message: `Fly API error in ${step}: ${status} ${bodyMsg}`,
+      status: 502,
+      detail: body,
+    };
+  }
+
+  if (err instanceof Error) {
+    const msg = err.message;
+
+    // pg / pg-connection-string URL parse failure
+    if ((err as NodeJS.ErrnoException).code === "ERR_INVALID_URL") {
+      return {
+        code: "db_error",
+        message: `DATABASE_URL is malformed — check the format (postgres://user:pass@host:port/dbname with no extra colon before the path)`,
+        status: 500,
+        detail: msg,
+      };
+    }
+
+    // pg ECONNREFUSED / ENOTFOUND
+    if (msg.includes("ECONNREFUSED") || msg.includes("ENOTFOUND") || msg.includes("connect ETIMEDOUT")) {
+      return {
+        code: "db_error",
+        message: `Database unreachable in ${step}: ${msg}`,
+        status: 500,
+        detail: msg,
+      };
+    }
+
+    // pg constraint violations (23xxx class)
+    if ("code" in err && typeof (err as Record<string, unknown>).code === "string") {
+      const pgCode = (err as Record<string, unknown>).code as string;
+      if (pgCode.startsWith("23")) {
+        return {
+          code: "db_error",
+          message: `Database constraint violation in ${step}: ${msg}`,
+          status: 409,
+          detail: msg,
+        };
+      }
+    }
+
+    return {
+      code: "internal_error",
+      message: `Unexpected error in ${step}: ${msg}`,
+      status: 500,
+      detail: msg,
+    };
+  }
+
+  return {
+    code: "internal_error",
+    message: `Unknown error in ${step}`,
+    status: 500,
+    detail: String(err),
+  };
+}
 
 export const intakeRouter = Router();
 intakeRouter.use(requireAuth);
@@ -121,10 +227,25 @@ intakeRouter.post(
       return;
     }
 
+    let internalUserId: string, internalOrgId: string;
     try {
-      const internalUserId = await ensureUser(userId);
-      const internalOrgId = await ensureOrg(orgId);
+      internalUserId = await ensureUser(userId);
+    } catch (err) {
+      const e = classifyError(err, "clerk.getUser");
+      console.error("[intake/zip] ensureUser failed:", e.message, e.detail ?? "");
+      res.status(e.status).json({ error: e.code, message: e.message });
+      return;
+    }
+    try {
+      internalOrgId = await ensureOrg(orgId);
+    } catch (err) {
+      const e = classifyError(err, "clerk.getOrganization");
+      console.error("[intake/zip] ensureOrg failed:", e.message, e.detail ?? "");
+      res.status(e.status).json({ error: e.code, message: e.message });
+      return;
+    }
 
+    try {
       const appName: string = (req.body.app_name as string | undefined) ?? `app-${randomSlug()}`;
       const { appId, deploymentId } = await createAppAndDeployment(
         internalOrgId,
@@ -146,8 +267,9 @@ intakeRouter.post(
         stream_url: `/v1/deployments/${deploymentId}/stream`,
       });
     } catch (err) {
-      console.error("[intake/zip]", err);
-      res.status(500).json({ error: "internal_error" });
+      const e = classifyError(err, "createAppAndDeployment");
+      console.error("[intake/zip] DB transaction failed:", e.message, e.detail ?? "");
+      res.status(e.status).json({ error: e.code, message: e.message });
     }
   }
 );
@@ -177,10 +299,25 @@ intakeRouter.post("/github", async (req: Request, res: Response) => {
     return;
   }
 
+  let internalUserId: string, internalOrgId: string;
   try {
-    const internalUserId = await ensureUser(userId);
-    const internalOrgId = await ensureOrg(orgId);
+    internalUserId = await ensureUser(userId);
+  } catch (err) {
+    const e = classifyError(err, "clerk.getUser");
+    console.error("[intake/github] ensureUser failed:", e.message, e.detail ?? "");
+    res.status(e.status).json({ error: e.code, message: e.message });
+    return;
+  }
+  try {
+    internalOrgId = await ensureOrg(orgId);
+  } catch (err) {
+    const e = classifyError(err, "clerk.getOrganization");
+    console.error("[intake/github] ensureOrg failed:", e.message, e.detail ?? "");
+    res.status(e.status).json({ error: e.code, message: e.message });
+    return;
+  }
 
+  try {
     const repoName = github_url.split("/").pop()?.replace(/\.git$/, "") ?? "app";
     const finalName = app_name ?? `${repoName}-${randomSlug()}`;
 
@@ -202,7 +339,8 @@ intakeRouter.post("/github", async (req: Request, res: Response) => {
       stream_url: `/v1/deployments/${deploymentId}/stream`,
     });
   } catch (err) {
-    console.error("[intake/github]", err);
-    res.status(500).json({ error: "internal_error" });
+    const e = classifyError(err, "createAppAndDeployment");
+    console.error("[intake/github] DB transaction failed:", e.message, e.detail ?? "");
+    res.status(e.status).json({ error: e.code, message: e.message });
   }
 });

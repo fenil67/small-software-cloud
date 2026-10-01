@@ -23,7 +23,7 @@ primary_region = "ord"
   force_https = true
   auto_stop_machines = "suspend"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
 [[vm]]
   memory = "256mb"
@@ -40,7 +40,10 @@ function nodeDockerfile(pm: "npm" | "pnpm" | "yarn", startCmd: string): string {
       ? "RUN npm install -g pnpm && pnpm install --frozen-lockfile"
       : pm === "yarn"
       ? "RUN yarn install --frozen-lockfile"
-      : "RUN npm ci --omit=dev || npm install";
+      // npm ci requires a lockfile; use it when one was committed, otherwise
+      // fall back to npm install. The lockfile presence determines pm="npm"
+      // detection, so check at build time by testing for package-lock.json.
+      : "RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi";
 
   return `FROM node:20-alpine
 WORKDIR /app

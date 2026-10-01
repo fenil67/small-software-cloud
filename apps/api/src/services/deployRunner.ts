@@ -107,7 +107,7 @@ async function runFlyctlDeploy(
   appName: string,
   deploymentId: string
 ): Promise<void> {
-  log(deploymentId, `Running flyctl deploy --remote-only --app ${appName}…`);
+  log(deploymentId, `Running flyctl deploy --remote-only --ha=false --app ${appName}…`);
 
   const env = {
     ...process.env,
@@ -119,7 +119,10 @@ async function runFlyctlDeploy(
   await new Promise<void>((resolve, reject) => {
     const proc = spawn(
       "flyctl",
-      ["deploy", "--remote-only", "--app", appName, "--yes"],
+      // --ha=false: deploy exactly one machine; without this Fly creates a second
+      //             machine for high-availability by default, doubling costs.
+      // --yes: accept any prompts non-interactively (same as CI=true but explicit)
+      ["deploy", "--remote-only", "--ha=false", "--app", appName, "--yes"],
       { cwd: codeDir, stdio: ["ignore", "pipe", "pipe"], env }
     );
 
