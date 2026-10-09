@@ -1,9 +1,40 @@
 import "dotenv/config";
+import { execFileSync } from "child_process";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import { clerkMiddleware } from "@clerk/express";
+
+// ─── Startup checks ──────────────────────────────────────────────────────────
+// Crash loudly at boot if required env vars or binaries are missing rather
+// than failing silently on the first deploy request.
+(function startupChecks() {
+  // Required env vars — check presence only, never log values
+  const requiredEnv = ["FLY_API_TOKEN", "FLY_ORG_SLUG"];
+  for (const key of requiredEnv) {
+    if (!process.env[key]) {
+      console.error(`[startup] FATAL: env var "${key}" is unset or empty.`);
+      process.exit(1);
+    }
+  }
+
+  // Required binaries
+  const required: { bin: string; args: string[] }[] = [
+    { bin: "flyctl", args: ["version"] },
+    { bin: "git",    args: ["--version"] },
+  ];
+
+  for (const { bin, args } of required) {
+    try {
+      const out = execFileSync(bin, args, { encoding: "utf8" }).trim();
+      console.log(`[startup] ${bin}: ${out.split("\n")[0]}`);
+    } catch {
+      console.error(`[startup] FATAL: "${bin}" not found or failed to run. Is it installed in this image?`);
+      process.exit(1);
+    }
+  }
+})();
 
 import { healthRouter } from "./routes/health";
 import { appsRouter } from "./routes/apps";

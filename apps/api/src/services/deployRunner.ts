@@ -86,6 +86,11 @@ async function cloneRepo(githubUrl: string, deploymentId: string): Promise<strin
     });
     proc.stdout.on("data", (d: Buffer) => log(deploymentId, d.toString().trim()));
     proc.stderr.on("data", (d: Buffer) => log(deploymentId, d.toString().trim()));
+    // "error" fires (before "close") when the binary is missing (ENOENT) or
+    // spawn otherwise fails at the OS level. Without this handler the event is
+    // unhandled, throws outside the Promise, and the catch block in runDeploy
+    // never runs — leaving the SSE stream stuck on keep-alive pings forever.
+    proc.on("error", reject);
     proc.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`git clone exited with code ${code}`));
@@ -142,6 +147,9 @@ async function runFlyctlDeploy(
         .forEach((line) => log(deploymentId, line));
     });
 
+    // Same as cloneRepo: without this, ENOENT escapes the Promise and the
+    // catch block never fires, leaving the SSE stream silent indefinitely.
+    proc.on("error", reject);
     proc.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`flyctl deploy exited with code ${code}`));

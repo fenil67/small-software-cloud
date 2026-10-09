@@ -34,5 +34,8 @@
     "@types/unzipper": "^0.10.11",
     "tsx": "^4.15.0",
     "typescript": "^5.5.0"
+  },
+  "pnpm": {
+    "allowBuild": ["esbuild"]
   }
 }

@@ -7,8 +7,33 @@ on:
     branches: [main]
 
 jobs:
-  build-and-typecheck:
-    name: Build & Typecheck
+  build-api:
+    name: Build & Typecheck (api)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/api/package-lock.json
+
+      - name: Install dependencies (api)
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Typecheck (api)
+        working-directory: apps/api
+        run: npm run typecheck
+
+      - name: Build (api)
+        working-directory: apps/api
+        run: npm run build
+
+  build-web:
+    name: Build & Typecheck (web)
     runs-on: ubuntu-latest
 
     steps:
@@ -26,13 +51,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck (api)
-        run: pnpm --filter @small-software-cloud/api run typecheck
-
       - name: Typecheck (web)
         run: pnpm --filter web run typecheck
         env:
-          # Clerk keys must be present at build time for Next.js
           NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_placeholder' }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY || 'sk_test_placeholder' }}
 
@@ -41,6 +62,3 @@ jobs:
         env:
           NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-
-      - name: Build (api)
-        run: pnpm --filter @small-software-cloud/api run build

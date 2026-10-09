@@ -1,35 +1,35 @@
 # ─── Stage 1: build ───────────────────────────────────────────────────────────
+# Uses npm (not pnpm) to avoid pnpm workspace/virtual-store issues in Docker.
+# pnpm is only needed for the local monorepo; npm works fine for isolated builds.
 FROM node:20-alpine AS builder
-
-RUN corepack enable && corepack prepare pnpm@latest --activate
 
 WORKDIR /app
 
-# Install dependencies first (cached layer)
-COPY pnpm-lock.yaml package.json ./
-RUN pnpm install --frozen-lockfile
+# Install ALL deps (including devDependencies for tsc)
+COPY package.json package-lock.json ./
+RUN npm ci
 
 # Copy source and compile
 COPY . .
-RUN pnpm run build
+RUN npm run build
 
 # ─── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM node:20-alpine
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# git: needed by cloneRepo in deployRunner
+# curl: required by fly.io/install.sh (node:20-alpine ships BusyBox wget only;
+#       the install script calls curl internally to download the flyctl binary)
+RUN apk add --no-cache git curl
 
-# Install git (needed for git clone in deployRunner)
-RUN apk add --no-cache git
-
-# Install flyctl
-RUN wget -q -O - https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh
+# Install flyctl into /usr/local/bin (FLYCTL_INSTALL/bin resolves to /usr/local/bin)
+RUN curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh
 ENV PATH="/usr/local/bin:${PATH}"
 
 WORKDIR /app
 
-# Install production deps only
-COPY pnpm-lock.yaml package.json ./
-RUN pnpm install --frozen-lockfile --prod
+# Production deps only — no devDependencies, no TypeScript tooling
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 # Copy compiled output from builder
 COPY --from=builder /app/dist ./dist
