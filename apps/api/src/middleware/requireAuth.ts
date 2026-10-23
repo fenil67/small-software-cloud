@@ -1,27 +1,91 @@
-import { getAuth } from "@clerk/express";
-import { Request, Response, NextFunction } from "express";
-
 /**
- * Enforces that the request has a valid Clerk session.
- * Attach after clerkMiddleware() in the middleware chain.
+ * requireAuth middleware
  *
- * On failure, returns structured JSON so callers know whether the token is
- * missing, expired, or otherwise invalid — avoids silent "internal_error".
+ * Supports two authentication schemes:
+ *   1. Clerk session JWT  — set by @clerk/express clerkMiddleware()
+ *   2. SSC API key        — "Authorization: Bearer ssc_<token>"
+ *
+ * On success, attaches `req.sscAuth` and calls next().
+ * On failure, returns 401.
  */
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const auth = getAuth(req);
-  if (!auth.userId) {
-    // debug() returns the raw authenticate-context including reason + message
-    const debugData = auth.debug() as Record<string, unknown>;
-    const reason = (debugData.reason as string | undefined) ?? "unauthenticated";
-    const message = (debugData.message as string | undefined) ?? undefined;
 
-    res.status(401).json({
-      error: "unauthenticated",
-      reason,
-      ...(message ? { message } : {}),
-    });
-    return;
+import { Request, Response, NextFunction } from "express";
+import { getAuth } from "@clerk/express";
+import { pool } from "../db";
+import { hashApiKey, looksLikeApiKey } from "../lib/apiKeys";
+
+export interface SscAuth {
+  type: "clerk" | "api_key";
+  clerkUserId?: string;
+  clerkOrgId?: string;
+  clerkOrgRole?: string;
+  internalOrgId?: string;
+}
+
+declare global {
+  namespace Express {
+    interface Request {
+      sscAuth?: SscAuth;
+    }
   }
-  next();
+}
+
+export async function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  // ── 1. Try API key ────────────────────────────────────────────────────────
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice("Bearer ".length).trim();
+    if (looksLikeApiKey(token)) {
+      const keyHash = hashApiKey(token);
+      const { rows } = await pool.query<{ org_id: string }>(
+        `SELECT org_id FROM api_keys
+         WHERE key_hash = $1
+           AND revoked_at IS NULL`,
+        [keyHash],
+      );
+      if (rows.length === 0) {
+        res.status(401).json({ error: "invalid_api_key" });
+        return;
+      }
+      // Update last_used_at asynchronously (fire and forget)
+      pool
+        .query(
+          "UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1",
+          [keyHash],
+        )
+        .catch(() => {});
+
+      req.sscAuth = {
+        type: "api_key",
+        internalOrgId: rows[0].org_id,
+      };
+      next();
+      return;
+    }
+  }
+
+  // ── 2. Try Clerk session ──────────────────────────────────────────────────
+  try {
+    const clerkAuth = getAuth(req);
+    if (clerkAuth?.userId) {
+      req.sscAuth = {
+        type: "clerk",
+        clerkUserId: clerkAuth.userId,
+        clerkOrgId: clerkAuth.orgId ?? undefined,
+        clerkOrgRole: clerkAuth.orgRole ?? undefined,
+      };
+      next();
+      return;
+    }
+  } catch {
+    // clerkMiddleware was not mounted or Clerk is not initialised
+    // — fall through to 401 below
+  }
+
+  // ── 3. Unauthenticated ────────────────────────────────────────────────────
+  res.status(401).json({ error: "unauthorized" });
 }

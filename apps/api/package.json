@@ -1,38 +1,44 @@
 {
-  "name": "@small-software-cloud/api",
+  "name": "@ssc/api",
+  "version": "0.1.0",
   "private": true,
-  "version": "0.0.1",
-  "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc --project tsconfig.json",
+    "build": "tsc",
+    "dev": "ts-node-dev --respawn src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "migrate": "node dist/db/migrate.js",
-    "migrate:dev": "tsx src/db/migrate.ts",
-    "get-token": "tsx scripts/get-test-token.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@clerk/express": "^2.0.0",
-    "axios": "^1.20.0",
+    "@clerk/express": "^1.0.0",
+    "axios": "^1.6.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.3.0",
+    "express": "^4.18.0",
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
-    "multer": "^2.4.0",
-    "pg": "^8.12.0",
-    "unzipper": "^0.12.5"
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.0",
+    "unzipper": "^0.12.3"
   },
   "devDependencies": {
+    "@types/archiver": "^6.0.4",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/form-data": "^2.5.2",
     "@types/morgan": "^1.9.9",
-    "@types/multer": "^2.3.0",
-    "@types/node": "^20.14.0",
-    "@types/pg": "^8.11.6",
-    "@types/unzipper": "^0.10.11",
-    "tsx": "^4.15.0",
-    "typescript": "^5.5.0"
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/unzipper": "^0.10.9",
+    "archiver": "^7.0.1",
+    "form-data": "^4.0.6",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@clerk/shared"
+    ]
   }
 }

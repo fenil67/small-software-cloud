@@ -1,40 +1,30 @@
-/**
- * In-process SSE event bus.
- *
- * Each in-flight deployment gets one EventEmitter. The SSE route subscribes to
- * it; the deploy runner emits onto it. No Redis needed for Phase 1 — this works
- * because Railway runs a single API instance. When we add multiple replicas or
- * horizontal scale, swap this for Redis pub/sub behind the same interface.
- */
 import { EventEmitter } from "events";
 
 export type DeployEvent =
   | { type: "log"; message: string }
   | { type: "status"; status: "queued" | "building" | "deploying" | "success" | "failed" }
   | { type: "url"; url: string }
-  | { type: "error"; message: string }
+  | { type: "error"; stage: string; message: string }
   | { type: "done" };
 
-const bus = new Map<string, EventEmitter>();
+class DeployEventBus {
+  private emitters = new Map<string, EventEmitter>();
 
-export const eventBus = {
-  /** Get or create the emitter for a deployment. */
   getOrCreate(deploymentId: string): EventEmitter {
-    if (!bus.has(deploymentId)) {
-      const em = new EventEmitter();
-      em.setMaxListeners(20);
-      bus.set(deploymentId, em);
+    if (!this.emitters.has(deploymentId)) {
+      const emitter = new EventEmitter();
+      emitter.setMaxListeners(20);
+      this.emitters.set(deploymentId, emitter);
     }
-    return bus.get(deploymentId)!;
-  },
+    return this.emitters.get(deploymentId)!;
+  }
 
   emit(deploymentId: string, event: DeployEvent): void {
-    bus.get(deploymentId)?.emit("event", event);
-  },
+    this.emitters.get(deploymentId)?.emit("event", event);
+    if (event.type === "done") {
+      setTimeout(() => this.emitters.delete(deploymentId), 60_000);
+    }
+  }
+}
 
-  /** Remove the emitter once all subscribers have disconnected. */
-  cleanup(deploymentId: string): void {
-    bus.get(deploymentId)?.removeAllListeners();
-    bus.delete(deploymentId);
-  },
-};
+export const eventBus = new DeployEventBus();

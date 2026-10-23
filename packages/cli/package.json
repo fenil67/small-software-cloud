@@ -1,0 +1,23 @@
+{
+  "name": "@ssc/cli",
+  "version": "0.1.0",
+  "description": "CLI for Small Software Cloud",
+  "bin": {
+    "ssc": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@ssc/client": "workspace:*",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

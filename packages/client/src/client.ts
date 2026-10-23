@@ -1,0 +1,154 @@
+/**
+ * SscClient — typed wrapper around the SSC HTTP API.
+ *
+ * Configuration is resolved from (in order of precedence):
+ *   1. Constructor argument
+ *   2. SSC_API_KEY / SSC_API_URL env vars
+ *   3. ~/.config/ssc/config.json
+ */
+
+import FormData from "form-data";
+import { makeAxios, extractErrorMessage } from "./http";
+import { resolveConfig, SscConfig } from "./config";
+import { zipDirectory } from "./zip";
+import type {
+  Deployment,
+  IntakeResponse,
+  DeployOptions,
+  DeployEvent,
+} from "./types";
+
+export class SscClient {
+  private config: SscConfig;
+
+  constructor(config?: Partial<SscConfig>) {
+    const resolved = resolveConfig();
+    this.config = { ...resolved, ...config };
+  }
+
+  // ─── Auth ──────────────────────────────────────────────────────────────────
+
+  /** Validate the configured API key against the server. Returns the org name. */
+  async checkAuth(): Promise<{ org: string }> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<{ org: string }>("/v1/auth/check");
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  // ─── Deploy ────────────────────────────────────────────────────────────────
+
+  /**
+   * Zip a local directory and submit it for deployment.
+   * Returns immediately with a deployment ID.
+   */
+  async deployZip(
+    dirPath: string,
+    opts: DeployOptions = {},
+  ): Promise<IntakeResponse> {
+    const zipBuffer = await zipDirectory(dirPath);
+
+    const form = new FormData();
+    form.append("code", zipBuffer, { filename: "app.zip", contentType: "application/zip" });
+    if (opts.appId) form.append("app_id", opts.appId);
+    if (opts.appName) form.append("app_name", opts.appName);
+
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.post<IntakeResponse>(
+        "/v1/deployments/intake/zip",
+        form,
+        { headers: form.getHeaders(), timeout: 120_000 },
+      );
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  /**
+   * Submit a GitHub URL for deployment.
+   * Returns immediately with a deployment ID.
+   */
+  async deployGithub(
+    githubUrl: string,
+    opts: DeployOptions = {},
+  ): Promise<IntakeResponse> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.post<IntakeResponse>(
+        "/v1/deployments/intake/github",
+        {
+          github_url: githubUrl,
+          ...(opts.appId ? { app_id: opts.appId } : {}),
+          ...(opts.appName ? { app_name: opts.appName } : {}),
+        },
+      );
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  // ─── Status ────────────────────────────────────────────────────────────────
+
+  async getDeployment(deploymentId: string): Promise<Deployment> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<Deployment>(`/v1/deployments/${deploymentId}`);
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  // ─── SSE stream ────────────────────────────────────────────────────────────
+
+  /**
+   * Open the SSE stream for a deployment and call onEvent for each event.
+   * Resolves when the stream ends (done event or connection closed).
+   */
+  async streamDeployment(
+    deploymentId: string,
+    onEvent: (event: DeployEvent) => void,
+  ): Promise<void> {
+    const ax = makeAxios(this.config);
+
+    // Use responseType: 'stream' to get raw HTTP stream
+    const response = await ax.get(
+      `/v1/deployments/${deploymentId}/stream`,
+      { responseType: "stream", timeout: 0 },
+    );
+
+    return new Promise<void>((resolve, reject) => {
+      let buffer = "";
+
+      response.data.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice("data: ".length).trim();
+          if (!raw) continue;
+          try {
+            const event = JSON.parse(raw) as DeployEvent;
+            onEvent(event);
+            if (event.type === "done") {
+              resolve();
+            }
+          } catch {
+            // ignore malformed SSE lines
+          }
+        }
+      });
+
+      response.data.on("end", () => resolve());
+      response.data.on("error", (err: Error) => reject(err));
+    });
+  }
+}
