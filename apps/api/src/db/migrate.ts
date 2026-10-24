@@ -6,6 +6,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import { Pool } from "pg";
+import { safeErr } from "../lib/safeErr";
 
 async function migrate() {
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -50,7 +51,7 @@ async function migrate() {
     console.log("[migrate] done");
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("[migrate] error", err);
+    console.error("[migrate] error", safeErr(err));
     process.exit(1);
   } finally {
     client.release();

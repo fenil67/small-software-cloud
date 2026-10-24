@@ -4,6 +4,7 @@
  * Runs on API boot and every 5 minutes thereafter.
  */
 import { pool } from "../db";
+import { safeErr } from "./safeErr";
 
 const TIMEOUT_MINUTES = 15;
 const INTERVAL_MS = 5 * 60 * 1000;
@@ -27,11 +28,11 @@ export async function reapStalledDeployments(): Promise<number> {
 
 export function startReaper(): void {
   reapStalledDeployments().catch((err) =>
-    console.error("[reaper] boot run failed:", err),
+    console.error("[reaper] boot run failed:", safeErr(err)),
   );
   setInterval(() => {
     reapStalledDeployments().catch((err) =>
-      console.error("[reaper] interval run failed:", err),
+      console.error("[reaper] interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
 }

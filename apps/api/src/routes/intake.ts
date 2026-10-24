@@ -16,6 +16,7 @@ import { checkDeployLimits } from "../lib/deployLimits";
 import { ensureUser, ensureOrg } from "../lib/clerkSync";
 import { runDeploy } from "../services/deployRunner";
 import { asyncHandler } from "../lib/asyncHandler";
+import { safeErr } from "../lib/safeErr";
 
 export const intakeRouter = Router();
 intakeRouter.use(requireAuth);
@@ -162,7 +163,7 @@ intakeRouter.post(
     const zipBuffer = req.file.buffer;
     setImmediate(() => {
       runDeploy({ deploymentId, appId, zipBuffer }).catch((e) =>
-        console.error("[intake] runDeploy error:", e),
+        console.error("[intake] runDeploy error:", safeErr(e)),
       );
     });
 
@@ -235,7 +236,7 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
   // Kick off deploy in background
   setImmediate(() => {
     runDeploy({ deploymentId, appId, githubUrl: github_url }).catch((e) =>
-      console.error("[intake] runDeploy error:", e),
+      console.error("[intake] runDeploy error:", safeErr(e)),
     );
   });
 

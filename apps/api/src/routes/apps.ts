@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
 import { destroyFlyApp } from "../services/flyClient";
 import { asyncHandler } from "../lib/asyncHandler";
+import { safeErr } from "../lib/safeErr";
 
 export const appsRouter = Router();
 appsRouter.use(requireAuth);
@@ -63,7 +64,7 @@ appsRouter.delete("/:id", asyncHandler(async (req: Request, res: Response) => {
     try {
       await destroyFlyApp(fly_app_id);
     } catch (err) {
-      console.error(`[apps] failed to destroy Fly app ${fly_app_id}:`, err);
+      console.error(`[apps] failed to destroy Fly app ${fly_app_id}:`, safeErr(err));
     }
   }
 

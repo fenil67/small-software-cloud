@@ -23,6 +23,18 @@ process.env.FLY_ORG_SLUG = "test-org";
 process.env.CLERK_SECRET_KEY = "sk_test_stubstubstubstub";
 process.env.SSC_TEST = "1";
 
+// ── Log capture (intercept console.error BEFORE any module imports) ───────────
+// Section N drains these to verify no secret leaks in error logs.
+const _recentErrorLogs: string[] = [];
+const _origConsoleError = console.error.bind(console);
+console.error = (...args: unknown[]) => {
+  _recentErrorLogs.push(
+    args.map((a) => (typeof a === "string" ? a : String(a))).join(" "),
+  );
+  if (_recentErrorLogs.length > 200) _recentErrorLogs.shift();
+  _origConsoleError(...args);
+};
+
 import crypto from "crypto";
 import express, { Request, Response, NextFunction } from "express";
 import { healthRouter } from "../src/routes/health";
@@ -34,6 +46,7 @@ import { apiKeysRouter } from "../src/routes/apiKeys";
 import { authRouter } from "../src/routes/auth";
 import { startReaper } from "../src/lib/reaper";
 import { eventBus } from "../src/lib/eventBus";
+import { safeErr } from "../src/lib/safeErr";
 import { pool } from "../src/db";
 
 // ── Stub deployRunner ─────────────────────────────────────────────────────────
@@ -120,8 +133,32 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
 // ── Stub flyClient ────────────────────────────────────────────────────────────
 const flyModule = require("../src/services/flyClient");
 flyModule.createFlyApp = async () => {};
-flyModule.destroyFlyApp = async () => {};
 flyModule.allocateFlyIp = async () => "1.2.3.4";
+
+// destroyFlyApp is configurable: normally succeeds; when flyErrorMode is enabled
+// it throws a raw Axios-shaped error (with Authorization in config) so Section N
+// can verify that safeErr strips credentials before they reach the log.
+let _flyErrorMode = false;
+flyModule.destroyFlyApp = async (_appName: string) => {
+  if (_flyErrorMode) {
+    // Simulate a Fly API 401 Axios error — this is the exact shape that would
+    // appear if the interceptor in flyClient.ts were absent.
+    const err = Object.assign(new Error("Request failed with status code 401"), {
+      isAxiosError: true,
+      config: {
+        method: "delete",
+        url: "https://api.machines.dev/v1/apps/test-app",
+        headers: {
+          Authorization: `Bearer ${process.env.FLY_API_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      },
+      request: { _header: `DELETE /v1/apps/test-app HTTP/1.1\nAuthorization: Bearer ${process.env.FLY_API_TOKEN}\n` },
+      response: { status: 401, data: { error: "unauthorized" } },
+    });
+    throw err;
+  }
+};
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
@@ -142,6 +179,19 @@ app.post("/test/set-deploy-mode", (req, res) => {
   } else {
     res.status(400).json({ error: "invalid mode" });
   }
+});
+
+// Test-control endpoint: POST /test/set-fly-error { enabled: true|false }
+// When enabled, destroyFlyApp throws a raw Axios error with credentials in config.
+app.post("/test/set-fly-error", (req, res) => {
+  _flyErrorMode = !!(req.body as { enabled?: boolean }).enabled;
+  res.json({ ok: true, flyErrorMode: _flyErrorMode });
+});
+
+// Test-control endpoint: GET /test/drain-logs
+// Returns and clears the captured console.error log lines.
+app.get("/test/drain-logs", (_req, res) => {
+  res.json({ logs: _recentErrorLogs.splice(0) });
 });
 
 // Test-control endpoint: GET /test/db-error — deliberately queries a nonexistent table
@@ -169,7 +219,7 @@ app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   const requestId = (req as Request & { id?: string }).id ?? "unknown";
-  console.error(`[test-server] unhandled error request_id=${requestId}:`, err);
+  console.error(`[test-server] unhandled error request_id=${requestId}:`, safeErr(err));
   if (!res.headersSent) {
     res.status(500).json({ error: "internal_error", request_id: requestId });
   }

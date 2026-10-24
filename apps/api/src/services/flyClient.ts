@@ -2,12 +2,47 @@ import axios from "axios";
 
 const FLY_API_BASE = "https://api.machines.dev/v1";
 
+/**
+ * Thrown by every flyClient function on any HTTP error.
+ * Carries only the HTTP status and a safe message — no request config,
+ * no headers, no Authorization values.
+ */
+export class FlyApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = "FlyApiError";
+  }
+}
+
 function makeClient() {
-  return axios.create({
+  const client = axios.create({
     baseURL: FLY_API_BASE,
     headers: { Authorization: `Bearer ${process.env.FLY_API_TOKEN}` },
     timeout: 30_000,
   });
+
+  // ── Response interceptor: strip credentials before errors propagate ──────────
+  // Without this, a logged Axios error contains the full request config including
+  // "Authorization: Bearer <FLY_API_TOKEN>", which would appear in Railway logs,
+  // Sentry, etc.  The interceptor replaces every Axios error with a FlyApiError
+  // that carries only status + response body message.
+  client.interceptors.response.use(
+    (resp) => resp,
+    (err: unknown) => {
+      if (axios.isAxiosError(err)) {
+        const status = err.response?.status ?? 0;
+        const data = err.response?.data as Record<string, unknown> | undefined;
+        const msg =
+          typeof data?.error === "string" ? data.error :
+          typeof data?.message === "string" ? data.message :
+          `Fly API error (HTTP ${status})`;
+        return Promise.reject(new FlyApiError(status, msg));
+      }
+      return Promise.reject(err);
+    },
+  );
+
+  return client;
 }
 
 export async function createFlyApp(appName: string, orgSlug: string): Promise<void> {
@@ -20,7 +55,9 @@ export async function destroyFlyApp(appName: string): Promise<void> {
   try {
     await client.delete(`/apps/${appName}`);
   } catch (err: unknown) {
-    if (axios.isAxiosError(err) && err.response?.status === 404) return;
+    // After the interceptor, errors are FlyApiError instances.
+    // A 404 means the app was already deleted — treat as success.
+    if (err instanceof FlyApiError && err.status === 404) return;
     throw err;
   }
 }

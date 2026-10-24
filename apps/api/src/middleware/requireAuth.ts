@@ -13,6 +13,7 @@ import { Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
 import { pool } from "../db";
 import { hashApiKey, looksLikeApiKey } from "../lib/apiKeys";
+import { safeErr } from "../lib/safeErr";
 
 export interface SscAuth {
   type: "clerk" | "api_key";
@@ -52,7 +53,7 @@ export async function requireAuth(
           [keyHash],
         ));
       } catch (dbErr) {
-        console.error("[requireAuth] db error", dbErr);
+        console.error("[requireAuth] db error", safeErr(dbErr));
         res.status(500).json({ error: "internal_error" });
         return;
       }

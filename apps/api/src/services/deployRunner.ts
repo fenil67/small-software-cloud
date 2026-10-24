@@ -7,6 +7,7 @@ import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp } from "./flyClient";
+import { safeErr } from "../lib/safeErr";
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles } from "./dockerfileGen";
 
@@ -264,7 +265,7 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       await fail(err);
     } else {
       await fail(new DeployError("internal", "An unexpected error occurred. Please try again."));
-      console.error("[deploy] unexpected:", err);
+      console.error("[deploy] unexpected:", safeErr(err));
     }
   } finally {
     if (workDir) {

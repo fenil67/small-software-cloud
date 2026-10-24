@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import { safeErr } from "./lib/safeErr";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is required");
@@ -12,5 +13,5 @@ export const pool = new Pool({
 });
 
 pool.on("error", (err) => {
-  console.error("[db] unexpected pool error", err);
+  console.error("[db] unexpected pool error", safeErr(err));
 });

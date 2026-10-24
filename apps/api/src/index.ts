@@ -6,16 +6,17 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { clerkMiddleware } from "@clerk/express";
 import crypto from "crypto";
+import { safeErr } from "./lib/safeErr";
 
 // ─── Process-level safety nets ────────────────────────────────────────────────
 // These are last-resort guards so no unhandled rejection or uncaught exception
 // can terminate the process.  Individual async handlers should still call
 // next(err) — these catch anything that leaks through.
 process.on("unhandledRejection", (reason) => {
-  console.error("[process] unhandledRejection", reason);
+  console.error("[process] unhandledRejection", safeErr(reason));
 });
 process.on("uncaughtException", (err) => {
-  console.error("[process] uncaughtException", err);
+  console.error("[process] uncaughtException", safeErr(err));
 });
 
 // ─── Startup checks ──────────────────────────────────────────────────────────
@@ -105,7 +106,7 @@ app.use((_req, res) => {
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   const reqId = (req as Request & { id?: string }).id ?? "unknown";
-  console.error(`[error] reqId=${reqId}`, err);
+  console.error(`[error] reqId=${reqId}`, safeErr(err));
   res.status(500).json({ error: "internal_error", request_id: reqId });
 });
 

@@ -976,6 +976,123 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("N: Secret scrubbing — safeErr + Fly API errors");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // N1 & N2: unit-test safeErr directly (no server needed)
+  {
+    const { safeErr, scrubSecrets } = require("../src/lib/safeErr");
+
+    // N1a: safeErr with a fake Axios error that has Authorization in config
+    //      simulates what an un-intercepted Fly API error looks like
+    const fakeToken = "ssc_fake_secret_bearer_token_value";
+    const fakeAxiosErr = Object.assign(
+      new Error("Request failed with status code 401"),
+      {
+        isAxiosError: true,
+        config: {
+          method: "delete",
+          url: `https://api.machines.dev/v1/apps/test?token=${fakeToken}`,
+          headers: { Authorization: `Bearer ${fakeToken}` },
+        },
+        request: { _header: `Authorization: Bearer ${fakeToken}` },
+        response: { status: 401, data: { error: "unauthorized" } },
+      },
+    );
+    const result = safeErr(fakeAxiosErr) as string;
+    console.log(`  safeErr(fakeAxiosErr) → "${result}"`);
+
+    !result.includes(fakeToken)
+      ? ok("N1: token value not in safeErr output")
+      : fail("N1: token value leaked in safeErr output");
+    !result.includes("Bearer ")
+      ? ok("N1: 'Bearer' not in safeErr output")
+      : fail("N1: 'Bearer' leaked in safeErr output");
+    !result.includes("Authorization")
+      ? ok("N1: 'Authorization' not in safeErr output")
+      : fail("N1: 'Authorization' leaked in safeErr output");
+    result.includes("401")
+      ? ok("N1: HTTP status preserved in output")
+      : fail("N1: status missing from safeErr output");
+    result.includes("unauthorized")
+      ? ok("N1: response message preserved in output")
+      : fail("N1: response message missing from safeErr output");
+
+    // N1b: plain Error whose message contains the token value
+    const errWithToken = new Error(`http call failed Bearer ${fakeToken}`);
+    const r1b = safeErr(errWithToken) as string;
+    console.log(`  safeErr(Error with token in msg) → "${r1b}"`);
+    !r1b.includes(fakeToken)
+      ? ok("N1b: token value scrubbed from plain Error message")
+      : fail("N1b: token value leaked in plain Error message");
+
+    // N2: scrubSecrets with the actual env token value ("test-token" in test server)
+    const envToken = process.env.FLY_API_TOKEN ?? "test-token";
+    const dirty = `call failed: Bearer ${envToken} at /v1/apps`;
+    const clean = scrubSecrets(dirty) as string;
+    console.log(`  scrubSecrets("...Bearer ${envToken}...") → "${clean}"`);
+    !clean.includes(envToken)
+      ? ok("N2: env token value scrubbed by scrubSecrets")
+      : fail("N2: env token value not scrubbed");
+    !clean.includes("Bearer " + envToken)
+      ? ok("N2: full Bearer+token pattern scrubbed")
+      : fail("N2: full Bearer pattern not scrubbed");
+  }
+
+  // N3: force Fly 401 via DELETE /v1/apps — check server logs contain no credentials
+  {
+    // Drain any logs accumulated so far
+    await request("GET", "/test/drain-logs");
+
+    // Enable fly-error mode: destroyFlyApp throws a raw Axios error with
+    // Authorization header in config — the worst-case shape.
+    const setErr = await request("POST", "/test/set-fly-error", { body: { enabled: true } });
+    console.log(`  POST /test/set-fly-error → ${setErr.status}  body=${JSON.stringify(setErr.body)}`);
+
+    // Create an app with a fly_app_id so the DELETE path hits destroyFlyApp
+    const { rows: appRows } = await pool.query<{ id: string }>(
+      "INSERT INTO apps (org_id, owner_id, name, slug, source_type, fly_app_id) VALUES ($1,$2,'fly-err-test','fly-err-test','zip','ssc-fly-err-test') RETURNING id",
+      [orgAId, userId],
+    );
+    const errAppId = appRows[0].id;
+
+    // DELETE the app — apps.ts:destroyFlyApp will throw, catch block logs safeErr(err)
+    const delResp = await request("DELETE", `/v1/apps/${errAppId}`, {
+      headers: authHeaders(keyA),
+    });
+    console.log(`  DELETE /v1/apps/${errAppId.slice(0, 8)}… → ${delResp.status}`);
+
+    // Give the handler time to complete
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Drain and inspect the captured logs
+    const logsResp = await request("GET", "/test/drain-logs");
+    const logs: string[] = (logsResp.body as any).logs ?? [];
+    const logText = logs.join("\n");
+    console.log(`  Captured ${logs.length} log line(s) after fly-error:`);
+    for (const line of logs) {
+      if (line.includes("[apps]") || line.includes("destroy") || line.includes("fly")) {
+        console.log(`    ${line.slice(0, 120)}`);
+      }
+    }
+
+    const FLY_TOKEN = process.env.FLY_API_TOKEN ?? "test-token";
+    !logText.includes("Bearer ")
+      ? ok("N3: 'Bearer' not in any log line after Fly 401")
+      : fail("N3: 'Bearer' leaked in log after Fly 401", logText.slice(0, 200));
+    !logText.includes(FLY_TOKEN)
+      ? ok("N3: token value not in any log line after Fly 401")
+      : fail("N3: token value leaked in log after Fly 401");
+    !logText.includes("Authorization")
+      ? ok("N3: 'Authorization' not in any log line after Fly 401")
+      : fail("N3: 'Authorization' leaked in log after Fly 401");
+
+    // Disable fly-error mode and clean up
+    await request("POST", "/test/set-fly-error", { body: { enabled: false } });
+    await pool.query("DELETE FROM apps WHERE id=$1", [errAppId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
