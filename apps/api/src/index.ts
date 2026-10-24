@@ -1,10 +1,22 @@
 import "dotenv/config";
 import { execFileSync } from "child_process";
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import { clerkMiddleware } from "@clerk/express";
+import crypto from "crypto";
+
+// ─── Process-level safety nets ────────────────────────────────────────────────
+// These are last-resort guards so no unhandled rejection or uncaught exception
+// can terminate the process.  Individual async handlers should still call
+// next(err) — these catch anything that leaks through.
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] unhandledRejection", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[process] uncaughtException", err);
+});
 
 // ─── Startup checks ──────────────────────────────────────────────────────────
 // Crash loudly at boot if required env vars or binaries are missing rather
@@ -50,6 +62,12 @@ const app = express();
 // Railway injects PORT; API_PORT is the local-dev fallback
 const PORT = parseInt(process.env.PORT ?? process.env.API_PORT ?? "4000");
 
+// ─── Request ID (must be first so every log and error response carries it) ───
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  (req as Request & { id: string }).id = crypto.randomUUID();
+  next();
+});
+
 // ─── Security & logging ──────────────────────────────────────────────────────
 app.use(helmet());
 app.use(
@@ -77,6 +95,18 @@ app.use("/v1/deployments", deploymentsRouter);
 // ─── 404 fallback ────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "not_found" });
+});
+
+// ─── Final error middleware ───────────────────────────────────────────────────
+// Catches any error passed via next(err) or thrown synchronously in a handler.
+// Async handlers in Express 4 do NOT automatically invoke this — they must
+// call next(err) themselves.  The process.on("unhandledRejection") above is the
+// safety net for anything that leaks without calling next(err).
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  const reqId = (req as Request & { id?: string }).id ?? "unknown";
+  console.error(`[error] reqId=${reqId}`, err);
+  res.status(500).json({ error: "internal_error", request_id: reqId });
 });
 
 // ─── Background jobs ─────────────────────────────────────────────────────────

@@ -6,7 +6,21 @@
  *   DATABASE_URL="postgres://fenilpatel@localhost:5432/ssc_test" \
  *   TEST_PORT=4099 \
  *   npx ts-node --project tsconfig.json scripts/run-tests.ts
+ *
+ * NEVER point DATABASE_URL at the Railway production database.
+ * Create a local test DB:  createdb ssc_test && node dist/db/migrate.js
  */
+
+// ── Safety: refuse Railway production DB ──────────────────────────────────────
+const _rawDbUrl = process.env.DATABASE_URL ?? "";
+if (_rawDbUrl.includes("rlwy.net") || _rawDbUrl.includes("railway.app")) {
+  console.error(
+    "FATAL: DATABASE_URL points at Railway production — aborting.\n" +
+      "  Use a local Postgres DB, e.g.:\n" +
+      '  DATABASE_URL="postgres://fenilpatel@localhost:5432/ssc_test" ...',
+  );
+  process.exit(1);
+}
 
 import http from "http";
 import https from "https";
@@ -763,6 +777,140 @@ async function main(): Promise<void> {
       );
     }
     ok(`${appRows.length} app(s) visible`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("L: App-type detection + Dockerfile / fly.toml generation");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const { detectAppType } = require("../src/services/appDetector");
+    const { generateDeployFiles } = require("../src/services/dockerfileGen");
+    const fsTmp = require("fs/promises");
+    const pathTmp = require("path");
+    const osTmp = require("os");
+
+    const mkTmp = () => fsTmp.mkdtemp(pathTmp.join(osTmp.tmpdir(), "ssc-det-"));
+    const cleanup = (d: string) => fsTmp.rm(d, { recursive: true, force: true }).catch(() => {});
+
+    // ── L1: Node (npm, with start script) ────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "package.json"), JSON.stringify({
+          name: "node-test", version: "1.0.0", scripts: { start: "node index.js" },
+        }));
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(node) → ${JSON.stringify(t)}`);
+        t.kind === "node" ? ok("Node: kind=node") : fail("Node detection failed", JSON.stringify(t));
+        t.kind === "node" && t.packageManager === "npm" ? ok("Node: pm=npm") : fail("pm should be npm");
+
+        const { internalPort } = await generateDeployFiles(d, "ssc-node-test", t);
+        console.log(`  generateDeployFiles(node) → internalPort=${internalPort}`);
+        internalPort === 8080 ? ok("Node: internalPort=8080") : fail("expected 8080");
+
+        const df = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        df.includes("node:20-alpine") ? ok("Node: Dockerfile has node:20-alpine") : fail("Dockerfile missing node image");
+        df.includes("package-lock.json") ? ok("Node: Dockerfile has lockfile check") : fail("Dockerfile missing lockfile check");
+
+        const ft = await fsTmp.readFile(pathTmp.join(d, "fly.toml"), "utf8");
+        ft.includes("ssc-node-test") ? ok("Node: fly.toml has app name") : fail("fly.toml missing app name");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L2: Node (pnpm) ──────────────────────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "package.json"), JSON.stringify({
+          name: "pnpm-test", version: "1.0.0", scripts: { start: "node server.js" },
+        }));
+        await fsTmp.writeFile(pathTmp.join(d, "pnpm-lock.yaml"), "");
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(pnpm) → ${JSON.stringify(t)}`);
+        t.kind === "node" && t.packageManager === "pnpm" ? ok("Node: pm=pnpm") : fail("pm should be pnpm");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L3: Python (gunicorn) ─────────────────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "requirements.txt"), "flask==3.0.0\ngunicorn");
+        await fsTmp.writeFile(pathTmp.join(d, "app.py"), "app = None");
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(python/gunicorn) → ${JSON.stringify(t)}`);
+        t.kind === "python" ? ok("Python: kind=python") : fail("Python detection failed");
+        t.kind === "python" && t.server === "gunicorn" ? ok("Python: server=gunicorn") : fail("server should be gunicorn");
+
+        const { internalPort } = await generateDeployFiles(d, "ssc-py-test", t);
+        internalPort === 8080 ? ok("Python: internalPort=8080") : fail("expected 8080");
+        const df = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        df.includes("python:3.11-slim") ? ok("Python: Dockerfile has python:3.11-slim") : fail("Dockerfile missing python image");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L4: Python (uvicorn / FastAPI) ────────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "requirements.txt"), "fastapi\nuvicorn[standard]");
+        await fsTmp.writeFile(pathTmp.join(d, "main.py"), "app = None");
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(python/uvicorn) → ${JSON.stringify(t)}`);
+        t.kind === "python" && t.server === "uvicorn" ? ok("Python: server=uvicorn (FastAPI)") : fail("server should be uvicorn");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L5: Static (index.html) ───────────────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "index.html"), "<h1>hello</h1>");
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(static) → ${JSON.stringify(t)}`);
+        t.kind === "static" ? ok("Static: kind=static") : fail("Static detection failed");
+
+        const { internalPort } = await generateDeployFiles(d, "ssc-static-test", t);
+        internalPort === 80 ? ok("Static: internalPort=80") : fail("expected 80");
+        const df = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        df.includes("nginx:alpine") ? ok("Static: Dockerfile has nginx") : fail("Dockerfile missing nginx");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L6: Pass-through (Dockerfile present) ────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "Dockerfile"), "FROM node:20-alpine\nEXPOSE 3000\n");
+        const t = await detectAppType(d);
+        console.log(`  detectAppType(dockerfile) → ${JSON.stringify(t)}`);
+        t.kind === "dockerfile" ? ok("Dockerfile pass-through: kind=dockerfile") : fail("should be dockerfile");
+
+        // generateDeployFiles must not overwrite the user Dockerfile, only write fly.toml
+        const before = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        await generateDeployFiles(d, "ssc-df-test", t);
+        const after = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        before === after ? ok("Dockerfile pass-through: user Dockerfile not overwritten") : fail("user Dockerfile was overwritten");
+        const ft = await fsTmp.readFile(pathTmp.join(d, "fly.toml"), "utf8");
+        ft.includes("internal_port = 3000") ? ok("Dockerfile pass-through: fly.toml sniffed EXPOSE 3000") : fail("fly.toml wrong port");
+      } finally { await cleanup(d); }
+    }
+
+    // ── L7: Unrecognised → clear error ───────────────────────────────────────
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "main.go"), "package main");
+        try {
+          await detectAppType(d);
+          fail("Unrecognised app should throw");
+        } catch (e: any) {
+          console.log(`  detectAppType(unrecognised) threw: ${e.message.split("\n")[0]}`);
+          ok("Unrecognised app: throws helpful error");
+        }
+      } finally { await cleanup(d); }
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════

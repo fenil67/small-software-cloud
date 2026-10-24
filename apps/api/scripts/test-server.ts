@@ -6,6 +6,17 @@
  * - Reads DATABASE_URL from env (point at ssc_test)
  */
 
+// ── Safety: refuse to run against the Railway production database ─────────────
+const _dbUrl = process.env.DATABASE_URL ?? "";
+if (_dbUrl.includes("rlwy.net") || _dbUrl.includes("railway.app")) {
+  console.error(
+    "[test-server] FATAL: DATABASE_URL points at Railway production — aborting.\n" +
+      "  Set DATABASE_URL to a local Postgres instance, e.g.:\n" +
+      '  DATABASE_URL="postgres://fenilpatel@localhost:5432/ssc_test" npx ts-node ...',
+  );
+  process.exit(1);
+}
+
 // Must be set before any imports
 process.env.FLY_API_TOKEN = "test-token";
 process.env.FLY_ORG_SLUG = "test-org";

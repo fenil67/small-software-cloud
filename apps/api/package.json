@@ -6,7 +6,10 @@
     "build": "tsc",
     "dev": "ts-node-dev --respawn src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "migrate": "node dist/db/migrate.js",
+    "migrate:dev": "tsx src/db/migrate.ts",
+    "get-token": "tsx scripts/get-test-token.ts"
   },
   "dependencies": {
     "@clerk/express": "^1.0.0",
@@ -34,6 +37,7 @@
     "form-data": "^4.0.6",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
+    "tsx": "^4.15.0",
     "typescript": "^5.4.0"
   },
   "pnpm": {

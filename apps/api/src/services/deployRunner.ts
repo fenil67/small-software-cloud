@@ -7,6 +7,8 @@ import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp } from "./flyClient";
+import { detectAppType } from "./appDetector";
+import { generateDeployFiles } from "./dockerfileGen";
 
 const execFileP = promisify(execFile);
 
@@ -100,22 +102,6 @@ async function cloneRepo(githubUrl: string, deploymentId: string): Promise<strin
   return dir;
 }
 
-function detectDockerfile(dir: string): boolean {
-  return fs.existsSync(path.join(dir, "Dockerfile")) || fs.existsSync(path.join(dir, "dockerfile"));
-}
-
-async function generateDockerfile(dir: string): Promise<void> {
-  // Simple Node.js Dockerfile generation
-  const dockerfile = `FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --production
-COPY . .
-EXPOSE 8080
-CMD ["node", "index.js"]
-`;
-  fs.writeFileSync(path.join(dir, "Dockerfile"), dockerfile);
-}
 
 async function runFlyctlDeploy(
   dir: string,
@@ -209,10 +195,17 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       throw new DeployError("internal", "No source provided.");
     }
 
-    // Step 2: ensure Dockerfile
-    if (!detectDockerfile(workDir)) {
-      log(deploymentId, "No Dockerfile found; generating one…");
-      await generateDockerfile(workDir);
+    // Step 2: detect app type (fast-fail before provisioning)
+    log(deploymentId, "Detecting app type…");
+    let appType: Awaited<ReturnType<typeof detectAppType>>;
+    try {
+      appType = await detectAppType(workDir);
+      log(deploymentId, `Detected: ${appType.kind}`);
+    } catch (err) {
+      throw new DeployError(
+        "detect",
+        err instanceof Error ? err.message : "Could not detect app type.",
+      );
     }
 
     // Step 3: ensure Fly app exists
@@ -233,6 +226,17 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
     }
     flyAppName = appName;
+
+    // Step 3b: generate Dockerfile + fly.toml (lockfile-aware for Node)
+    log(deploymentId, "Generating deploy files…");
+    try {
+      await generateDeployFiles(workDir, appName, appType);
+    } catch (err) {
+      throw new DeployError(
+        "provision",
+        err instanceof Error ? err.message : "Failed to generate deploy files.",
+      );
+    }
 
     // Step 4: deploy
     await updateDeploymentStatus(deploymentId, "deploying");

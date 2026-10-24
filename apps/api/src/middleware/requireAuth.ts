@@ -41,12 +41,19 @@ export async function requireAuth(
     const token = authHeader.slice("Bearer ".length).trim();
     if (looksLikeApiKey(token)) {
       const keyHash = hashApiKey(token);
-      const { rows } = await pool.query<{ org_id: string }>(
-        `SELECT org_id FROM api_keys
-         WHERE key_hash = $1
-           AND revoked_at IS NULL`,
-        [keyHash],
-      );
+      let rows: { org_id: string }[];
+      try {
+        ({ rows } = await pool.query<{ org_id: string }>(
+          `SELECT org_id FROM api_keys
+           WHERE key_hash = $1
+             AND revoked_at IS NULL`,
+          [keyHash],
+        ));
+      } catch (dbErr) {
+        console.error("[requireAuth] db error", dbErr);
+        res.status(500).json({ error: "internal_error" });
+        return;
+      }
       if (rows.length === 0) {
         res.status(401).json({ error: "invalid_api_key" });
         return;
@@ -87,5 +94,5 @@ export async function requireAuth(
   }
 
   // ── 3. Unauthenticated ────────────────────────────────────────────────────
-  res.status(401).json({ error: "unauthorized" });
+  res.status(401).json({ error: "unauthenticated", reason: "no_credentials" });
 }
