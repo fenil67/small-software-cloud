@@ -1,12 +1,12 @@
 import "dotenv/config";
 import { execFileSync } from "child_process";
-import express, { Request, Response, NextFunction } from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import { clerkMiddleware } from "@clerk/express";
-import crypto from "crypto";
 import { safeErr } from "./lib/safeErr";
+import { requestIdMiddleware, errorHandlerMiddleware } from "./middleware/errorHandler";
 
 // ─── Process-level safety nets ────────────────────────────────────────────────
 // These are last-resort guards so no unhandled rejection or uncaught exception
@@ -64,10 +64,7 @@ const app = express();
 const PORT = parseInt(process.env.PORT ?? process.env.API_PORT ?? "4000");
 
 // ─── Request ID (must be first so every log and error response carries it) ───
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  (req as Request & { id: string }).id = crypto.randomUUID();
-  next();
-});
+app.use(requestIdMiddleware);
 
 // ─── Security & logging ──────────────────────────────────────────────────────
 app.use(helmet());
@@ -103,12 +100,7 @@ app.use((_req, res) => {
 // Async handlers in Express 4 do NOT automatically invoke this — they must
 // call next(err) themselves.  The process.on("unhandledRejection") above is the
 // safety net for anything that leaks without calling next(err).
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
-  const reqId = (req as Request & { id?: string }).id ?? "unknown";
-  console.error(`[error] reqId=${reqId}`, safeErr(err));
-  res.status(500).json({ error: "internal_error", request_id: reqId });
-});
+app.use(errorHandlerMiddleware);
 
 // ─── Background jobs ─────────────────────────────────────────────────────────
 startReaper();

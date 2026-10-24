@@ -661,6 +661,44 @@ async function main(): Promise<void> {
     console.log(`  POST /intake/zip (.env inside) → ${r.status}  body=${JSON.stringify(r.body)}`);
     r.status === 400 ? ok("zip with .env → 400") : fail("zip with .env should 400", `got ${r.status} ${JSON.stringify(r.body)}`);
   }
+  {
+    // Zip-slip: a zip with a path-traversal entry (../evil.txt) must be rejected.
+    // The zip is crafted with Python's zipfile (which doesn't sanitise paths);
+    // the base64 constant is deterministic and verified.
+    const zipSlipB64 =
+      "UEsDBBQAAAAAAAAAIQByrErGCwAAAAsAAAALAAAALi4vZXZpbC50eHRiYWQgY29udGVudFBLAQIU" +
+      "AxQAAAAAAAAAIQByrErGCwAAAAsAAAALAAAAAAAAAAAAAACAAQAAAAAuLi9ldmlsLnR4dFBLBQYA" +
+      "AAAAAQABADkAAAA0AAAAAAA=";
+    const zipSlipBuf = Buffer.from(zipSlipB64, "base64");
+    const form = new FormData();
+    form.append("code", zipSlipBuf, { filename: "slip.zip", contentType: "application/zip" });
+    const r = await request("POST", "/v1/deployments/intake/zip", {
+      headers: authHeaders(keyA),
+      formData: form,
+    });
+    console.log(`  POST /intake/zip (zip-slip ../evil.txt) → ${r.status}  body=${JSON.stringify(r.body)}`);
+    r.status === 400 ? ok("zip-slip entry → 400") : fail("zip-slip should 400", `got ${r.status} ${JSON.stringify(r.body)}`);
+    (r.body as any)?.message?.includes("unsafe path")
+      ? ok("zip-slip → unsafe path message")
+      : fail("zip-slip → expected 'unsafe path' in message", JSON.stringify(r.body));
+  }
+  {
+    // 50 MB cap: multer must reject the upload before it reaches zip validation.
+    // The buffer doesn't need to be a valid zip — multer counts multipart bytes.
+    const oversizedBuf = Buffer.alloc(50 * 1024 * 1024 + 1, 0x42);
+    const form = new FormData();
+    form.append("code", oversizedBuf, { filename: "big.zip", contentType: "application/zip" });
+    console.log(`  Sending ${oversizedBuf.length} byte payload (50 MB + 1)…`);
+    const r = await request("POST", "/v1/deployments/intake/zip", {
+      headers: authHeaders(keyA),
+      formData: form,
+    });
+    console.log(`  POST /intake/zip (oversized) → ${r.status}  body=${JSON.stringify(r.body)}`);
+    r.status === 413 ? ok("oversized upload → 413") : fail("oversized upload should 413", `got ${r.status}`);
+    (r.body as any)?.error === "file_too_large"
+      ? ok("oversized upload → error=file_too_large")
+      : fail("oversized upload → expected error=file_too_large", JSON.stringify(r.body));
+  }
 
   // ════════════════════════════════════════════════════════════════════════════
   section("H: Reaper — cleans stuck deployments");
@@ -1090,6 +1128,150 @@ async function main(): Promise<void> {
     // Disable fly-error mode and clean up
     await request("POST", "/test/set-fly-error", { body: { enabled: false } });
     await pool.query("DELETE FROM apps WHERE id=$1", [errAppId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section O — Real flyClient interceptor (no stubs, local mock HTTP server)
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("O: Real flyClient interceptor — FlyApiError + credential scrubbing");
+
+    // ── Spin up a tiny mock HTTP server ──────────────────────────────────────
+    // We use a responseQueue so each incoming request pops one entry.
+    type MockResponse = { status: number; body: Record<string, unknown> };
+    const responseQueue: MockResponse[] = [];
+
+    const mockServer = http.createServer((req, res) => {
+      const next = responseQueue.shift() ?? { status: 500, body: { error: "unexpected request" } };
+      res.writeHead(next.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(next.body));
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const mockAddr = mockServer.address() as { port: number };
+    const mockPort = mockAddr.port;
+    const mockBase = `http://127.0.0.1:${mockPort}`;
+
+    // Set env vars BEFORE requiring flyClient so makeClient() picks them up.
+    // Use 127.0.0.1 — resolveBaseUrl() honours it in every environment.
+    const O_TOKEN = "O_TEST_FLY_TOKEN_SECRET_VALUE";
+    const prevFlyApiBase = process.env.FLY_API_BASE;
+    const prevFlyToken = process.env.FLY_API_TOKEN;
+    process.env.FLY_API_BASE = mockBase;
+    process.env.FLY_API_TOKEN = O_TOKEN;
+
+    // Require the real flyClient — run-tests.ts is a separate process, no stubs
+    const { createFlyApp, destroyFlyApp, allocateFlyIp, FlyApiError } =
+      require("../src/services/flyClient") as {
+        createFlyApp: (name: string, org: string) => Promise<void>;
+        destroyFlyApp: (name: string) => Promise<void>;
+        allocateFlyIp: (name: string) => Promise<string>;
+        FlyApiError: new (status: number, msg: string) => Error & { status: number };
+      };
+
+    // ── O1: createFlyApp — mock returns 401 ──────────────────────────────────
+    responseQueue.push({ status: 401, body: { error: "token validation error" } });
+    let o1Err: unknown;
+    try { await createFlyApp("o-test-app", "o-test-org"); } catch (e) { o1Err = e; }
+
+    o1Err instanceof FlyApiError
+      ? ok("O1: createFlyApp 401 throws FlyApiError")
+      : fail("O1: createFlyApp 401 did not throw FlyApiError", String(o1Err));
+    (o1Err instanceof FlyApiError && (o1Err as { status: number }).status === 401)
+      ? ok("O1: FlyApiError.status === 401")
+      : fail("O1: FlyApiError.status !== 401");
+    (o1Err instanceof FlyApiError && o1Err.message === "token validation error")
+      ? ok("O1: FlyApiError.message === 'token validation error'")
+      : fail("O1: FlyApiError.message mismatch", String(o1Err instanceof Error ? o1Err.message : o1Err));
+
+    // ── O2: createFlyApp — credential scrubbing in serialised error ───────────
+    if (o1Err instanceof Error) {
+      const j = JSON.stringify(o1Err, Object.getOwnPropertyNames(o1Err));
+      const u = require("util").inspect(o1Err, { depth: 5 });
+      !j.includes(O_TOKEN) && !u.includes(O_TOKEN)
+        ? ok("O2: token value absent from JSON.stringify + util.inspect of FlyApiError")
+        : fail("O2: token value leaked in serialised FlyApiError");
+      !j.includes("Bearer") && !u.includes("Bearer")
+        ? ok("O2: 'Bearer' absent from serialised FlyApiError")
+        : fail("O2: 'Bearer' leaked in serialised FlyApiError");
+      !j.toLowerCase().includes("authorization") && !u.toLowerCase().includes("authorization")
+        ? ok("O2: 'Authorization' absent from serialised FlyApiError")
+        : fail("O2: 'Authorization' leaked in serialised FlyApiError");
+    } else {
+      fail("O2: skipped — O1 did not throw Error");
+      fail("O2: skipped");
+      fail("O2: skipped");
+    }
+
+    // ── O3: createFlyApp — 500 with message field ─────────────────────────────
+    responseQueue.push({ status: 500, body: { message: "internal server error" } });
+    let o3Err: unknown;
+    try { await createFlyApp("o-test-app", "o-test-org"); } catch (e) { o3Err = e; }
+
+    o3Err instanceof FlyApiError
+      ? ok("O3: createFlyApp 500 throws FlyApiError")
+      : fail("O3: createFlyApp 500 did not throw FlyApiError", String(o3Err));
+    (o3Err instanceof FlyApiError && (o3Err as { status: number }).status === 500)
+      ? ok("O3: FlyApiError.status === 500")
+      : fail("O3: FlyApiError.status !== 500");
+
+    // ── O4: destroyFlyApp — 404 returns quietly ───────────────────────────────
+    responseQueue.push({ status: 404, body: { error: "app not found" } });
+    let o4Err: unknown;
+    try { await destroyFlyApp("o-test-app"); }
+    catch (e) { o4Err = e; }
+
+    o4Err === undefined
+      ? ok("O4: destroyFlyApp 404 returns quietly (no throw)")
+      : fail("O4: destroyFlyApp 404 threw unexpectedly", String(o4Err));
+
+    // ── O5: destroyFlyApp — 401 throws FlyApiError ────────────────────────────
+    responseQueue.push({ status: 401, body: { error: "token validation error" } });
+    let o5Err: unknown;
+    try { await destroyFlyApp("o-test-app"); } catch (e) { o5Err = e; }
+
+    o5Err instanceof FlyApiError
+      ? ok("O5: destroyFlyApp 401 throws FlyApiError")
+      : fail("O5: destroyFlyApp 401 did not throw FlyApiError", String(o5Err));
+    (o5Err instanceof FlyApiError && (o5Err as { status: number }).status === 401)
+      ? ok("O5: destroyFlyApp FlyApiError.status === 401")
+      : fail("O5: destroyFlyApp FlyApiError.status !== 401");
+
+    // ── O6: allocateFlyIp — 401 throws FlyApiError ───────────────────────────
+    responseQueue.push({ status: 401, body: { error: "token validation error" } });
+    let o6Err: unknown;
+    try { await allocateFlyIp("o-test-app"); } catch (e) { o6Err = e; }
+
+    o6Err instanceof FlyApiError
+      ? ok("O6: allocateFlyIp 401 throws FlyApiError")
+      : fail("O6: allocateFlyIp 401 did not throw FlyApiError", String(o6Err));
+
+    // ── O7: resolveBaseUrl — non-local override is always ignored ────────────────
+    const { resolveBaseUrl } =
+      require("../src/services/flyClient") as { resolveBaseUrl: () => string };
+
+    process.env.FLY_API_BASE = "https://example.com/v1";
+    const o7Base = resolveBaseUrl();
+    console.log(`  resolveBaseUrl(FLY_API_BASE=https://example.com, no NODE_ENV) → "${o7Base}"`);
+    o7Base === "https://api.machines.dev/v1"
+      ? ok("O7: https://example.com override ignored — falls back to api.machines.dev")
+      : fail("O7: expected api.machines.dev but got " + o7Base);
+
+    // ── O8: resolveBaseUrl — 127.0.0.1 override is honoured without NODE_ENV=test ─
+    process.env.FLY_API_BASE = mockBase; // http://127.0.0.1:<port>
+    const o8Base = resolveBaseUrl();
+    console.log(`  resolveBaseUrl(FLY_API_BASE=http://127.0.0.1:${mockPort}, no NODE_ENV) → "${o8Base}"`);
+    o8Base === mockBase
+      ? ok("O8: http://127.0.0.1 override honoured without NODE_ENV=test")
+      : fail("O8: expected " + mockBase + " but got " + o8Base);
+
+    // ── Restore env and shut down mock server ─────────────────────────────────
+    if (prevFlyApiBase === undefined) delete process.env.FLY_API_BASE;
+    else process.env.FLY_API_BASE = prevFlyApiBase;
+    if (prevFlyToken === undefined) delete process.env.FLY_API_TOKEN;
+    else process.env.FLY_API_TOKEN = prevFlyToken;
+
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
   }
 
   // ════════════════════════════════════════════════════════════════════════════

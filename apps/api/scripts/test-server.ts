@@ -35,7 +35,6 @@ console.error = (...args: unknown[]) => {
   _origConsoleError(...args);
 };
 
-import crypto from "crypto";
 import express, { Request, Response, NextFunction } from "express";
 import { healthRouter } from "../src/routes/health";
 import { appsRouter } from "../src/routes/apps";
@@ -46,8 +45,8 @@ import { apiKeysRouter } from "../src/routes/apiKeys";
 import { authRouter } from "../src/routes/auth";
 import { startReaper } from "../src/lib/reaper";
 import { eventBus } from "../src/lib/eventBus";
-import { safeErr } from "../src/lib/safeErr";
 import { pool } from "../src/db";
+import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/errorHandler";
 
 // ── Stub deployRunner ─────────────────────────────────────────────────────────
 // Override the module-level import used by intake.ts.
@@ -165,10 +164,7 @@ const app = express();
 app.use(express.json());
 
 // Attach a request ID so the error middleware can echo it back
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  (req as Request & { id: string }).id = crypto.randomUUID();
-  next();
-});
+app.use(requestIdMiddleware);
 
 // Test-control endpoint: POST /test/set-deploy-mode { mode: "success"|"failure" }
 app.post("/test/set-deploy-mode", (req, res) => {
@@ -216,14 +212,7 @@ app.use("/v1/deployments", deploymentsRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 
 // Final error middleware — catches anything forwarded via next(err)
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
-  const requestId = (req as Request & { id?: string }).id ?? "unknown";
-  console.error(`[test-server] unhandled error request_id=${requestId}:`, safeErr(err));
-  if (!res.headersSent) {
-    res.status(500).json({ error: "internal_error", request_id: requestId });
-  }
-});
+app.use(errorHandlerMiddleware);
 
 startReaper();
 

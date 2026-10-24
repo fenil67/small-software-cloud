@@ -1,7 +1,5 @@
 import axios from "axios";
 
-const FLY_API_BASE = "https://api.machines.dev/v1";
-
 /**
  * Thrown by every flyClient function on any HTTP error.
  * Carries only the HTTP status and a safe message — no request config,
@@ -14,9 +12,42 @@ export class FlyApiError extends Error {
   }
 }
 
+const FLY_API_DEFAULT = "https://api.machines.dev/v1";
+
+/**
+ * Resolves the base URL for Fly API calls.
+ *
+ * FLY_API_BASE is only honoured when the parsed hostname is exactly
+ * localhost, 127.0.0.1, or ::1.  Any other value is dropped and the
+ * production URL is used — in every environment — so a misconfigured or
+ * injected env var cannot redirect FLY_API_TOKEN to an arbitrary host.
+ *
+ * Exported so tests can assert on the resolution logic without making real
+ * network calls.
+ */
+export function resolveBaseUrl(): string {
+  const override = process.env.FLY_API_BASE;
+  if (!override) return FLY_API_DEFAULT;
+
+  let hostname: string;
+  try {
+    hostname = new URL(override).hostname;
+  } catch {
+    console.error("[fly] ignoring FLY_API_BASE override");
+    return FLY_API_DEFAULT;
+  }
+
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+    return override;
+  }
+
+  console.error("[fly] ignoring FLY_API_BASE override");
+  return FLY_API_DEFAULT;
+}
+
 function makeClient() {
   const client = axios.create({
-    baseURL: FLY_API_BASE,
+    baseURL: resolveBaseUrl(),
     headers: { Authorization: `Bearer ${process.env.FLY_API_TOKEN}` },
     timeout: 30_000,
   });

@@ -7,7 +7,7 @@
  * with { deployment_id, app_id, stream_url }.
  */
 
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
@@ -25,6 +25,22 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB hard cap (enforced before processing)
 });
+
+/**
+ * Express middleware that runs multer's upload.single("code") and converts
+ * a LIMIT_FILE_SIZE MulterError into a 413 response before it reaches the
+ * generic error handler.  All other errors are forwarded via next(err).
+ */
+function limitedUpload(req: Request, res: Response, next: NextFunction): void {
+  upload.single("code")(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({ error: "file_too_large", message: "Upload exceeds the 50 MB limit." });
+      return;
+    }
+    if (err) { next(err as Error); return; }
+    next();
+  });
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -109,7 +125,7 @@ async function createAppAndDeployment(
 
 intakeRouter.post(
   "/zip",
-  upload.single("code"),
+  limitedUpload,
   asyncHandler(async (req: Request, res: Response) => {
     if (!req.file) {
       res.status(400).json({ error: "validation_error", message: "Field 'code' (zip file) is required." });
