@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { requireAuth } from "../middleware/requireAuth";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const deployStreamRouter = Router();
 deployStreamRouter.use(requireAuth);
@@ -27,7 +28,7 @@ async function resolveCallerOrgId(req: Request): Promise<string | null> {
   return rows[0]?.id ?? null;
 }
 
-deployStreamRouter.get("/:id/stream", async (req: Request, res: Response) => {
+deployStreamRouter.get("/:id/stream", asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
 
   // Auth: verify caller owns this deployment's org
@@ -98,4 +99,4 @@ deployStreamRouter.get("/:id/stream", async (req: Request, res: Response) => {
 
   emitter.on("event", onEvent);
   req.on("close", cleanup);
-});
+}));

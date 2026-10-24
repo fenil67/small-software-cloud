@@ -15,6 +15,7 @@ import { validateZip, ZipValidationError } from "../lib/zipValidate";
 import { checkDeployLimits } from "../lib/deployLimits";
 import { ensureUser, ensureOrg } from "../lib/clerkSync";
 import { runDeploy } from "../services/deployRunner";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const intakeRouter = Router();
 intakeRouter.use(requireAuth);
@@ -35,7 +36,7 @@ async function resolveOrgId(req: Request): Promise<string | null> {
 
 async function resolveUserId(req: Request): Promise<string | null> {
   const sscAuth = req.sscAuth!;
-  if (sscAuth.type === "api_key") return null;
+  if (sscAuth.type === "api_key") return sscAuth.apiKeyCreatedBy ?? null;
   if (!sscAuth.clerkUserId) return null;
   return ensureUser(sscAuth.clerkUserId);
 }
@@ -108,7 +109,7 @@ async function createAppAndDeployment(
 intakeRouter.post(
   "/zip",
   upload.single("code"),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     if (!req.file) {
       res.status(400).json({ error: "validation_error", message: "Field 'code' (zip file) is required." });
       return;
@@ -170,12 +171,12 @@ intakeRouter.post(
       app_id: appId,
       stream_url: `/v1/deployments/${deploymentId}/stream`,
     });
-  },
+  }),
 );
 
 // ─── POST /github ─────────────────────────────────────────────────────────────
 
-intakeRouter.post("/github", async (req: Request, res: Response) => {
+intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) => {
   const { github_url, app_id: existingAppId, app_name } = req.body as {
     github_url?: string;
     app_id?: string;
@@ -243,4 +244,4 @@ intakeRouter.post("/github", async (req: Request, res: Response) => {
     app_id: appId,
     stream_url: `/v1/deployments/${deploymentId}/stream`,
   });
-});
+}));

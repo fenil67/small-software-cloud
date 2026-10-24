@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
 import { generateApiKey } from "../lib/apiKeys";
 import { ensureUser, ensureOrg } from "../lib/clerkSync";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const apiKeysRouter = Router();
 apiKeysRouter.use(requireAuth);
@@ -27,7 +28,7 @@ function requireClerkOrgAdmin(req: Request, res: Response, next: NextFunction): 
   next();
 }
 
-apiKeysRouter.post("/", requireClerkOrgAdmin, async (req: Request, res: Response) => {
+apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
   const { name } = req.body as { name?: string };
   if (!name?.trim()) {
@@ -52,9 +53,9 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, async (req: Request, res: Response
     key_prefix: keyPrefix,
     created_at: rows[0].created_at,
   });
-});
+}));
 
-apiKeysRouter.get("/", requireClerkOrgAdmin, async (req: Request, res: Response) => {
+apiKeysRouter.get("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
   const orgId = await ensureOrg(sscAuth.clerkOrgId!);
 
@@ -64,9 +65,9 @@ apiKeysRouter.get("/", requireClerkOrgAdmin, async (req: Request, res: Response)
     [orgId],
   );
   res.json(rows);
-});
+}));
 
-apiKeysRouter.delete("/:id", requireClerkOrgAdmin, async (req: Request, res: Response) => {
+apiKeysRouter.delete("/:id", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
   const orgId = await ensureOrg(sscAuth.clerkOrgId!);
 
@@ -77,4 +78,4 @@ apiKeysRouter.delete("/:id", requireClerkOrgAdmin, async (req: Request, res: Res
   );
   if (!rowCount) { res.status(404).json({ error: "key_not_found" }); return; }
   res.json({ revoked: true });
-});
+}));

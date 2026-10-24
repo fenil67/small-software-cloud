@@ -1,11 +1,12 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const orgsRouter = Router();
 orgsRouter.use(requireAuth);
 
-orgsRouter.get("/current", async (req: Request, res: Response) => {
+orgsRouter.get("/current", asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
   let orgId: string;
 
@@ -26,4 +27,4 @@ orgsRouter.get("/current", async (req: Request, res: Response) => {
 
   const { rows } = await pool.query("SELECT id, name FROM orgs WHERE id = $1", [orgId]);
   res.json(rows[0] ?? {});
-});
+}));

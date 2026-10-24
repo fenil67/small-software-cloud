@@ -20,6 +20,8 @@ export interface SscAuth {
   clerkOrgId?: string;
   clerkOrgRole?: string;
   internalOrgId?: string;
+  /** users.id of the user who created this API key (undefined when key has no creator) */
+  apiKeyCreatedBy?: string;
 }
 
 declare global {
@@ -41,10 +43,10 @@ export async function requireAuth(
     const token = authHeader.slice("Bearer ".length).trim();
     if (looksLikeApiKey(token)) {
       const keyHash = hashApiKey(token);
-      let rows: { org_id: string }[];
+      let rows: { org_id: string; created_by: string | null }[];
       try {
-        ({ rows } = await pool.query<{ org_id: string }>(
-          `SELECT org_id FROM api_keys
+        ({ rows } = await pool.query<{ org_id: string; created_by: string | null }>(
+          `SELECT org_id, created_by FROM api_keys
            WHERE key_hash = $1
              AND revoked_at IS NULL`,
           [keyHash],
@@ -69,6 +71,7 @@ export async function requireAuth(
       req.sscAuth = {
         type: "api_key",
         internalOrgId: rows[0].org_id,
+        ...(rows[0].created_by ? { apiKeyCreatedBy: rows[0].created_by } : {}),
       };
       next();
       return;

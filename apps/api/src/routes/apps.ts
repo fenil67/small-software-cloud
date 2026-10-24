@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
 import { destroyFlyApp } from "../services/flyClient";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const appsRouter = Router();
 appsRouter.use(requireAuth);
@@ -18,7 +19,7 @@ async function getOrgId(req: Request): Promise<string | null> {
   return rows[0]?.id ?? null;
 }
 
-appsRouter.get("/", async (req: Request, res: Response) => {
+appsRouter.get("/", asyncHandler(async (req: Request, res: Response) => {
   const orgId = await getOrgId(req);
   if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
 
@@ -28,9 +29,9 @@ appsRouter.get("/", async (req: Request, res: Response) => {
     [orgId],
   );
   res.json(rows);
-});
+}));
 
-appsRouter.get("/:id", async (req: Request, res: Response) => {
+appsRouter.get("/:id", asyncHandler(async (req: Request, res: Response) => {
   const orgId = await getOrgId(req);
   if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
 
@@ -41,11 +42,11 @@ appsRouter.get("/:id", async (req: Request, res: Response) => {
   );
   if (!rows[0]) { res.status(404).json({ error: "app_not_found" }); return; }
   res.json(rows[0]);
-});
+}));
 
 // DELETE /v1/apps/:id
 // Destroys the Fly app, marks DB record deleted (soft-delete via deleted_at)
-appsRouter.delete("/:id", async (req: Request, res: Response) => {
+appsRouter.delete("/:id", asyncHandler(async (req: Request, res: Response) => {
   const orgId = await getOrgId(req);
   if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
 
@@ -72,4 +73,4 @@ appsRouter.delete("/:id", async (req: Request, res: Response) => {
   );
 
   res.status(200).json({ deleted: true });
-});
+}));

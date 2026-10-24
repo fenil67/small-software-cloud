@@ -119,7 +119,16 @@ function request(
         });
       },
     );
-    req.on("error", reject);
+    // 8-second socket timeout so a hung server-side async handler doesn't stall
+    // the whole suite indefinitely (see intake.ts owner_id mismatch report).
+    req.setTimeout(8000, () => {
+      req.destroy(new Error("request timeout after 8s — server sent no response"));
+    });
+    // Resolve with a sentinel status-0 response instead of rejecting so a
+    // hung or crashed server doesn't abort the whole suite at main().catch().
+    req.on("error", (err) => {
+      resolve({ status: 0, body: { error: err.message }, text: err.message, headers: {} });
+    });
     if (postData !== undefined) req.write(postData);
     req.end();
   });
@@ -141,7 +150,10 @@ function streamRequest(url: string, headers: Record<string, string>): Promise<st
         if (res.statusCode !== 200) {
           const d: Buffer[] = [];
           res.on("data", (c: Buffer) => d.push(c));
-          res.on("end", () => reject(new Error(`stream ${res.statusCode}: ${Buffer.concat(d).toString()}`)));
+          res.on("end", () => {
+            console.log(`  [streamRequest] non-200: ${res.statusCode} ${Buffer.concat(d).toString()}`);
+            resolve([]); // resolve empty so callers record failures, not crash
+          });
           return;
         }
         let buf = "";
@@ -156,7 +168,15 @@ function streamRequest(url: string, headers: Record<string, string>): Promise<st
         res.on("end", () => resolve(chunks));
       },
     );
-    req.on("error", reject);
+    req.setTimeout(8000, () => {
+      req.destroy(new Error("stream timeout after 8s"));
+    });
+    req.on("error", (err) => {
+      // resolve with empty chunks so callers still run their assertions and
+      // record failures rather than crashing the suite
+      console.log(`  [streamRequest] error: ${err.message}`);
+      resolve([]);
+    });
     req.end();
   });
 }
@@ -166,6 +186,7 @@ function streamRequest(url: string, headers: Record<string, string>): Promise<st
 interface SeedResult {
   orgAId: string;
   orgBId: string;
+  userId: string;     // test user (needed for apps.owner_id NOT NULL)
   keyA: string;       // valid key for org A
   keyARevoked: string; // revoked key for org A
   keyB: string;       // valid key for org B
@@ -179,13 +200,21 @@ async function seed(): Promise<SeedResult> {
   await pool.query("DELETE FROM users");
   await pool.query("DELETE FROM orgs");
 
+  // Real schema: users.email NOT NULL, users.display_name nullable
+  const userRow = await pool.query<{ id: string }>(
+    "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+    ["clerk_user_test_seed", "seed@test.local", "Seed User"],
+  );
+  const userId = userRow.rows[0].id;
+
+  // Real schema: orgs.slug TEXT NOT NULL UNIQUE
   const orgA = await pool.query<{ id: string }>(
-    "INSERT INTO orgs (clerk_org_id, name) VALUES ($1,$2) RETURNING id",
-    ["clerk_org_aaa", "Org Alpha"],
+    "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+    ["clerk_org_aaa", "Org Alpha", "org-alpha"],
   );
   const orgB = await pool.query<{ id: string }>(
-    "INSERT INTO orgs (clerk_org_id, name) VALUES ($1,$2) RETURNING id",
-    ["clerk_org_bbb", "Org Beta"],
+    "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+    ["clerk_org_bbb", "Org Beta", "org-beta"],
   );
   const orgAId = orgA.rows[0].id;
   const orgBId = orgB.rows[0].id;
@@ -193,9 +222,9 @@ async function seed(): Promise<SeedResult> {
   const genAndInsert = async (orgId: string, name: string, revoked = false) => {
     const { fullKey, keyPrefix, keyHash } = generateApiKey();
     await pool.query(
-      `INSERT INTO api_keys (org_id, name, key_prefix, key_hash${revoked ? ", revoked_at" : ""})
-       VALUES ($1, $2, $3, $4${revoked ? ", now()" : ""})`,
-      [orgId, name, keyPrefix, keyHash],
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash${revoked ? ", revoked_at" : ""})
+       VALUES ($1, $2, $3, $4, $5${revoked ? ", now()" : ""})`,
+      [orgId, userId, name, keyPrefix, keyHash],
     );
     return fullKey;
   };
@@ -204,8 +233,8 @@ async function seed(): Promise<SeedResult> {
   const keyARevoked = await genAndInsert(orgAId, "Key A-revoked", true);
   const keyB = await genAndInsert(orgBId, "Key B1");
 
-  console.log(DIM(`  seeded: orgA=${orgAId.slice(0, 8)}… orgB=${orgBId.slice(0, 8)}…`));
-  return { orgAId, orgBId, keyA, keyARevoked, keyB };
+  console.log(DIM(`  seeded: orgA=${orgAId.slice(0, 8)}… orgB=${orgBId.slice(0, 8)}… user=${userId.slice(0, 8)}…`));
+  return { orgAId, orgBId, userId, keyA, keyARevoked, keyB };
 }
 
 function authHeaders(key: string): Record<string, string> {
@@ -254,7 +283,7 @@ async function main(): Promise<void> {
   await waitForServer();
   console.log(DIM("  server ready"));
 
-  const { orgAId, orgBId, keyA, keyARevoked, keyB } = await seed();
+  const { orgAId, orgBId, userId, keyA, keyARevoked, keyB } = await seed();
 
   // ════════════════════════════════════════════════════════════════════════════
   section("A: API Key Auth — valid / revoked / invalid");
@@ -397,6 +426,7 @@ async function main(): Promise<void> {
     });
     const form = new FormData();
     form.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+    form.append("app_name", "bad-app");
     const r = await request("POST", "/v1/deployments/intake/zip", {
       headers: authHeaders(keyA),
       formData: form,
@@ -452,8 +482,14 @@ async function main(): Promise<void> {
     const redeployId = (r.body as any).deployment_id ?? "";
     const redeployAppId = (r.body as any).app_id ?? "";
 
-    // Verify app_id is the same
-    redeployAppId === successAppId ? ok("redeploy reuses same app_id") : fail("redeploy should reuse app_id");
+    // Verify app_id is the same (only meaningful if intake succeeded)
+    if (r.status === 202) {
+      redeployAppId === successAppId
+        ? ok("redeploy reuses same app_id")
+        : fail("redeploy should reuse app_id", `redeployAppId=${redeployAppId} successAppId=${successAppId}`);
+    } else {
+      fail("redeploy app_id check skipped (intake failed)", `status=${r.status}`);
+    }
 
     // Stream it
     await new Promise((r) => setTimeout(r, 300));
@@ -465,14 +501,18 @@ async function main(): Promise<void> {
     const parsed = events.map((e) => { try { return JSON.parse(e); } catch { return {}; } });
     parsed.some((e: any) => e.type === "status" && e.status === "success") ? ok("redeploy stream → success") : fail("redeploy stream should succeed");
 
-    // Check version incremented
-    const { rows } = await pool.query<{ version: number }>(
-      "SELECT version FROM deployments WHERE id=$1",
-      [redeployId],
-    );
-    const v = rows[0]?.version ?? 0;
-    console.log(`  Redeploy version=${v}`);
-    v >= 2 ? ok(`redeploy version=${v} (incremented)`) : fail("redeploy version should be ≥2");
+    // Check version incremented (skip if intake failed — redeployId is empty)
+    if (redeployId) {
+      const { rows } = await pool.query<{ version: number }>(
+        "SELECT version FROM deployments WHERE id=$1",
+        [redeployId],
+      );
+      const v = rows[0]?.version ?? 0;
+      console.log(`  Redeploy version=${v}`);
+      v >= 2 ? ok(`redeploy version=${v} (incremented)`) : fail("redeploy version should be ≥2");
+    } else {
+      fail("redeploy version check skipped (no deployment_id — intake failed)");
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -484,6 +524,7 @@ async function main(): Promise<void> {
     const zip = await buildZip({ "package.json": '{"name":"hourly-test"}' });
     const form = new FormData();
     form.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+    form.append("app_name", "hourly-test");
     const r = await request("POST", "/v1/deployments/intake/zip", {
       headers: authHeaders(keyA),
       formData: form,
@@ -499,14 +540,14 @@ async function main(): Promise<void> {
   // F2: app-count limit — use a fresh org seeded with 10 active apps
   {
     const { rows: orgRows } = await pool.query<{ id: string }>(
-      "INSERT INTO orgs (clerk_org_id, name) VALUES ('clerk_org_limit','Limit Org') RETURNING id",
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_limit','Limit Org','limit-org') RETURNING id",
     );
     const limitOrgId = orgRows[0].id;
     const limitKey = await (async () => {
       const { fullKey, keyPrefix, keyHash } = generateApiKey();
       await pool.query(
-        "INSERT INTO api_keys (org_id, name, key_prefix, key_hash) VALUES ($1,'limit-key',$2,$3)",
-        [limitOrgId, keyPrefix, keyHash],
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'limit-key',$3,$4)",
+        [limitOrgId, userId, keyPrefix, keyHash],
       );
       return fullKey;
     })();
@@ -515,8 +556,8 @@ async function main(): Promise<void> {
     // Use started_at 2 hours ago so they don't trigger the hourly limit
     for (let i = 0; i < 10; i++) {
       const { rows: appRows } = await pool.query<{ id: string }>(
-        "INSERT INTO apps (org_id, name, slug, source_type) VALUES ($1,$2,$3,'zip') RETURNING id",
-        [limitOrgId, `limit-app-${i}`, `limit-app-${i}`],
+        "INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,$3,$4,'zip') RETURNING id",
+        [limitOrgId, userId, `limit-app-${i}`, `limit-app-${i}`],
       );
       await pool.query(
         "INSERT INTO deployments (app_id, version, status, started_at) VALUES ($1,1,'success', now() - INTERVAL '2 hours')",
@@ -543,14 +584,14 @@ async function main(): Promise<void> {
   // F3: failed apps do NOT count toward the limit
   {
     const { rows: orgRows } = await pool.query<{ id: string }>(
-      "INSERT INTO orgs (clerk_org_id, name) VALUES ('clerk_org_failcheck','FailCheck Org') RETURNING id",
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_failcheck','FailCheck Org','failcheck-org') RETURNING id",
     );
     const failCheckOrgId = orgRows[0].id;
     const failCheckKey = await (async () => {
       const { fullKey, keyPrefix, keyHash } = generateApiKey();
       await pool.query(
-        "INSERT INTO api_keys (org_id, name, key_prefix, key_hash) VALUES ($1,'fc-key',$2,$3)",
-        [failCheckOrgId, keyPrefix, keyHash],
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'fc-key',$3,$4)",
+        [failCheckOrgId, userId, keyPrefix, keyHash],
       );
       return fullKey;
     })();
@@ -559,8 +600,8 @@ async function main(): Promise<void> {
     // Also use old timestamps to avoid hourly limit
     for (let i = 0; i < 10; i++) {
       const { rows: appRows } = await pool.query<{ id: string }>(
-        "INSERT INTO apps (org_id, name, slug, source_type) VALUES ($1,$2,$3,'zip') RETURNING id",
-        [failCheckOrgId, `fail-app-${i}`, `fail-app-${i}`],
+        "INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,$3,$4,'zip') RETURNING id",
+        [failCheckOrgId, userId, `fail-app-${i}`, `fail-app-${i}`],
       );
       await pool.query(
         "INSERT INTO deployments (app_id, version, status, started_at) VALUES ($1,1,'failed', now() - INTERVAL '2 hours')",
@@ -597,6 +638,7 @@ async function main(): Promise<void> {
     console.log(`  Zip buffer size: ${zip.length} bytes`);
     const form = new FormData();
     form.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+    form.append("app_name", "direct-upload");
     const r = await request("POST", "/v1/deployments/intake/zip", {
       headers: authHeaders(keyA),
       formData: form,
@@ -627,8 +669,8 @@ async function main(): Promise<void> {
   {
     // Insert a deployment stuck in 'building' for 20 minutes
     const { rows: appRows } = await pool.query<{ id: string }>(
-      "INSERT INTO apps (org_id, name, slug, source_type) VALUES ($1,'reaper-test','reaper-test','zip') RETURNING id",
-      [orgAId],
+      "INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,'reaper-test','reaper-test','zip') RETURNING id",
+      [orgAId, userId],
     );
     const { rows: depRows } = await pool.query<{ id: string }>(
       `INSERT INTO deployments (app_id, version, status, started_at)
@@ -671,8 +713,8 @@ async function main(): Promise<void> {
   {
     // Create an app to delete
     const { rows: appRows } = await pool.query<{ id: string }>(
-      "INSERT INTO apps (org_id, name, slug, source_type, fly_app_id) VALUES ($1,'delete-me','delete-me','zip','ssc-delete-me') RETURNING id",
-      [orgAId],
+      "INSERT INTO apps (org_id, owner_id, name, slug, source_type, fly_app_id) VALUES ($1,$2,'delete-me','delete-me','zip','ssc-delete-me') RETURNING id",
+      [orgAId, userId],
     );
     const appId = appRows[0].id;
 
@@ -911,6 +953,26 @@ async function main(): Promise<void> {
         }
       } finally { await cleanup(d); }
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("M: DB error → 500 JSON + server stays up");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const t0 = Date.now();
+    const r = await request("GET", "/test/db-error");
+    const elapsed = Date.now() - t0;
+    console.log(`  GET /test/db-error → ${r.status}  body=${JSON.stringify(r.body)}  (${elapsed}ms)`);
+    r.status === 500 ? ok("DB error → 500") : fail("DB error should 500", `got ${r.status} ${JSON.stringify(r.body)}`);
+    (r.body as any)?.error === "internal_error"
+      ? ok("500 body has error=internal_error")
+      : fail("500 body missing error=internal_error", JSON.stringify(r.body));
+    elapsed < 2000 ? ok(`response within 2s (${elapsed}ms)`) : fail(`response too slow: ${elapsed}ms`);
+
+    // Server must still be alive
+    const health = await request("GET", "/health");
+    health.status === 200 ? ok("server still alive after DB error") : fail("server died after DB error", `got ${health.status}`);
   }
 
   // ════════════════════════════════════════════════════════════════════════════

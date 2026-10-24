@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
+import { asyncHandler } from "../lib/asyncHandler";
 
 export const deploymentsRouter = Router();
 deploymentsRouter.use(requireAuth);
@@ -16,7 +17,7 @@ async function resolveCallerOrgId(req: Request): Promise<string | null> {
   return rows[0]?.id ?? null;
 }
 
-deploymentsRouter.get("/:id", async (req: Request, res: Response) => {
+deploymentsRouter.get("/:id", asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
 
   const callerOrgId = await resolveCallerOrgId(req);
@@ -56,4 +57,4 @@ deploymentsRouter.get("/:id", async (req: Request, res: Response) => {
     url: row.subdomain ? `https://${row.subdomain}` : null,
     stream_url: `/v1/deployments/${id}/stream`,
   });
-});
+}));

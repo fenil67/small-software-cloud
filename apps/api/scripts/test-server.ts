@@ -23,7 +23,8 @@ process.env.FLY_ORG_SLUG = "test-org";
 process.env.CLERK_SECRET_KEY = "sk_test_stubstubstubstub";
 process.env.SSC_TEST = "1";
 
-import express from "express";
+import crypto from "crypto";
+import express, { Request, Response, NextFunction } from "express";
 import { healthRouter } from "../src/routes/health";
 import { appsRouter } from "../src/routes/apps";
 import { deploymentsRouter } from "../src/routes/deployments";
@@ -126,6 +127,12 @@ flyModule.allocateFlyIp = async () => "1.2.3.4";
 const app = express();
 app.use(express.json());
 
+// Attach a request ID so the error middleware can echo it back
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  (req as Request & { id: string }).id = crypto.randomUUID();
+  next();
+});
+
 // Test-control endpoint: POST /test/set-deploy-mode { mode: "success"|"failure" }
 app.post("/test/set-deploy-mode", (req, res) => {
   const { mode } = req.body as { mode?: string };
@@ -134,6 +141,17 @@ app.post("/test/set-deploy-mode", (req, res) => {
     res.json({ ok: true, mode });
   } else {
     res.status(400).json({ error: "invalid mode" });
+  }
+});
+
+// Test-control endpoint: GET /test/db-error — deliberately queries a nonexistent table
+// Used by Section M to prove asyncHandler + error middleware returns 500 JSON
+app.get("/test/db-error", async (_req: Request, _res: Response, next: NextFunction) => {
+  try {
+    await pool.query("SELECT * FROM _nonexistent_table_xyzzy");
+  } catch (err) {
+    next(err);
+    return;
   }
 });
 
@@ -146,6 +164,16 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));
+
+// Final error middleware — catches anything forwarded via next(err)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  const requestId = (req as Request & { id?: string }).id ?? "unknown";
+  console.error(`[test-server] unhandled error request_id=${requestId}:`, err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: "internal_error", request_id: requestId });
+  }
+});
 
 startReaper();
 
