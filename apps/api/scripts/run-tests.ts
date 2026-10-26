@@ -1275,6 +1275,121 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section P — flyctl deploy flag guard (real binary, no network call)
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("P: flyctl deploy flags are all recognised by the installed binary");
+
+    // Run `flyctl deploy --help` and collect output.  The test does not call
+    // Fly — --help exits immediately without making any API requests.
+    const { execFileSync } = require("child_process") as typeof import("child_process");
+
+    let helpText = "";
+    let binaryOk = true;
+    try {
+      // flyctl prints --help to stdout; use stdio pipe so we can capture it.
+      helpText = execFileSync("flyctl", ["deploy", "--help"], {
+        encoding: "utf8",
+        // flyctl may exit non-zero when run with --help in some versions; that's fine.
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e: unknown) {
+      // execFileSync throws on non-zero exit but still fills stderr/stdout on
+      // the error object.  Grab whatever output was produced.
+      const ee = e as { stdout?: string; stderr?: string; message?: string };
+      helpText = (ee.stdout ?? "") + (ee.stderr ?? "");
+      if (!helpText.trim()) {
+        fail("P: flyctl deploy --help produced no output", String(ee.message));
+        binaryOk = false;
+      }
+    }
+
+    if (binaryOk) {
+      console.log(`  flyctl deploy --help → ${helpText.split("\n").length} lines`);
+
+      // These are the exact flags deployRunner passes.  --ha=false uses the --ha
+      // flag, so we check for "--ha" without the value suffix.
+      const requiredFlags: string[] = [
+        "--remote-only",
+        "--ha",
+        "--app",
+        "--yes",
+      ];
+
+      for (const flag of requiredFlags) {
+        helpText.includes(flag)
+          ? ok(`P: flyctl deploy --help lists ${flag}`)
+          : fail(`P: flyctl deploy --help does NOT list ${flag} — code would fail at runtime`);
+      }
+
+      // Also confirm --json is NOT a valid flag (this is the regression this
+      // test is designed to catch).
+      !helpText.includes("--json")
+        ? ok("P: --json is NOT a flyctl deploy flag (regression guard)")
+        : fail("P: --json appears in flyctl deploy --help — verify deployRunner args");
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section Q — deployRunner: stderr lines reach the SSE event stream
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("Q: deployRunner stderr lines appear in SSE log events");
+
+    // Create a fake flyctl binary that writes one sentinel to stderr, one to
+    // stdout, then exits 0.  Prepend its directory to PATH so spawn finds it.
+    const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-fake-flyctl-"));
+    const fakeFlyctlPath = path.join(fakeBinDir, "flyctl");
+    fs.writeFileSync(
+      fakeFlyctlPath,
+      "#!/bin/sh\necho 'Q_STDERR_SENTINEL' >&2\necho 'Q_STDOUT_LINE' >&1\n",
+      { mode: 0o755 },
+    );
+
+    const origPath = process.env.PATH;
+    process.env.PATH = fakeBinDir + ":" + (origPath ?? "");
+
+    // Require the real deployRunner (not the stubbed test-server copy).
+    // run-tests.ts is a separate process so no stubs are in effect.
+    const { runFlyctlDeploy } =
+      require("../src/services/deployRunner") as {
+        runFlyctlDeploy: (dir: string, appName: string, deploymentId: string) => Promise<void>;
+      };
+    const { eventBus } =
+      require("../src/lib/eventBus") as {
+        eventBus: { getOrCreate: (id: string) => import("events").EventEmitter };
+      };
+
+    // Give runFlyctlDeploy a real directory as cwd (spawn checks it exists).
+    const fakeCwd = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-fake-cwd-"));
+    const depId = "q-test-" + crypto.randomUUID().slice(0, 8);
+
+    // Subscribe BEFORE calling runFlyctlDeploy so we don't miss early events.
+    const collectedLogs: string[] = [];
+    eventBus.getOrCreate(depId).on("event", (evt: { type: string; message?: string }) => {
+      if (evt.type === "log" && evt.message) collectedLogs.push(evt.message);
+    });
+
+    await runFlyctlDeploy(fakeCwd, "fake-app", depId);
+
+    console.log(`  collected log events: [${collectedLogs.map((l) => JSON.stringify(l)).join(", ")}]`);
+
+    collectedLogs.some((l) => l.includes("Q_STDERR_SENTINEL"))
+      ? ok("Q: stderr line appears in SSE log events")
+      : fail("Q: stderr line missing from SSE log events", `got: [${collectedLogs.join(" | ")}]`);
+
+    collectedLogs.some((l) => l.includes("Q_STDOUT_LINE"))
+      ? ok("Q: stdout line still appears in SSE log events")
+      : fail("Q: stdout line missing from SSE log events", `got: [${collectedLogs.join(" | ")}]`);
+
+    // Restore env and clean up temp dirs.
+    if (origPath === undefined) delete process.env.PATH;
+    else process.env.PATH = origPath;
+    fs.rmSync(fakeBinDir, { recursive: true });
+    fs.rmSync(fakeCwd, { recursive: true });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

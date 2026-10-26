@@ -7,7 +7,7 @@ import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp } from "./flyClient";
-import { safeErr } from "../lib/safeErr";
+import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles } from "./dockerfileGen";
 
@@ -104,53 +104,77 @@ async function cloneRepo(githubUrl: string, deploymentId: string): Promise<strin
 }
 
 
-async function runFlyctlDeploy(
+// Exported for unit testing (fake flyctl binary on PATH).
+export async function runFlyctlDeploy(
   dir: string,
   appName: string,
   deploymentId: string,
-): Promise<string> {
+): Promise<void> {
   log(deploymentId, `Deploying to Fly app: ${appName}`);
 
   const outputLines: string[] = [];
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const proc = require("child_process").spawn(
       "flyctl",
-      ["deploy", "--app", appName, "--remote-only", "--ha=false", "--json"],
-      { cwd: dir, env: { ...process.env } },
+      // --remote-only: build on Fly's remote builders, not locally
+      // --ha=false:    deploy exactly one machine (avoid the default HA pair)
+      // --yes:         accept any interactive prompts non-interactively (CI-safe)
+      ["deploy", "--remote-only", "--ha=false", "--app", appName, "--yes"],
+      {
+        cwd: dir,
+        env: {
+          ...process.env,
+          CI: "true", // belt-and-suspenders: suppress interactive prompts
+        },
+      },
     );
 
     proc.stdout.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
       for (const line of lines) {
         outputLines.push(line);
-        log(deploymentId, line);
+        log(deploymentId, scrubSecrets(line));
       }
     });
+    // stderr carries flyctl progress, warnings, and error messages — send it
+    // to the SSE stream the same way as stdout so users see it in real time.
     proc.stderr.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
       for (const line of lines) {
         outputLines.push(line);
+        log(deploymentId, scrubSecrets(line));
       }
     });
 
+    // Without this handler, a missing flyctl binary raises ENOENT outside the
+    // Promise and the catch block in runDeploy never fires, leaving the SSE
+    // stream stuck on keep-alive pings.
+    proc.on("error", reject);
+
     proc.on("close", (code: number) => {
       if (code !== 0) {
-        const tail = outputLines.slice(-20).join("\n");
-        reject(new DeployError("deploy", `Build or deploy failed. Last output:\n${tail}`));
+        // When flyctl gets an unrecognised flag it prints ~20 lines of usage
+        // text instead of a useful error.  Detect that case and surface only
+        // the single "Error:" line so the failure message stays actionable.
+        const isUsageOutput = outputLines.some(
+          (l) => l.includes("Usage:") || l.includes("Global Flags:"),
+        );
+        let detail: string;
+        if (isUsageOutput) {
+          const errorLine =
+            outputLines.find((l) => l.startsWith("Error:")) ??
+            outputLines.slice(-1)[0] ??
+            "Unknown error";
+          detail = errorLine;
+        } else {
+          detail = `Last output:\n${outputLines.slice(-20).join("\n")}`;
+        }
+        reject(new DeployError("deploy", `Build or deploy failed. ${scrubSecrets(detail)}`));
         return;
       }
-      // Extract machine ID from JSON output if possible
-      try {
-        const jsonLine = outputLines.find((l) => l.startsWith("{"));
-        if (jsonLine) {
-          const parsed = JSON.parse(jsonLine) as { id?: string };
-          resolve(parsed.id ?? "");
-          return;
-        }
-      } catch {}
-      resolve("");
+      resolve();
     });
   });
 }
@@ -243,16 +267,18 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     await updateDeploymentStatus(deploymentId, "deploying");
     eventBus.emit(deploymentId, { type: "status", status: "deploying" });
 
-    const machineId = await runFlyctlDeploy(workDir, appName, deploymentId);
+    await runFlyctlDeploy(workDir, appName, deploymentId);
 
     // Step 5: success
+    // The live URL follows Fly's deterministic pattern; no JSON parsing needed.
+    // fly_machine_id is left NULL — it is purely informational and would require
+    // a separate listMachines() API call that isn't worth the extra latency here.
     const appUrl = `https://${appName}.fly.dev`;
     await pool.query(
       `UPDATE apps SET subdomain = $1 WHERE id = $2`,
       [appUrl, appId],
     );
     await updateDeploymentStatus(deploymentId, "success", {
-      fly_machine_id: machineId || undefined,
       finished: true,
     });
     eventBus.emit(deploymentId, { type: "url", url: appUrl });

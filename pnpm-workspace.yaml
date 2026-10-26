@@ -3,3 +3,4 @@ packages:
   - "packages/*"
 allowBuilds:
   '@clerk/shared': true
+  esbuild: false
