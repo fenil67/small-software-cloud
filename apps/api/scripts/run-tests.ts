@@ -1390,6 +1390,273 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section R — Slug uniqueness: partial index + collision handling
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("R: Slug uniqueness (partial index + collision retry)");
+
+    // Use a fresh org so slug state is clean for this section.
+    const { rows: rOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_slug_test','Slug Test Org','slug-test-org') RETURNING id",
+    );
+    const rOrgId = rOrgRows[0].id;
+    const rKey = await (async () => {
+      const { fullKey, keyPrefix, keyHash } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'r-key',$3,$4)",
+        [rOrgId, userId, keyPrefix, keyHash],
+      );
+      return fullKey;
+    })();
+
+    // R1: deploy twice with no explicit name (same app_name = "slug-test") →
+    //     first succeeds with slug "slug-test"; second gets a suffix because the
+    //     first app is still active.
+    {
+      const zip = await buildZip({ "package.json": '{"name":"slug-test"}', "app.js": "// v1" });
+      const form1 = new FormData();
+      form1.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+      form1.append("app_name", "slug-test"); // client-derived but no explicit-name flag
+      // We send app_name so the server uses "slug-test", but we do NOT mark it explicit.
+      // To simulate the auto-name path, we post WITHOUT app_name on the second request.
+
+      const r1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(rKey),
+        formData: form1,
+      });
+      console.log(`  R1a: first deploy (app_name=slug-test) → ${r1.status} ${JSON.stringify(r1.body)}`);
+      r1.status === 202
+        ? ok("R1a: first auto-name deploy → 202")
+        : fail("R1a: first auto-name deploy should 202", `got ${r1.status} ${JSON.stringify(r1.body)}`);
+
+      const appId1 = (r1.body as any).app_id ?? "";
+      if (appId1) {
+        const { rows: slugRows } = await pool.query<{ slug: string }>(
+          "SELECT slug FROM apps WHERE id=$1",
+          [appId1],
+        );
+        const slug1 = slugRows[0]?.slug ?? "";
+        console.log(`  R1a: first app slug = "${slug1}"`);
+        slug1 === "slug-test"
+          ? ok(`R1a: first app slug = "slug-test"`)
+          : fail("R1a: first app slug should be slug-test", `got "${slug1}"`);
+      } else {
+        fail("R1a: no app_id in response, skipping slug check");
+      }
+
+      // Second deploy with same name (no explicit flag — simulated via no app_name field)
+      const zip2 = await buildZip({ "package.json": '{"name":"slug-test"}', "app.js": "// v2" });
+      const form2 = new FormData();
+      form2.append("code", zip2, { filename: "app.zip", contentType: "application/zip" });
+      // Intentionally no app_name — server falls back to "app" as base slug.
+      // To test the suffix path properly, send the same name but without explicit flag.
+      // The server's auto-path retries on 23505 and appends a suffix.
+      form2.append("app_name", "slug-test"); // same name, NOT explicit (auto path)
+      // NOTE: since we can't tell the server "this is auto", test the explicit-name
+      // 409 path instead in R3; here verify the DB state via slug uniqueness.
+      const r2 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(rKey),
+        formData: form2,
+      });
+      console.log(`  R1b: second deploy (same name, first app still active) → ${r2.status} ${JSON.stringify(r2.body)}`);
+      // Both 202 (suffix appended) and 409 (if treated as explicit) are possible
+      // depending on server path.  Here app_name IS sent, so it IS the explicit path.
+      // So this should 409.
+      r2.status === 409 && (r2.body as any).error === "name_taken"
+        ? ok("R1b: explicit name already taken → 409 name_taken")
+        : fail("R1b: duplicate explicit name should 409", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+    }
+
+    // R2: deploy, soft-delete the app, then deploy again with the same name →
+    //     should succeed because the partial index excludes deleted rows.
+    {
+      const zip = await buildZip({ "package.json": '{"name":"reuse-after-delete"}', "app.js": "// hi" });
+      const form = new FormData();
+      form.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+      form.append("app_name", "reuse-after-delete");
+
+      const r1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(rKey),
+        formData: form,
+      });
+      console.log(`  R2a: create app → ${r1.status}`);
+      const appId = (r1.body as any).app_id ?? "";
+
+      if (r1.status === 202 && appId) {
+        // Soft-delete via the API
+        const del = await request("DELETE", `/v1/apps/${appId}`, { headers: authHeaders(rKey) });
+        console.log(`  R2b: delete app → ${del.status}`);
+
+        // Now re-deploy with same name — partial index means this should succeed
+        const zip2 = await buildZip({ "package.json": '{"name":"reuse-after-delete"}', "app.js": "// v2" });
+        const form2 = new FormData();
+        form2.append("code", zip2, { filename: "app.zip", contentType: "application/zip" });
+        form2.append("app_name", "reuse-after-delete");
+        const r2 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(rKey),
+          formData: form2,
+        });
+        console.log(`  R2c: redeploy same name after delete → ${r2.status} ${JSON.stringify(r2.body)}`);
+        r2.status === 202
+          ? ok("R2: redeploy after delete succeeds (partial index)")
+          : fail("R2: redeploy after delete should 202", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+
+        // Verify the deleted app didn't block the slug
+        if (r2.status === 202) {
+          const newAppId = (r2.body as any).app_id ?? "";
+          const { rows } = await pool.query<{ slug: string; deleted_at: Date | null }>(
+            "SELECT slug, deleted_at FROM apps WHERE id=$1",
+            [newAppId],
+          );
+          const newApp = rows[0];
+          console.log(`  R2c: new app slug="${newApp?.slug}" deleted_at=${newApp?.deleted_at ?? "null"}`);
+          newApp?.slug === "reuse-after-delete" && !newApp?.deleted_at
+            ? ok("R2: new app has same slug, not deleted")
+            : fail("R2: slug or deleted_at mismatch", JSON.stringify(newApp));
+        }
+      } else {
+        fail("R2: initial app creation failed, skipping", `status=${r1.status}`);
+      }
+    }
+
+    // Diagnostic: show in-progress deployments in rOrgId right before R3.
+    // R1a, R2a, and R2c each launch a background runDeploy (80 ms stub). If all
+    // three are still queued/building when R3 fires, the concurrent-deploy limit
+    // (max 3) fires before the slug check, producing 429 instead of 409.
+    {
+      const { rows: inProg } = await pool.query<{ id: string; status: string; app_name: string }>(
+        `SELECT d.id, d.status, a.name AS app_name
+         FROM deployments d JOIN apps a ON a.id = d.app_id
+         WHERE a.org_id = $1 AND d.status IN ('queued','building','deploying')`,
+        [rOrgId],
+      );
+      console.log(`  [diag] in-progress in rOrgId before R3: ${JSON.stringify(inProg)}`);
+    }
+
+    // R3: explicit name already active in org → 409 name_taken with correct body.
+    // Uses its own fresh org so in-progress deploys from R1/R2 cannot trip the
+    // concurrent-deploy limit before the slug-collision check runs.
+    {
+      const { rows: r3OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_r3','R3 Org','r3-org') RETURNING id",
+      );
+      const r3OrgId = r3OrgRows[0].id;
+      const r3Key = await (async () => {
+        const { fullKey, keyPrefix, keyHash } = generateApiKey();
+        await pool.query(
+          "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'r3-key',$3,$4)",
+          [r3OrgId, userId, keyPrefix, keyHash],
+        );
+        return fullKey;
+      })();
+
+      const zip = await buildZip({ "package.json": '{"name":"taken-name"}', "app.js": "// x" });
+      const form1 = new FormData();
+      form1.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+      form1.append("app_name", "taken-name");
+      await request("POST", "/v1/deployments/intake/zip", { headers: authHeaders(r3Key), formData: form1 });
+
+      const form2 = new FormData();
+      form2.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+      form2.append("app_name", "taken-name");
+      const r = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(r3Key),
+        formData: form2,
+      });
+      console.log(`  R3: second deploy explicit taken name → ${r.status} ${JSON.stringify(r.body)}`);
+      r.status === 409
+        ? ok("R3: explicit taken name → 409")
+        : fail("R3: should 409 for explicit taken name", `got ${r.status} ${JSON.stringify(r.body)}`);
+      (r.body as any)?.error === "name_taken"
+        ? ok("R3: error code = name_taken")
+        : fail("R3: error code should be name_taken", `got ${(r.body as any)?.error}`);
+      typeof (r.body as any)?.message === "string" && (r.body as any).message.includes("taken-name")
+        ? ok("R3: message names the conflicting app")
+        : fail("R3: message should name the conflicting app", `got "${(r.body as any)?.message}"`);
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [r3OrgId]);
+    }
+
+    // R4: redeploy with app_id → keeps original slug unchanged.
+    // Uses its own fresh org for the same isolation reason as R3.
+    {
+      const { rows: r4OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_r4','R4 Org','r4-org') RETURNING id",
+      );
+      const r4OrgId = r4OrgRows[0].id;
+      const r4Key = await (async () => {
+        const { fullKey, keyPrefix, keyHash } = generateApiKey();
+        await pool.query(
+          "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'r4-key',$3,$4)",
+          [r4OrgId, userId, keyPrefix, keyHash],
+        );
+        return fullKey;
+      })();
+
+      const zip = await buildZip({ "package.json": '{"name":"keep-slug"}', "app.js": "// v1" });
+      const form1 = new FormData();
+      form1.append("code", zip, { filename: "app.zip", contentType: "application/zip" });
+      form1.append("app_name", "keep-slug");
+      const r1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(r4Key),
+        formData: form1,
+      });
+      const appId = (r1.body as any).app_id ?? "";
+
+      if (r1.status === 202 && appId) {
+        const zip2 = await buildZip({ "package.json": '{"name":"keep-slug"}', "app.js": "// v2" });
+        const form2 = new FormData();
+        form2.append("code", zip2, { filename: "app.zip", contentType: "application/zip" });
+        form2.append("app_id", appId);
+        form2.append("app_name", "something-different"); // name ignored for redeploy
+        const r2 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(r4Key),
+          formData: form2,
+        });
+        console.log(`  R4: redeploy with app_id → ${r2.status}`);
+        r2.status === 202
+          ? ok("R4: redeploy with app_id → 202")
+          : fail("R4: redeploy should 202", `got ${r2.status}`);
+
+        if (r2.status === 202) {
+          const { rows } = await pool.query<{ slug: string }>(
+            "SELECT slug FROM apps WHERE id=$1",
+            [appId],
+          );
+          const slug = rows[0]?.slug ?? "";
+          console.log(`  R4: slug after redeploy = "${slug}"`);
+          slug === "keep-slug"
+            ? ok("R4: slug unchanged after redeploy")
+            : fail("R4: slug should be unchanged", `got "${slug}"`);
+        }
+      } else {
+        fail("R4: initial deploy failed, skipping", `status=${r1.status}`);
+      }
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [r4OrgId]);
+    }
+
+    // R5: verify at DB level that deleted app does NOT appear in the partial index
+    //     by checking active slug count is zero after delete.
+    {
+      const { rows: slugCheckRows } = await pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM apps
+         WHERE org_id=$1 AND slug='reuse-after-delete' AND deleted_at IS NULL`,
+        [rOrgId],
+      );
+      const cnt = parseInt(slugCheckRows[0]?.cnt ?? "0", 10);
+      console.log(`  R5: active apps with slug 'reuse-after-delete' = ${cnt}`);
+      // After R2, there should be exactly 1 active app with this slug (the re-created one)
+      cnt === 1
+        ? ok("R5: exactly 1 active app with re-used slug (deleted row excluded)")
+        : fail("R5: expected 1 active app with re-used slug", `got ${cnt}`);
+    }
+
+    // Cleanup slug-test org
+    await pool.query("DELETE FROM orgs WHERE id=$1", [rOrgId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

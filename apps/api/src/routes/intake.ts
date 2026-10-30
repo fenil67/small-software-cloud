@@ -58,6 +58,32 @@ async function resolveUserId(req: Request): Promise<string | null> {
   return ensureUser(sscAuth.clerkUserId);
 }
 
+// ─── Slug helpers ─────────────────────────────────────────────────────────────
+
+class NameTakenError extends Error {
+  constructor(public appName: string) {
+    super("name_taken");
+  }
+}
+
+function isPgUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
+}
+
+function slugify(s: string): string {
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 50) || "app"
+  );
+}
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 6); // 4 chars, e.g. "k3x9"
+}
+
 interface CreateDeployResult {
   deploymentId: string;
   appId: string;
@@ -67,11 +93,12 @@ async function createAppAndDeployment(
   orgId: string,
   userId: string | null,
   appName: string,
+  explicitName: boolean,
   sourceType: "zip" | "github",
   sourceRef: string | null,
   existingAppId?: string,
 ): Promise<CreateDeployResult> {
-  let appId: string;
+  let appId!: string; // definite assignment: all branches assign or throw
 
   if (existingAppId) {
     // Verify the app belongs to this org
@@ -88,19 +115,44 @@ async function createAppAndDeployment(
       [sourceType, sourceRef, appId],
     );
   } else {
-    // Create a new app
-    const slug = appName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 50);
+    const baseSlug = slugify(appName);
 
-    const { rows } = await pool.query<{ id: string }>(
-      `INSERT INTO apps (org_id, owner_id, name, slug, source_type, source_ref)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [orgId, userId, appName, slug, sourceType, sourceRef],
-    );
-    appId = rows[0].id;
+    if (explicitName) {
+      // User explicitly chose a name — 409 if already taken by an active app
+      try {
+        const { rows } = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, owner_id, name, slug, source_type, source_ref)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [orgId, userId, appName, baseSlug, sourceType, sourceRef],
+        );
+        appId = rows[0].id;
+      } catch (err) {
+        if (isPgUniqueViolation(err)) throw new NameTakenError(appName);
+        throw err;
+      }
+    } else {
+      // Auto-derived name — retry up to 5 times with a random suffix on collision
+      let inserted = false;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const suffix = attempt === 0 ? "" : `-${randomSuffix()}`;
+        const slug = `${baseSlug.slice(0, 45)}${suffix}`;
+        const name = suffix ? `${appName}${suffix}` : appName;
+        try {
+          const { rows } = await pool.query<{ id: string }>(
+            `INSERT INTO apps (org_id, owner_id, name, slug, source_type, source_ref)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [orgId, userId, name, slug, sourceType, sourceRef],
+          );
+          appId = rows[0].id;
+          inserted = true;
+          break;
+        } catch (err) {
+          if (isPgUniqueViolation(err) && attempt < 4) continue;
+          throw err;
+        }
+      }
+      if (!inserted) throw new Error("app_not_found"); // never reached; satisfies TS
+    }
   }
 
   // Get current version
@@ -158,16 +210,25 @@ intakeRouter.post(
     }
 
     const userId = await resolveUserId(req);
-    const appName = ((req.body as { app_name?: string }).app_name ?? "").trim() || "my-app";
+    const rawName = ((req.body as { app_name?: string }).app_name ?? "").trim();
+    const appName = rawName || "app";
+    const explicitName = rawName.length > 0;
 
     let deploymentId: string;
     let appId: string;
 
     try {
       ({ deploymentId, appId } = await createAppAndDeployment(
-        orgId, userId, appName, "zip", null, existingAppId,
+        orgId, userId, appName, explicitName, "zip", null, existingAppId,
       ));
     } catch (err) {
+      if (err instanceof NameTakenError) {
+        res.status(409).json({
+          error: "name_taken",
+          message: `An app named '${err.appName}' already exists in your org. Choose a different name.`,
+        });
+        return;
+      }
       if (err instanceof Error && err.message === "app_not_found") {
         res.status(404).json({ error: "app_not_found" });
         return;
@@ -232,16 +293,25 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
   }
 
   const userId = await resolveUserId(req);
-  const appName = (app_name ?? "").trim() || parsedUrl.pathname.split("/").filter(Boolean)[1] || "my-app";
+  const rawName = (app_name ?? "").trim();
+  const appName = rawName || parsedUrl.pathname.split("/").filter(Boolean)[1] || "app";
+  const explicitName = rawName.length > 0;
 
   let deploymentId: string;
   let appId: string;
 
   try {
     ({ deploymentId, appId } = await createAppAndDeployment(
-      orgId, userId, appName, "github", github_url, existingAppId,
+      orgId, userId, appName, explicitName, "github", github_url, existingAppId,
     ));
   } catch (err) {
+    if (err instanceof NameTakenError) {
+      res.status(409).json({
+        error: "name_taken",
+        message: `An app named '${err.appName}' already exists in your org. Choose a different name.`,
+      });
+      return;
+    }
     if (err instanceof Error && err.message === "app_not_found") {
       res.status(404).json({ error: "app_not_found" });
       return;

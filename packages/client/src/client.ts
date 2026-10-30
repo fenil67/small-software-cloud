@@ -7,6 +7,8 @@
  *   3. ~/.config/ssc/config.json
  */
 
+import fs from "fs";
+import path from "path";
 import FormData from "form-data";
 import { makeAxios, extractErrorMessage } from "./http";
 import { resolveConfig, SscConfig } from "./config";
@@ -17,6 +19,16 @@ import type {
   DeployOptions,
   DeployEvent,
 } from "./types";
+
+/** Read the "name" field from package.json in dirPath, or return null. */
+function readPackageJsonName(dirPath: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(dirPath, "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { name?: unknown };
+    if (typeof pkg.name === "string" && pkg.name) return pkg.name;
+  } catch {}
+  return null;
+}
 
 export class SscClient {
   private config: SscConfig;
@@ -51,10 +63,15 @@ export class SscClient {
   ): Promise<IntakeResponse> {
     const zipBuffer = await zipDirectory(dirPath);
 
+    const derivedName =
+      opts.appName ??
+      readPackageJsonName(dirPath) ??
+      path.basename(path.resolve(dirPath));
+
     const form = new FormData();
     form.append("code", zipBuffer, { filename: "app.zip", contentType: "application/zip" });
+    form.append("app_name", derivedName);
     if (opts.appId) form.append("app_id", opts.appId);
-    if (opts.appName) form.append("app_name", opts.appName);
 
     const ax = makeAxios(this.config);
     try {
@@ -77,6 +94,14 @@ export class SscClient {
     githubUrl: string,
     opts: DeployOptions = {},
   ): Promise<IntakeResponse> {
+    // Derive app name from the repo slug in the URL if not provided explicitly
+    let repoName: string | undefined;
+    try {
+      const parts = new URL(githubUrl).pathname.split("/").filter(Boolean);
+      if (parts[1]) repoName = parts[1];
+    } catch {}
+    const derivedName = opts.appName ?? repoName;
+
     const ax = makeAxios(this.config);
     try {
       const { data } = await ax.post<IntakeResponse>(
@@ -84,7 +109,7 @@ export class SscClient {
         {
           github_url: githubUrl,
           ...(opts.appId ? { app_id: opts.appId } : {}),
-          ...(opts.appName ? { app_name: opts.appName } : {}),
+          ...(derivedName ? { app_name: derivedName } : {}),
         },
       );
       return data;
