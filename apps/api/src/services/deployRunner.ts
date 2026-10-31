@@ -6,7 +6,7 @@ import { promisify } from "util";
 import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
-import { createFlyApp, destroyFlyApp } from "./flyClient";
+import { createFlyApp, destroyFlyApp, checkFlyAppExists } from "./flyClient";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles } from "./dockerfileGen";
@@ -50,13 +50,52 @@ async function updateDeploymentStatus(
   await pool.query(`UPDATE deployments SET ${sets.join(", ")} WHERE id = $1`, vals);
 }
 
-async function getApp(appId: string): Promise<{ fly_app_id: string | null; name: string }> {
-  const { rows } = await pool.query<{ fly_app_id: string | null; name: string }>(
-    "SELECT fly_app_id, name FROM apps WHERE id = $1",
+async function getApp(appId: string): Promise<{ fly_app_id: string | null; name: string; org_id: string }> {
+  const { rows } = await pool.query<{ fly_app_id: string | null; name: string; org_id: string }>(
+    "SELECT fly_app_id, name, org_id FROM apps WHERE id = $1",
     [appId],
   );
   if (!rows[0]) throw new DeployError("internal", "App record not found.");
   return rows[0];
+}
+
+// ─── Destroy with retry + orphan recording ────────────────────────────────────
+
+const DESTROY_MAX_ATTEMPTS = 3; // 1 initial + 2 retries
+const DESTROY_BACKOFF_MS = [200, 600]; // waits between attempts 1→2 and 2→3
+
+async function destroyWithRetry(flyAppName: string, orgId: string | null): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < DESTROY_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise<void>((r) =>
+        setTimeout(r, DESTROY_BACKOFF_MS[attempt - 1] ?? 1000),
+      );
+    }
+    try {
+      await destroyFlyApp(flyAppName);
+      return; // success — destroyFlyApp already treats 404 as success
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  // All attempts exhausted — log and persist for reaper cleanup
+  console.error(
+    `[deploy] FAILED to destroy Fly app ${flyAppName} — it may still be running and billing:`,
+    safeErr(lastErr),
+  );
+  try {
+    await pool.query(
+      `INSERT INTO orphaned_fly_apps (fly_app_name, org_id, last_error)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (fly_app_name) DO UPDATE
+         SET org_id     = COALESCE(EXCLUDED.org_id, orphaned_fly_apps.org_id),
+             last_error = EXCLUDED.last_error`,
+      [flyAppName, orgId, String(safeErr(lastErr))],
+    );
+  } catch (dbErr) {
+    console.error("[deploy] failed to record orphaned Fly app in DB:", safeErr(dbErr));
+  }
 }
 
 function generateFlyAppName(): string {
@@ -185,6 +224,7 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
   let flyAppName: string | null = null;
   let flyAppCreatedThisRun = false;
   let workDir: string | null = null;
+  let orgId: string | null = null; // captured in Step 3 for orphan recording
 
   const fail = async (err: DeployError): Promise<void> => {
     console.error(`[deploy] ${deploymentId} failed at ${err.stage}: ${err.message}`);
@@ -198,7 +238,16 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     eventBus.emit(deploymentId, { type: "done" });
 
     if (flyAppCreatedThisRun && flyAppName) {
-      destroyFlyApp(flyAppName).catch(() => {});
+      // Clear fly_app_id BEFORE destroying the Fly app so any concurrent read
+      // sees NULL rather than a name that no longer exists.  A failed redeploy
+      // will then create a fresh Fly app instead of trying to target the deleted one.
+      await pool.query(
+        "UPDATE apps SET fly_app_id = NULL WHERE id = $1",
+        [appId],
+      ).catch((e) => console.error("[deploy] failed to clear fly_app_id:", safeErr(e)));
+      // Retry destroy up to 3 times; on total failure, log with safeErr and
+      // record the app name for the reaper to clean up later.
+      await destroyWithRetry(flyAppName, orgId);
     }
     if (workDir) {
       fs.rm(workDir, { recursive: true, force: true }, () => {});
@@ -235,9 +284,33 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
 
     // Step 3: ensure Fly app exists
     const app = await getApp(appId);
+    orgId = app.org_id; // needed by destroyWithRetry inside fail()
     let appName: string;
     if (app.fly_app_id) {
       appName = app.fly_app_id;
+      // The Fly app may have been destroyed externally (or by a pre-fix failed
+      // first-deploy that cleared fly_app_id late / not at all).  Verify it
+      // still exists; if not, treat it like a brand-new app.
+      let flyAppFound = false;
+      try {
+        flyAppFound = await checkFlyAppExists(appName);
+      } catch {
+        // If the existence check itself errors, assume missing and recreate.
+        flyAppFound = false;
+      }
+      if (!flyAppFound) {
+        const newName = generateFlyAppName();
+        log(deploymentId, `Fly app ${appName} not found — recreating as ${newName}`);
+        appName = newName;
+        try {
+          await createFlyApp(appName, process.env.FLY_ORG_SLUG!);
+        } catch (err) {
+          throw new DeployError("provision", "Failed to create app on Fly.io. Please try again.");
+        }
+        flyAppCreatedThisRun = true;
+        flyAppName = appName;
+        await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
+      }
     } else {
       appName = generateFlyAppName();
       log(deploymentId, `Creating Fly app: ${appName}`);

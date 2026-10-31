@@ -3,6 +3,8 @@
  * - Uses API-key auth only (no Clerk middleware needed)
  * - Stubs flyClient so no real Fly API calls are made
  * - Stubs deployRunner so deploys return quickly with predictable results
+ * - Real deploy mode: POST /test/set-real-deploy switches to actual deployRunner
+ *   (fly stubs + fake flyctl binary stay active in this process)
  * - Reads DATABASE_URL from env (point at ssc_test)
  */
 
@@ -35,6 +37,9 @@ console.error = (...args: unknown[]) => {
   _origConsoleError(...args);
 };
 
+import os from "os";
+import path from "path";
+import fs from "fs";
 import express, { Request, Response, NextFunction } from "express";
 import { healthRouter } from "../src/routes/health";
 import { appsRouter } from "../src/routes/apps";
@@ -43,16 +48,25 @@ import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
 import { apiKeysRouter } from "../src/routes/apiKeys";
 import { authRouter } from "../src/routes/auth";
-import { startReaper } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps } from "../src/lib/reaper";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
 import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/errorHandler";
 
+// ── Fake flyctl binary ────────────────────────────────────────────────────────
+// Prepended to PATH so runFlyctlDeploy in the real deployRunner finds it.
+// Default: exit 0 (success). Sections S and T toggle via POST /test/set-flyctl-mode.
+const _fakeFlyctlDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-test-flyctl-"));
+const _fakeFlyctlBin = path.join(_fakeFlyctlDir, "flyctl");
+fs.writeFileSync(_fakeFlyctlBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+process.env.PATH = _fakeFlyctlDir + ":" + (process.env.PATH ?? "");
+
 // ── Stub deployRunner ─────────────────────────────────────────────────────────
 // Override the module-level import used by intake.ts.
-// We do this by patching require cache after imports resolve.
-// intake.ts calls runDeploy({ deploymentId, appId, ... }) in setImmediate.
-// We replace it so tests can control success/failure.
+// Save the real runDeploy BEFORE patching so /test/set-real-deploy can restore it.
+// When _realDeployEnabled = true the stub delegates to _realRunDeploy; the fly
+// stubs and fake flyctl remain active in this process, so Sections S and T get
+// real lifecycle behaviour with controllable Fly API responses.
 
 const deployRunnerModule = require("../src/services/deployRunner");
 
@@ -64,6 +78,9 @@ type DeployArgs = {
   simulateFailure?: boolean;
 };
 
+const _realRunDeploy = deployRunnerModule.runDeploy as (args: DeployArgs) => Promise<void>;
+let _realDeployEnabled = false;
+
 let nextDeployMode: "success" | "failure" | "timeout" = "success";
 
 export function setNextDeployMode(mode: "success" | "failure" | "timeout"): void {
@@ -71,6 +88,10 @@ export function setNextDeployMode(mode: "success" | "failure" | "timeout"): void
 }
 
 deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> {
+  if (_realDeployEnabled) {
+    return _realRunDeploy(args);
+  }
+
   const { deploymentId, appId } = args;
   const mode = nextDeployMode;
   nextDeployMode = "success"; // reset
@@ -130,33 +151,61 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
 };
 
 // ── Stub flyClient ────────────────────────────────────────────────────────────
-const flyModule = require("../src/services/flyClient");
-flyModule.createFlyApp = async () => {};
-flyModule.allocateFlyIp = async () => "1.2.3.4";
+// All three Fly functions record calls to _flyCallLog.
+// destroyFlyApp supports configurable failure modes for Sections S and T:
+//   _destroyFailuresRemaining = 0  → succeed (default)
+//   _destroyFailuresRemaining = -1 → always fail (T2: always-fail)
+//   _destroyFailuresRemaining = N  → fail the next N calls then succeed (T1: fail-2-then-succeed)
+// Failures embed process.env.FLY_API_TOKEN in the message so T2 can verify safeErr scrubs it.
+// _flyErrorMode (Section N) takes precedence and throws an Axios-shaped error.
 
-// destroyFlyApp is configurable: normally succeeds; when flyErrorMode is enabled
-// it throws a raw Axios-shaped error (with Authorization in config) so Section N
-// can verify that safeErr strips credentials before they reach the log.
+const flyModule = require("../src/services/flyClient");
+
+interface FlyCall { fn: string; arg: string }
+const _flyCallLog: FlyCall[] = [];
+
+let _checkExistsResult = true;
+let _destroyFailuresRemaining = 0;
 let _flyErrorMode = false;
-flyModule.destroyFlyApp = async (_appName: string) => {
+
+flyModule.createFlyApp = async (name: string) => {
+  _flyCallLog.push({ fn: "createFlyApp", arg: name });
+};
+flyModule.allocateFlyIp = async () => "1.2.3.4";
+flyModule.checkFlyAppExists = async (name: string): Promise<boolean> => {
+  _flyCallLog.push({ fn: "checkFlyAppExists", arg: name });
+  return _checkExistsResult;
+};
+flyModule.destroyFlyApp = async (appName: string) => {
+  _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
+
   if (_flyErrorMode) {
-    // Simulate a Fly API 401 Axios error — this is the exact shape that would
-    // appear if the interceptor in flyClient.ts were absent.
+    // Section N: Axios-shaped 401 to exercise safeErr credential stripping
     const err = Object.assign(new Error("Request failed with status code 401"), {
       isAxiosError: true,
       config: {
         method: "delete",
-        url: "https://api.machines.dev/v1/apps/test-app",
+        url: "https://api.machines.dev/v1/apps/" + appName,
         headers: {
           Authorization: `Bearer ${process.env.FLY_API_TOKEN}`,
           "Content-Type": "application/json",
         },
       },
-      request: { _header: `DELETE /v1/apps/test-app HTTP/1.1\nAuthorization: Bearer ${process.env.FLY_API_TOKEN}\n` },
+      request: { _header: `DELETE /v1/apps/${appName} HTTP/1.1\nAuthorization: Bearer ${process.env.FLY_API_TOKEN}\n` },
       response: { status: 401, data: { error: "unauthorized" } },
     });
     throw err;
   }
+
+  if (_destroyFailuresRemaining === -1) {
+    // Always fail — message embeds token so safeErr scrubbing is exercised by T2
+    throw new Error(`Fly API error token=${process.env.FLY_API_TOKEN} unauthorized app=${appName}`);
+  }
+  if (_destroyFailuresRemaining > 0) {
+    _destroyFailuresRemaining--;
+    throw new Error(`Fly API error token=${process.env.FLY_API_TOKEN} unauthorized app=${appName}`);
+  }
+  // else: succeed (no-op)
 };
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -166,10 +215,12 @@ app.use(express.json());
 // Attach a request ID so the error middleware can echo it back
 app.use(requestIdMiddleware);
 
-// Test-control endpoint: POST /test/set-deploy-mode { mode: "success"|"failure" }
+// ── Test-control endpoints ────────────────────────────────────────────────────
+
+// POST /test/set-deploy-mode { mode: "success"|"failure"|"timeout" }
 app.post("/test/set-deploy-mode", (req, res) => {
   const { mode } = req.body as { mode?: string };
-  if (mode === "success" || mode === "failure") {
+  if (mode === "success" || mode === "failure" || mode === "timeout") {
     nextDeployMode = mode;
     res.json({ ok: true, mode });
   } else {
@@ -177,20 +228,77 @@ app.post("/test/set-deploy-mode", (req, res) => {
   }
 });
 
-// Test-control endpoint: POST /test/set-fly-error { enabled: true|false }
+// POST /test/set-real-deploy { enabled: bool }
+// Switch between fast stub deployRunner and the real deployRunner.
+// Fly stubs + fake flyctl are still active in this process.
+app.post("/test/set-real-deploy", (req, res) => {
+  _realDeployEnabled = !!(req.body as { enabled?: boolean }).enabled;
+  res.json({ ok: true, realDeployEnabled: _realDeployEnabled });
+});
+
+// POST /test/set-flyctl-mode { mode: "success"|"failure" }
+// Rewrites the fake flyctl binary to exit 0 or 1.
+app.post("/test/set-flyctl-mode", (req, res) => {
+  const { mode } = req.body as { mode?: string };
+  const script = mode === "failure" ? "#!/bin/sh\nexit 1\n" : "#!/bin/sh\nexit 0\n";
+  fs.writeFileSync(_fakeFlyctlBin, script, { mode: 0o755 });
+  res.json({ ok: true, mode: mode ?? "success" });
+});
+
+// GET /test/fly-call-log — returns all recorded Fly API calls
+app.get("/test/fly-call-log", (_req, res) => {
+  res.json({ calls: [..._flyCallLog] });
+});
+
+// POST /test/reset-fly-call-log — clears the call log
+app.post("/test/reset-fly-call-log", (_req, res) => {
+  _flyCallLog.length = 0;
+  res.json({ ok: true });
+});
+
+// POST /test/set-fly-destroy-failures { times: number }
+// 0 = succeed; -1 = always fail; N = fail next N calls then succeed.
+app.post("/test/set-fly-destroy-failures", (req, res) => {
+  const { times } = req.body as { times?: number };
+  _destroyFailuresRemaining = typeof times === "number" ? times : 0;
+  res.json({ ok: true, destroyFailuresRemaining: _destroyFailuresRemaining });
+});
+
+// POST /test/set-fly-check-exists { result: bool }
+// Controls what checkFlyAppExists returns (default: true).
+app.post("/test/set-fly-check-exists", (req, res) => {
+  const { result } = req.body as { result?: boolean };
+  _checkExistsResult = result !== false;
+  res.json({ ok: true, checkExistsResult: _checkExistsResult });
+});
+
+// POST /test/set-fly-error { enabled: true|false }
 // When enabled, destroyFlyApp throws a raw Axios error with credentials in config.
+// Used by Section N to verify safeErr strips credentials before they reach the log.
 app.post("/test/set-fly-error", (req, res) => {
   _flyErrorMode = !!(req.body as { enabled?: boolean }).enabled;
   res.json({ ok: true, flyErrorMode: _flyErrorMode });
 });
 
-// Test-control endpoint: GET /test/drain-logs
+// POST /test/run-reaper
+// Runs reapOrphanedFlyApps() directly in this process (uses patched flyClient).
+// Returns { destroyed: number }.
+app.post("/test/run-reaper", async (_req, res) => {
+  try {
+    const destroyed = await reapOrphanedFlyApps();
+    res.json({ ok: true, destroyed });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// GET /test/drain-logs
 // Returns and clears the captured console.error log lines.
 app.get("/test/drain-logs", (_req, res) => {
   res.json({ logs: _recentErrorLogs.splice(0) });
 });
 
-// Test-control endpoint: GET /test/db-error — deliberately queries a nonexistent table
+// GET /test/db-error — deliberately queries a nonexistent table
 // Used by Section M to prove asyncHandler + error middleware returns 500 JSON
 app.get("/test/db-error", async (_req: Request, _res: Response, next: NextFunction) => {
   try {

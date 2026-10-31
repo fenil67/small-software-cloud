@@ -261,6 +261,44 @@ async function buildZip(files: Record<string, string>): Promise<Buffer> {
   });
 }
 
+// ── Poll deployment until terminal ───────────────────────────────────────────
+// Used by Sections S and T which trigger real deploys via HTTP intake and need
+// to wait for the background runDeploy to reach success or failed.
+
+interface DeployPollResult {
+  status: string;
+  failure_stage: string | null;
+  failure_message: string | null;
+  app_id: string;
+}
+
+async function pollDeployment(
+  deploymentId: string,
+  apiKey: string,
+  timeoutMs = 10000,
+): Promise<DeployPollResult> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const r = await request("GET", `/v1/deployments/${deploymentId}`, {
+      headers: authHeaders(apiKey),
+    });
+    if (r.status === 200) {
+      const b = r.body as Record<string, unknown>;
+      const st = String(b.status ?? "");
+      if (st === "success" || st === "failed") {
+        return {
+          status: st,
+          failure_stage: (b.failure_stage as string | null) ?? null,
+          failure_message: (b.failure_message as string | null) ?? null,
+          app_id: String(b.app_id ?? ""),
+        };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  throw new Error(`pollDeployment: ${deploymentId} timed out after ${timeoutMs}ms`);
+}
+
 // ── Wait for server ───────────────────────────────────────────────────────────
 
 async function waitForServer(retries = 20): Promise<void> {
@@ -1654,6 +1692,498 @@ async function main(): Promise<void> {
 
     // Cleanup slug-test org
     await pool.query("DELETE FROM orgs WHERE id=$1", [rOrgId]);
+  }
+
+  // Helpers shared by Sections S and T — placed at outer scope so both sections
+  // can use them without re-declaration.
+  type FlyCall = { fn: string; arg: string };
+  const getFlyLog = async (): Promise<FlyCall[]> =>
+    ((await request("GET", "/test/fly-call-log")).body as { calls?: FlyCall[] }).calls ?? [];
+  const resetFlyLog = () => request("POST", "/test/reset-fly-call-log");
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section S — deployRunner lifecycle: failed-first-deploy, redeploy states,
+  //             and the app-count limit for all-failed apps
+  //
+  // Uses POST /test/set-real-deploy to switch the test server to real deployRunner.
+  // Fly client behaviour is controlled via /test/set-fly-* endpoints (same process).
+  // Fake flyctl binary lives in the test server process (set via /test/set-flyctl-mode).
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("S: deployRunner lifecycle (failed-first-deploy + redeploy states)");
+
+    // Fresh org + API key — HTTP intake and poll use this key
+    const { rows: sOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_s','S Org','s-org') RETURNING id",
+    );
+    const sOrgId = sOrgRows[0].id;
+    const { fullKey: sKey, keyPrefix: sKP, keyHash: sKH } = generateApiKey();
+    await pool.query(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'s-key',$3,$4)",
+      [sOrgId, userId, sKP, sKH],
+    );
+
+    // Enable real deployRunner in the test server for all of Section S
+    await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+
+    // Minimal valid Node.js zip — passes validateZip and detectAppType
+    const sZip = await buildZip({
+      "package.json": JSON.stringify({
+        name: "s-test-app",
+        version: "1.0.0",
+        scripts: { start: "node index.js" },
+      }),
+      "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+    });
+
+    // afterFail: deployed app's fail() runs destroyWithRetry AFTER marking the
+    // deployment failed.  For a 1-attempt success the extra work is instant;
+    // we wait a short fixed time so the fly call log and DB are settled before
+    // we assert.  For retry tests (T1/T2) the wait is longer — see Section T.
+    const afterFail = () => new Promise<void>((r) => setTimeout(r, 400));
+
+    // ── S1/S2: first deploy fails → fly_app_id cleared → redeploy succeeds ──
+    {
+      console.log(DIM("\n  S1/S2: first deploy fails → fly_app_id cleared → redeploy succeeds"));
+
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "failure" } });
+      await resetFlyLog();
+
+      const s1Form = new FormData();
+      s1Form.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s1Form.append("app_name", "s1-app");
+      const s1Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s1Form,
+      });
+      s1Intake.status === 202
+        ? ok("S1: intake accepted (202)")
+        : fail("S1: intake should 202", `got ${s1Intake.status} ${JSON.stringify(s1Intake.body)}`);
+
+      const { deployment_id: s1DepId, app_id: s1AppId } = s1Intake.body as Record<string, string>;
+      const s1Poll = await pollDeployment(s1DepId, sKey);
+      await afterFail(); // wait for fail() cleanup (fly_app_id clear + destroyWithRetry)
+
+      s1Poll.status === "failed"
+        ? ok("S1: first-deploy status = failed")
+        : fail("S1: expected status=failed", s1Poll.status);
+
+      const s1AppRow = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [s1AppId],
+      );
+      s1AppRow.rows[0].fly_app_id === null
+        ? ok("S1: fly_app_id = NULL after failed first deploy")
+        : fail("S1: fly_app_id should be NULL", s1AppRow.rows[0].fly_app_id ?? "");
+
+      const s1Log = await getFlyLog();
+      s1Log.some((c) => c.fn === "createFlyApp")
+        ? ok("S1: createFlyApp called")
+        : fail("S1: createFlyApp should have been called");
+      s1Log.some((c) => c.fn === "destroyFlyApp")
+        ? ok("S1: destroyFlyApp called")
+        : fail("S1: destroyFlyApp should have been called");
+      console.log(`  [diag] fly calls after S1: ${JSON.stringify(s1Log)}`);
+
+      // S2: redeploy the SAME app_id after S1 → succeeds with a fresh Fly app
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await resetFlyLog();
+
+      const s2Form = new FormData();
+      s2Form.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s2Form.append("app_id", s1AppId);
+      const s2Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s2Form,
+      });
+      const { deployment_id: s2DepId, app_id: s2AppId } = s2Intake.body as Record<string, string>;
+      const s2Poll = await pollDeployment(s2DepId, sKey);
+
+      s2Poll.status === "success"
+        ? ok("S2: redeploy after failed first deploy → success")
+        : fail("S2: expected success", `${s2Poll.status} stage=${s2Poll.failure_stage} msg=${s2Poll.failure_message}`);
+
+      const { rows: s2AppCount } = await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM apps WHERE org_id=$1 AND slug LIKE 's1%'", [sOrgId],
+      );
+      parseInt(s2AppCount[0].count) === 1
+        ? ok("S2: no second app row created")
+        : fail("S2: only 1 app row should exist for s1-app", s2AppCount[0].count);
+
+      s2AppId === s1AppId
+        ? ok("S2: same app_id on redeploy")
+        : fail("S2: redeploy should use same app_id", `s2=${s2AppId} s1=${s1AppId}`);
+
+      const s2Log = await getFlyLog();
+      s2Log.some((c) => c.fn === "createFlyApp")
+        ? ok("S2: createFlyApp called to provision fresh Fly app")
+        : fail("S2: createFlyApp should be called when fly_app_id is NULL");
+      console.log(`  [diag] fly calls after S2: ${JSON.stringify(s2Log)}`);
+    }
+
+    // ── S3: success → failure → redeploy (fly_app_id preserved) ──────────────
+    {
+      console.log(DIM("\n  S3: success → failure → redeploy (fly_app_id preserved)"));
+
+      // Deploy 1: success → fly_app_id set
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await resetFlyLog();
+
+      const s3Form1 = new FormData();
+      s3Form1.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s3Form1.append("app_name", "s3-app");
+      const s3Intake1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s3Form1,
+      });
+      const { deployment_id: s3Dep1Id, app_id: s3AppId } = s3Intake1.body as Record<string, string>;
+      await pollDeployment(s3Dep1Id, sKey);
+
+      const s3After1 = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [s3AppId],
+      );
+      const s3FlyApp = s3After1.rows[0].fly_app_id;
+      s3FlyApp !== null
+        ? ok("S3: fly_app_id set after first success")
+        : fail("S3: fly_app_id should be set after success");
+      console.log(`  [diag] fly_app_id after first success: ${s3FlyApp}`);
+
+      // Deploy 2: failure on existing app → fly_app_id must NOT be cleared
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "failure" } });
+      await resetFlyLog();
+
+      const s3Form2 = new FormData();
+      s3Form2.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s3Form2.append("app_id", s3AppId);
+      const s3Intake2 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s3Form2,
+      });
+      const { deployment_id: s3Dep2Id } = s3Intake2.body as Record<string, string>;
+      await pollDeployment(s3Dep2Id, sKey);
+      await afterFail();
+
+      const s3After2 = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [s3AppId],
+      );
+      s3After2.rows[0].fly_app_id === s3FlyApp
+        ? ok("S3: fly_app_id unchanged after failure on existing app")
+        : fail("S3: fly_app_id should not be cleared for pre-existing Fly app",
+            s3After2.rows[0].fly_app_id ?? "null");
+
+      const s3Log2 = await getFlyLog();
+      !s3Log2.some((c) => c.fn === "destroyFlyApp")
+        ? ok("S3: destroyFlyApp NOT called (Fly app was pre-existing)")
+        : fail("S3: destroyFlyApp should not be called for pre-existing app");
+
+      // Deploy 3: redeploy → success → reuses same Fly app (no createFlyApp)
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await resetFlyLog();
+
+      const s3Form3 = new FormData();
+      s3Form3.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s3Form3.append("app_id", s3AppId);
+      const s3Intake3 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s3Form3,
+      });
+      const { deployment_id: s3Dep3Id } = s3Intake3.body as Record<string, string>;
+      const s3Poll3 = await pollDeployment(s3Dep3Id, sKey);
+
+      s3Poll3.status === "success"
+        ? ok("S3: third deploy succeeds")
+        : fail("S3: third deploy should succeed", `${s3Poll3.status} msg=${s3Poll3.failure_message}`);
+
+      const s3Log3 = await getFlyLog();
+      !s3Log3.some((c) => c.fn === "createFlyApp")
+        ? ok("S3: createFlyApp NOT called (pre-existing Fly app reused)")
+        : fail("S3: createFlyApp should NOT be called when Fly app still exists");
+      console.log(`  [diag] fly calls after S3 redeploy: ${JSON.stringify(s3Log3)}`);
+    }
+
+    // ── S4: Fly app manually deleted → redeploy recreates it ─────────────────
+    {
+      console.log(DIM("\n  S4: Fly app manually deleted → redeploy recreates it"));
+
+      // Insert an app with fly_app_id pointing to a "manually deleted" Fly app
+      const { rows: s4AppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type, fly_app_id)
+         VALUES ($1,$2,'s4-app','s4-app','zip','ssc-manually-deleted') RETURNING id`,
+        [sOrgId, userId],
+      );
+      const s4AppId = s4AppRows[0].id;
+      // Seed a prior success deployment so the app looks deployed before
+      await pool.query(
+        `INSERT INTO deployments (app_id, version, status, started_at, finished_at)
+         VALUES ($1,1,'success',now()-INTERVAL'2 hours',now()-INTERVAL'110 minutes')`,
+        [s4AppId],
+      );
+
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-fly-check-exists", { body: { result: false } });
+      await resetFlyLog();
+
+      const s4Form = new FormData();
+      s4Form.append("code", sZip, { filename: "app.zip", contentType: "application/zip" });
+      s4Form.append("app_id", s4AppId);
+      const s4Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(sKey), formData: s4Form,
+      });
+      const { deployment_id: s4DepId } = s4Intake.body as Record<string, string>;
+      const s4Poll = await pollDeployment(s4DepId, sKey);
+
+      s4Poll.status === "success"
+        ? ok("S4: redeploy after manual Fly app deletion → success")
+        : fail("S4: expected success", `${s4Poll.status} msg=${s4Poll.failure_message}`);
+
+      const s4Log = await getFlyLog();
+      s4Log.some((c) => c.fn === "checkFlyAppExists" && c.arg === "ssc-manually-deleted")
+        ? ok("S4: checkFlyAppExists called for original fly_app_id")
+        : fail("S4: checkFlyAppExists should be called", JSON.stringify(s4Log));
+
+      s4Log.some((c) => c.fn === "createFlyApp")
+        ? ok("S4: createFlyApp called to recreate Fly app")
+        : fail("S4: createFlyApp should be called when Fly app not found");
+
+      const s4AppAfter = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [s4AppId],
+      );
+      const s4NewApp = s4AppAfter.rows[0].fly_app_id;
+      s4NewApp !== null && s4NewApp !== "ssc-manually-deleted"
+        ? ok(`S4: fly_app_id updated to new app (${s4NewApp})`)
+        : fail("S4: fly_app_id should be a new name", s4NewApp ?? "null");
+
+      // Restore checkFlyAppExists to default true
+      await request("POST", "/test/set-fly-check-exists", { body: { result: true } });
+      console.log(`  [diag] fly calls after S4: ${JSON.stringify(s4Log)}`);
+    }
+
+    // ── S5: app-count limit excludes all-failed apps ──────────────────────────
+    {
+      console.log(DIM("\n  S5: app-count limit excludes all-failed apps"));
+      const { rows: sLimitOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_s5','S5 Org','s5-org') RETURNING id",
+      );
+      const s5OrgId = sLimitOrgRows[0].id;
+
+      for (let i = 0; i < 9; i++) {
+        const { rows: aRows } = await pool.query<{ id: string }>(
+          "INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,$3,$4,'zip') RETURNING id",
+          [s5OrgId, userId, `s5-fail-${i}`, `s5-fail-${i}`],
+        );
+        await pool.query(
+          "INSERT INTO deployments (app_id, version, status, started_at) VALUES ($1,1,'failed',now()-INTERVAL'1 hour')",
+          [aRows[0].id],
+        );
+      }
+
+      const { rows: countRows } = await pool.query<{ count: string }>(
+        `SELECT COUNT(DISTINCT a.id) AS count
+         FROM apps a
+         WHERE a.org_id = $1
+           AND a.deleted_at IS NULL
+           AND EXISTS (
+             SELECT 1 FROM deployments d
+             WHERE d.app_id = a.id AND d.status != 'failed'
+           )`,
+        [s5OrgId],
+      );
+      const limitCount = parseInt(countRows[0].count, 10);
+      console.log(`  [diag] app-count for 9 all-failed apps: ${limitCount}`);
+      limitCount === 0
+        ? ok("S5: 9 all-failed apps count as 0 toward the limit")
+        : fail("S5: all-failed apps should not count toward limit", String(limitCount));
+
+      const { rows: aSuccessRows } = await pool.query<{ id: string }>(
+        "INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,'s5-ok','s5-ok','zip') RETURNING id",
+        [s5OrgId, userId],
+      );
+      await pool.query(
+        "INSERT INTO deployments (app_id, version, status, started_at) VALUES ($1,1,'success',now()-INTERVAL'30 minutes')",
+        [aSuccessRows[0].id],
+      );
+
+      const { rows: countRows2 } = await pool.query<{ count: string }>(
+        `SELECT COUNT(DISTINCT a.id) AS count
+         FROM apps a
+         WHERE a.org_id = $1
+           AND a.deleted_at IS NULL
+           AND EXISTS (
+             SELECT 1 FROM deployments d
+             WHERE d.app_id = a.id AND d.status != 'failed'
+           )`,
+        [s5OrgId],
+      );
+      const limitCount2 = parseInt(countRows2[0].count, 10);
+      console.log(`  [diag] app-count after adding 1 success: ${limitCount2}`);
+      limitCount2 === 1
+        ? ok("S5: only the 1 app with a success deployment counts toward limit")
+        : fail("S5: expected exactly 1 active app", String(limitCount2));
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [s5OrgId]);
+    }
+
+    // ── Cleanup Section S ─────────────────────────────────────────────────────
+    await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+    await request("POST", "/test/set-fly-destroy-failures", { body: { times: 0 } });
+    await request("POST", "/test/set-fly-check-exists", { body: { result: true } });
+    await pool.query("DELETE FROM orgs WHERE id=$1", [sOrgId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section T — destroyWithRetry: retry logic, orphan recording, reaper cleanup
+  //
+  // Uses the same real-deploy + fly stub mechanism as Section S.
+  // Fake flyctl always exits 1 so every deploy fails, triggering fail() →
+  // destroyWithRetry.  Fly destroy behaviour is configured via
+  // /test/set-fly-destroy-failures.
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("T: destroyWithRetry (retry + orphan_fly_apps + reaper)");
+
+    // Fresh org + API key
+    const { rows: tOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_t','T Org','t-org') RETURNING id",
+    );
+    const tOrgId = tOrgRows[0].id;
+    const { fullKey: tKey, keyPrefix: tKP, keyHash: tKH } = generateApiKey();
+    await pool.query(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'t-key',$3,$4)",
+      [tOrgId, userId, tKP, tKH],
+    );
+
+    // Enable real deploy; fake flyctl always fails → deploy always fails
+    await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+    await request("POST", "/test/set-flyctl-mode", { body: { mode: "failure" } });
+
+    // Minimal valid Node.js zip
+    const tZip = await buildZip({
+      "package.json": JSON.stringify({
+        name: "t-test-app",
+        version: "1.0.0",
+        scripts: { start: "node index.js" },
+      }),
+      "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+    });
+
+    // Destroy retry backoff is [200ms, 600ms] so we need ~1 second after
+    // pollDeployment returns before checking the fly call log and orphan table.
+    const afterRetry = () => new Promise<void>((r) => setTimeout(r, 1500));
+
+    // ── T1: destroyFlyApp fails twice then succeeds → no orphan row ───────────
+    {
+      console.log(DIM("\n  T1: destroyFlyApp fails twice then succeeds → no orphan row"));
+
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: 2 } });
+      await resetFlyLog();
+
+      const t1Form = new FormData();
+      t1Form.append("code", tZip, { filename: "app.zip", contentType: "application/zip" });
+      t1Form.append("app_name", "t1-app");
+      const t1Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(tKey), formData: t1Form,
+      });
+      const { deployment_id: t1DepId } = t1Intake.body as Record<string, string>;
+      await pollDeployment(t1DepId, tKey);
+      await afterRetry();
+
+      const t1Log = await getFlyLog();
+      const t1Destroys = t1Log.filter((c) => c.fn === "destroyFlyApp");
+      t1Destroys.length === 3
+        ? ok("T1: destroyFlyApp called 3 times (2 failures + 1 success)")
+        : fail("T1: expected exactly 3 destroy calls", String(t1Destroys.length));
+
+      const { rows: t1Orphans } = await pool.query<{ fly_app_name: string }>(
+        "SELECT fly_app_name FROM orphaned_fly_apps WHERE org_id=$1", [tOrgId],
+      );
+      t1Orphans.length === 0
+        ? ok("T1: no orphan row recorded (succeeded on 3rd attempt)")
+        : fail("T1: orphan row should NOT exist after eventual success",
+            t1Orphans.map((r) => r.fly_app_name).join(", "));
+    }
+
+    // ── T2: destroyFlyApp always fails → orphan recorded, no secrets in log ──
+    {
+      console.log(DIM("\n  T2: destroyFlyApp always fails → orphan recorded, no secrets in log"));
+
+      await request("GET", "/test/drain-logs"); // clear prior log lines
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: -1 } });
+      await resetFlyLog();
+
+      const t2Form = new FormData();
+      t2Form.append("code", tZip, { filename: "app.zip", contentType: "application/zip" });
+      t2Form.append("app_name", "t2-app");
+      const t2Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(tKey), formData: t2Form,
+      });
+      const { deployment_id: t2DepId, app_id: t2AppId } = t2Intake.body as Record<string, string>;
+      await pollDeployment(t2DepId, tKey);
+      await afterRetry();
+
+      const t2Log = await getFlyLog();
+      const t2Destroys = t2Log.filter((c) => c.fn === "destroyFlyApp");
+      t2Destroys.length === 3
+        ? ok("T2: destroyFlyApp called 3 times (all failed)")
+        : fail("T2: expected 3 destroy calls", String(t2Destroys.length));
+
+      const { rows: t2Orphans } = await pool.query<{ fly_app_name: string; last_error: string | null }>(
+        "SELECT fly_app_name, last_error FROM orphaned_fly_apps WHERE org_id=$1", [tOrgId],
+      );
+      t2Orphans.length > 0
+        ? ok(`T2: orphan row recorded (${t2Orphans[0].fly_app_name})`)
+        : fail("T2: orphan row should be in orphaned_fly_apps");
+
+      const t2Drained = (await request("GET", "/test/drain-logs")).body as { logs: string[] };
+      const t2ErrStr = t2Drained.logs.join(" ");
+      t2ErrStr.includes("FAILED to destroy Fly app")
+        ? ok("T2: error logged for failed destroy attempts")
+        : fail("T2: expected destroy-failure error log", t2ErrStr.slice(0, 300));
+
+      // FLY_API_TOKEN in test-server.ts is "test-token" — must not appear in logs
+      !t2ErrStr.includes("test-token")
+        ? ok("T2: FLY_API_TOKEN value not present in error logs (safeErr scrubbed it)")
+        : fail("T2: FLY_API_TOKEN leaked into error log");
+      console.log(`  [diag] T2 app_id=${t2AppId} orphans=${t2Orphans.length}`);
+    }
+
+    // ── T3: reaper destroys orphan fly app, removes row from DB ──────────────
+    {
+      console.log(DIM("\n  T3: reaper destroys orphan fly app, removes row from DB"));
+
+      // Seed an independent orphan row (T2's orphan may also be present; reaper destroys all)
+      const t3AppName = "ssc-t3-reaper-test";
+      await pool.query(
+        `INSERT INTO orphaned_fly_apps (fly_app_name, org_id, last_error)
+         VALUES ($1, $2, 'seeded for T3')
+         ON CONFLICT (fly_app_name) DO UPDATE SET last_error = EXCLUDED.last_error`,
+        [t3AppName, tOrgId],
+      );
+
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: 0 } });
+      await resetFlyLog();
+
+      const t3Resp = await request("POST", "/test/run-reaper");
+      const t3Reaped = (t3Resp.body as { destroyed?: number }).destroyed ?? 0;
+
+      t3Reaped >= 1
+        ? ok(`T3: reapOrphanedFlyApps returned ${t3Reaped} (≥ 1)`)
+        : fail("T3: reapOrphanedFlyApps should return ≥ 1", String(t3Reaped));
+
+      const t3Log = await getFlyLog();
+      t3Log.some((c) => c.fn === "destroyFlyApp" && c.arg === t3AppName)
+        ? ok("T3: destroyFlyApp called by reaper for seeded orphan")
+        : fail("T3: reaper should have called destroyFlyApp for ssc-t3-reaper-test",
+            JSON.stringify(t3Log));
+
+      const { rows: t3After } = await pool.query<{ fly_app_name: string }>(
+        "SELECT fly_app_name FROM orphaned_fly_apps WHERE fly_app_name=$1", [t3AppName],
+      );
+      t3After.length === 0
+        ? ok("T3: orphan row removed from DB after successful reap")
+        : fail("T3: orphan row should be deleted after reap");
+    }
+
+    // ── Cleanup Section T ─────────────────────────────────────────────────────
+    await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+    await request("POST", "/test/set-fly-destroy-failures", { body: { times: 0 } });
+    await pool.query("DELETE FROM orphaned_fly_apps WHERE org_id=$1", [tOrgId]);
+    await pool.query("DELETE FROM orgs WHERE id=$1", [tOrgId]);
   }
 
   // ════════════════════════════════════════════════════════════════════════════

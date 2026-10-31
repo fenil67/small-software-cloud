@@ -98,3 +98,19 @@ export async function allocateFlyIp(appName: string): Promise<string> {
   const { data } = await client.post(`/apps/${appName}/allocate-shared-ipv4`);
   return data.address as string;
 }
+
+/**
+ * Returns true if the named Fly app exists, false on 404.
+ * Used by deployRunner to detect apps that were destroyed externally so it can
+ * recreate them rather than failing with an unhelpful "app not found" error.
+ */
+export async function checkFlyAppExists(appName: string): Promise<boolean> {
+  const client = makeClient();
+  try {
+    await client.get(`/apps/${appName}`);
+    return true;
+  } catch (err) {
+    if (err instanceof FlyApiError && err.status === 404) return false;
+    throw err;
+  }
+}
