@@ -1049,6 +1049,7 @@ async function main(): Promise<void> {
     // Server must still be alive
     const health = await request("GET", "/health");
     health.status === 200 ? ok("server still alive after DB error") : fail("server died after DB error", `got ${health.status}`);
+    (health.body as any)?.db === "ok" ? ok("health reports db ok") : fail("health does not report db ok", JSON.stringify(health.body));
   }
 
   // ════════════════════════════════════════════════════════════════════════════
