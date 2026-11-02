@@ -22,7 +22,7 @@ if (_dbUrl.includes("rlwy.net") || _dbUrl.includes("railway.app")) {
 // Must be set before any imports
 process.env.FLY_API_TOKEN = "test-token";
 process.env.FLY_ORG_SLUG = "test-org";
-process.env.CLERK_SECRET_KEY = "sk_test_stubstubstubstub";
+process.env.CLERK_SECRET_KEY = "sk_test_fake";
 process.env.SSC_TEST = "1";
 
 // ── Log capture (intercept console.error BEFORE any module imports) ───────────
