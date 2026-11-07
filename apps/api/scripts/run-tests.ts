@@ -3058,8 +3058,11 @@ async function main(): Promise<void> {
       !y4Result.output.includes("[timed out]")
         ? ok("Y4: migrate exited within 3 seconds")
         : fail("Y4: migrate timed out (should fast-fail before connecting)");
-      y4Result.output.includes("10.255.255.1")
-        ? ok("Y4: migrate output contains guard message (guard ran, not just connection failure)")
+      y4Result.output.includes("[migrate] FATAL")
+        ? ok("Y4: migrate output contains [migrate] FATAL prefix (guard path reached)")
+        : fail("Y4: migrate output missing [migrate] FATAL prefix", y4Result.output.slice(0, 300));
+      y4Result.output.includes("points to a remote host")
+        ? ok("Y4: migrate output contains guard message text")
         : fail("Y4: migrate output missing guard message text", y4Result.output.slice(0, 300));
     }
 
@@ -3108,7 +3111,7 @@ async function main(): Promise<void> {
         y5Result.code !== 0
           ? ok("Y5: db.ts exits non-zero when remote DATABASE_URL and no RAILWAY_ENVIRONMENT")
           : fail("Y5: db.ts should exit non-zero with remote DB", `output: ${y5Result.output.slice(0, 300)}`);
-        y5Result.output.includes("10.255.255.1")
+        y5Result.output.includes("points to a remote host")
           ? ok("Y5: db.ts output contains guard message text")
           : fail("Y5: db.ts output missing guard message text", y5Result.output.slice(0, 300));
         !y5Result.output.includes("secretpw")
