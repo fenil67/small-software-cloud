@@ -7,8 +7,18 @@ import fs from "fs";
 import path from "path";
 import { Pool } from "pg";
 import { safeErr } from "../lib/safeErr";
+import { assertSafeDatabaseUrl } from "../lib/dbGuard";
 
 async function migrate() {
+  // Safety guard: bail out before attempting any connection if the DB host is
+  // remote and we are not running on Railway or with an explicit override.
+  try {
+    assertSafeDatabaseUrl(process.env.DATABASE_URL ?? "");
+  } catch (err) {
+    console.error("[migrate] FATAL:", err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   const client = await pool.connect();
 

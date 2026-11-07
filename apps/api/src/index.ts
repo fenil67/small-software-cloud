@@ -7,18 +7,12 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { clerkMiddleware } from "@clerk/express";
 import { safeErr } from "./lib/safeErr";
+import { installProcessHandlers } from "./lib/processHandlers";
 import { requestIdMiddleware, errorHandlerMiddleware } from "./middleware/errorHandler";
 
 // ─── Process-level safety nets ────────────────────────────────────────────────
-// These are last-resort guards so no unhandled rejection or uncaught exception
-// can terminate the process.  Individual async handlers should still call
-// next(err) — these catch anything that leaks through.
-process.on("unhandledRejection", (reason) => {
-  console.error("[process] unhandledRejection", safeErr(reason));
-});
-process.on("uncaughtException", (err) => {
-  console.error("[process] uncaughtException", safeErr(err));
-});
+// Last-resort guards: uncaughtException exits 1; unhandledRejection only logs.
+installProcessHandlers();
 
 // ─── Startup checks ──────────────────────────────────────────────────────────
 // Crash loudly at boot if required env vars or binaries are missing rather

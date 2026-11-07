@@ -24,6 +24,9 @@ export function writeConfigFile(data: ConfigFile): void {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2) + "\n", {
     mode: 0o600,
   });
+  // Enforce mode even if the file already existed (writeFileSync mode only
+  // applies to newly created files on some platforms).
+  fs.chmodSync(CONFIG_PATH, 0o600);
 }
 
 export interface SscConfig {
@@ -41,7 +44,8 @@ export function resolveConfig(): SscConfig {
   const apiUrl = process.env.SSC_API_URL ?? file.api_url;
   if (!apiUrl) {
     throw new Error(
-      "SSC_API_URL is not configured. Set it via the SSC_API_URL env var or run 'ssc login' to save it to ~/.config/ssc/config.json.",
+      "SSC_API_URL is not configured. Set it via the SSC_API_URL env var, " +
+        "or run 'ssc login' (which saves both the key and the URL to ~/.config/ssc/config.json).",
     );
   }
 

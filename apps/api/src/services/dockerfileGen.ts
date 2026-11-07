@@ -118,8 +118,13 @@ EXPOSE 80
 `;
 }
 
-// .dockerignore contents — static excludes dotfiles; node/python exclude only .git
-const STATIC_DOCKERIGNORE = `.git\n.*\n**/.*\n*.pem\n*.key\nid_rsa*\n`;
+// .dockerignore contents — static excludes dotfiles and generated deploy files;
+// node/python exclude only .git.
+// Dockerfile and fly.toml are excluded from static images so they are not
+// reachable from the document root (Docker still builds with them present —
+// .dockerignore only controls what is SENT INTO the build context, not what
+// is already in the directory when docker build runs).
+const STATIC_DOCKERIGNORE = `.git\n.*\n**/.*\n*.pem\n*.key\nid_rsa*\nDockerfile\nfly.toml\n`;
 const NODE_PYTHON_DOCKERIGNORE = `.git\n`;
 
 // ─── Public API ───────────────────────────────────────────────────────────────

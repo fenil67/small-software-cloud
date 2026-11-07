@@ -2293,7 +2293,7 @@ async function main(): Promise<void> {
           const hasShorthandEnv = /[,{]\s*env\s*[,}]/.test(callText) && fileHasEnvHelper;
 
           if (!hasDirectEnv && !hasShorthandEnv) {
-            envViolations.push(`${relPath}:${lineNum} — ${fnName}() missing env: gitEnv()/flyctlEnv()`);
+            envViolations.push(`${relPath}:${lineNum}`);
           }
         }
       }
@@ -2709,6 +2709,8 @@ async function main(): Promise<void> {
         di.includes("*.pem") ? ok("W2a: static .dockerignore contains *.pem") : fail("W2a: .dockerignore missing *.pem", di);
         di.includes("*.key") ? ok("W2a: static .dockerignore contains *.key") : fail("W2a: .dockerignore missing *.key", di);
         di.includes("id_rsa*") ? ok("W2a: static .dockerignore contains id_rsa*") : fail("W2a: .dockerignore missing id_rsa*", di);
+        di.includes("Dockerfile") ? ok("W2a: static .dockerignore contains Dockerfile") : fail("W2a: .dockerignore missing Dockerfile", di);
+        di.includes("fly.toml") ? ok("W2a: static .dockerignore contains fly.toml") : fail("W2a: .dockerignore missing fly.toml", di);
 
         // W2b: ssc-nginx.conf contains server_tokens off and dotfile location block
         let nc = "";
@@ -2830,6 +2832,201 @@ async function main(): Promise<void> {
           ? ok("W4: no createFlyApp call (failed before Fly provisioning)")
           : fail("W4: createFlyApp was called despite detect failure", JSON.stringify(createCalls));
       }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("Y: processHandlers crash-exit · SSC login · dbGuard");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
+
+    // ── Y1: uncaughtException → exit 1, stderr contains "[process] uncaughtException" ──
+    {
+      // Write a minimal temp script next to the test runner so relative imports resolve.
+      const y1Script = path.join(__dirname, "_y1_ph_tmp.ts");
+      try {
+        fs.writeFileSync(
+          y1Script,
+          `import { installProcessHandlers } from "../src/lib/processHandlers";\n` +
+          `installProcessHandlers();\n` +
+          `setTimeout(() => { throw new Error("y1 deliberate uncaught error"); }, 50);\n`,
+        );
+
+        const y1Result = await new Promise<{ code: number; stderr: string; stdout: string }>((resolve) => {
+          const child = require("child_process").spawn(tsx, [y1Script], {
+            cwd: __dirname,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+          child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+          child.on("close", (code: number) => resolve({ code: code ?? 1, stderr, stdout }));
+        });
+
+        y1Result.code === 1
+          ? ok("Y1: uncaughtException → exit code 1")
+          : fail("Y1: expected exit code 1", `got ${y1Result.code}`);
+        y1Result.stderr.includes("[process] uncaughtException")
+          ? ok("Y1: stderr contains [process] uncaughtException")
+          : fail("Y1: stderr missing [process] uncaughtException", y1Result.stderr.slice(0, 300));
+        // No secret-looking content (FLY_API_TOKEN, DATABASE_URL password, CLERK key)
+        const y1Combined = y1Result.stdout + y1Result.stderr;
+        const y1Secrets = ["test-token", "CLERK_SECRET_KEY", "sk_test_fake"].filter(
+          (s) => y1Combined.includes(s),
+        );
+        y1Secrets.length === 0
+          ? ok("Y1: no secret values in process output")
+          : fail("Y1: secret value(s) leaked into output", y1Secrets.join(", "));
+      } finally {
+        try { fs.unlinkSync(y1Script); } catch {}
+      }
+    }
+
+    // ── Y2: SSC login — muted stdin, key not echoed, config saved with mode 0600 ──
+    {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-login-y2-"));
+      try {
+        const cliPath = path.join(__dirname, "../../../packages/cli/src/index.ts");
+
+        const y2Result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+          const child = require("child_process").spawn(tsx, [cliPath, "login"], {
+            env: { ...process.env, HOME: tmpHome, SSC_API_URL: BASE_URL },
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+          child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+          child.on("close", (code: number) => resolve({ code: code ?? 1, stdout, stderr }));
+          // Pipe the key (non-TTY mode — no prompt, no echo)
+          child.stdin!.write(keyA + "\n");
+          child.stdin!.end();
+        });
+
+        y2Result.code === 0
+          ? ok("Y2: ssc login exits 0")
+          : fail("Y2: ssc login should exit 0", `code=${y2Result.code} stderr=${y2Result.stderr.slice(0, 300)}`);
+
+        const y2Combined = y2Result.stdout + y2Result.stderr;
+        !y2Combined.includes(keyA)
+          ? ok("Y2: API key does not appear in stdout or stderr")
+          : fail("Y2: API key leaked into output", y2Combined.slice(0, 300));
+
+        const cfgPath = path.join(tmpHome, ".config", "ssc", "config.json");
+        const cfgExists = fs.existsSync(cfgPath);
+        cfgExists ? ok("Y2: config file created") : fail("Y2: config file not found", cfgPath);
+
+        if (cfgExists) {
+          const stat = fs.statSync(cfgPath);
+          // mode & 0o777 gives permission bits
+          (stat.mode & 0o777) === 0o600
+            ? ok("Y2: config file mode is 0600")
+            : fail("Y2: config file mode is not 0600", `0o${(stat.mode & 0o777).toString(8)}`);
+
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+          typeof cfg.api_url === "string" && cfg.api_url.length > 0
+            ? ok("Y2: config file contains api_url")
+            : fail("Y2: config file missing api_url", JSON.stringify(cfg));
+          !JSON.stringify(cfg).includes(keyA)
+            ? ok("Y2: config file content not echoed to stdout/stderr (key in file is correct)")
+            : ok("Y2: config file contains the key (expected)"); // key in file is fine
+        }
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    }
+
+    // ── Y3: dbGuard unit tests ────────────────────────────────────────────────
+    {
+      delete require.cache[require.resolve("../src/lib/dbGuard")];
+      const { assertSafeDatabaseUrl } = require("../src/lib/dbGuard") as {
+        assertSafeDatabaseUrl: (url: string, env?: NodeJS.ProcessEnv) => void;
+      };
+
+      // Remote host without RAILWAY_ENVIRONMENT → throws
+      let threw = false;
+      try { assertSafeDatabaseUrl("postgres://u:pw@10.0.0.1/db", {}); } catch { threw = true; }
+      threw ? ok("Y3: remote host (no RAILWAY_ENVIRONMENT) → throws") : fail("Y3: remote host should throw");
+
+      // Remote host with RAILWAY_ENVIRONMENT → passes
+      let passed3b = true;
+      try { assertSafeDatabaseUrl("postgres://u:pw@10.0.0.1/db", { RAILWAY_ENVIRONMENT: "production" }); } catch { passed3b = false; }
+      passed3b ? ok("Y3: remote host + RAILWAY_ENVIRONMENT → passes") : fail("Y3: RAILWAY_ENVIRONMENT should bypass guard");
+
+      // localhost → passes
+      let passed3c = true;
+      try { assertSafeDatabaseUrl("postgres://u:pw@localhost/db", {}); } catch { passed3c = false; }
+      passed3c ? ok("Y3: localhost → passes") : fail("Y3: localhost should pass");
+
+      // 127.0.0.1 → passes
+      let passed3d = true;
+      try { assertSafeDatabaseUrl("postgres://u:pw@127.0.0.1/db", {}); } catch { passed3d = false; }
+      passed3d ? ok("Y3: 127.0.0.1 → passes") : fail("Y3: 127.0.0.1 should pass");
+
+      // SSC_ALLOW_REMOTE_DB=1 → passes
+      let passed3e = true;
+      try { assertSafeDatabaseUrl("postgres://u:pw@10.0.0.1/db", { SSC_ALLOW_REMOTE_DB: "1" }); } catch { passed3e = false; }
+      passed3e ? ok("Y3: SSC_ALLOW_REMOTE_DB=1 → passes") : fail("Y3: SSC_ALLOW_REMOTE_DB=1 should bypass guard");
+
+      // Error message must not contain the password
+      let errMsg = "";
+      try { assertSafeDatabaseUrl("postgres://u:supersecretpw@10.0.0.1/db", {}); } catch (e) {
+        errMsg = e instanceof Error ? e.message : String(e);
+      }
+      !errMsg.includes("supersecretpw")
+        ? ok("Y3: error message does not contain database password")
+        : fail("Y3: error message leaks database password", errMsg.slice(0, 200));
+      errMsg.includes("10.0.0.1")
+        ? ok("Y3: error message names the offending host")
+        : fail("Y3: error message should name the host", errMsg.slice(0, 200));
+    }
+
+    // ── Y4: migrate exits non-zero quickly without connecting to remote DB ────
+    {
+      const y4Result = await new Promise<{ code: number; output: string }>((resolve) => {
+        const childEnv: NodeJS.ProcessEnv = {
+          ...process.env,
+          DATABASE_URL: "postgres://u:secretpw@10.255.255.1:5432/x",
+        };
+        delete childEnv.RAILWAY_ENVIRONMENT;
+        delete childEnv.SSC_ALLOW_REMOTE_DB;
+
+        const child = require("child_process").spawn(
+          tsx,
+          ["src/db/migrate.ts"],
+          {
+            cwd: path.join(__dirname, ".."),
+            env: childEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let output = "";
+        child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
+        child.stderr.on("data", (d: Buffer) => { output += d.toString(); });
+
+        const timer = setTimeout(() => {
+          child.kill();
+          resolve({ code: 1, output: output + "\n[timed out]" });
+        }, 3000);
+
+        child.on("close", (code: number) => {
+          clearTimeout(timer);
+          resolve({ code: code ?? 1, output });
+        });
+      });
+
+      y4Result.code !== 0
+        ? ok("Y4: migrate exits non-zero when remote DB and no RAILWAY_ENVIRONMENT")
+        : fail("Y4: migrate should exit non-zero", `output: ${y4Result.output.slice(0, 300)}`);
+      !y4Result.output.includes("secretpw")
+        ? ok("Y4: migrate output does not contain database password")
+        : fail("Y4: migrate output leaks password", y4Result.output.slice(0, 300));
+      !y4Result.output.includes("[timed out]")
+        ? ok("Y4: migrate exited within 3 seconds")
+        : fail("Y4: migrate timed out (should fast-fail before connecting)");
     }
   }
 

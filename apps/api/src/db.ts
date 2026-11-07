@@ -1,9 +1,11 @@
 import { Pool } from "pg";
 import { safeErr } from "./lib/safeErr";
+import { assertSafeDatabaseUrl } from "./lib/dbGuard";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is required");
 }
+assertSafeDatabaseUrl(process.env.DATABASE_URL);
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
