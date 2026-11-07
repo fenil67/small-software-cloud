@@ -2834,6 +2834,44 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("X: Dockerfile hardening checks (digest pins, non-root user, flyctl pin)");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const dfPath = path.join(__dirname, "..", "Dockerfile");
+    const df = fs.readFileSync(dfPath, "utf8");
+    const lines = df.split("\n");
+
+    // X1: every FROM line must include @sha256:
+    const fromLines = lines.filter((l) => /^\s*FROM\s/i.test(l));
+    const fromWithoutDigest = fromLines.filter((l) => !l.includes("@sha256:"));
+    fromWithoutDigest.length === 0
+      ? ok(`X1: all ${fromLines.length} FROM line(s) carry an @sha256: digest`)
+      : fail("X1: FROM line(s) missing @sha256: digest", fromWithoutDigest.join(" | "));
+
+    // X2: last USER line must exist and must not be root or 0
+    const userLines = lines.filter((l) => /^\s*USER\s/i.test(l));
+    if (userLines.length === 0) {
+      fail("X2: no USER line found in Dockerfile");
+    } else {
+      const lastUser = userLines[userLines.length - 1].trim().replace(/^USER\s+/i, "").trim();
+      lastUser !== "root" && lastUser !== "0"
+        ? ok(`X2: last USER is "${lastUser}" (not root/0)`)
+        : fail("X2: last USER is root or 0 — image must run as unprivileged user", lastUser);
+    }
+
+    // X3: flyctl version must be pinned to 0.5.1
+    df.includes("0.5.1")
+      ? ok("X3: Dockerfile pins flyctl 0.5.1")
+      : fail("X3: flyctl version 0.5.1 not found in Dockerfile");
+
+    // X4: sha256 checksum verification of the flyctl download must be present
+    df.includes("sha256sum")
+      ? ok("X4: Dockerfile verifies flyctl download with sha256sum")
+      : fail("X4: no sha256sum check of flyctl download in Dockerfile");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
