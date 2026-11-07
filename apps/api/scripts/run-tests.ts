@@ -2601,6 +2601,239 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("W: Static detection hardening, .dockerignore, nginx dotfile guard");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const { detectAppType } = require("../src/services/appDetector");
+    const { generateDeployFiles } = require("../src/services/dockerfileGen");
+    const fsTmp = require("fs/promises");
+    const pathTmp = require("path");
+    const osTmp = require("os");
+
+    const mkTmp = () => fsTmp.mkdtemp(pathTmp.join(osTmp.tmpdir(), "ssc-w-"));
+    const cleanup = (d: string) => fsTmp.rm(d, { recursive: true, force: true }).catch(() => {});
+
+    // ── W1: Detection unit tests ─────────────────────────────────────────────
+
+    // W1a: empty dir → throws (no index.html)
+    {
+      const d = await mkTmp();
+      try {
+        try {
+          await detectAppType(d);
+          fail("W1a: empty dir should throw");
+        } catch (e: any) {
+          ok("W1a: empty dir → throws (no fallback to static)");
+        }
+      } finally { await cleanup(d); }
+    }
+
+    // W1b: only a dotfile (.env) → throws
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, ".env"), "SECRET=abc");
+        try {
+          await detectAppType(d);
+          fail("W1b: .env-only dir should throw");
+        } catch (e: any) {
+          ok("W1b: .env-only dir → throws (dotfile alone ≠ static)");
+        }
+      } finally { await cleanup(d); }
+    }
+
+    // W1c: static assets but no index.html → throws
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "logo.png"), "PNG");
+        await fsTmp.writeFile(pathTmp.join(d, "style.css"), "body{}");
+        try {
+          await detectAppType(d);
+          fail("W1c: assets-without-index.html should throw");
+        } catch (e: any) {
+          ok("W1c: assets-without-index.html → throws");
+        }
+      } finally { await cleanup(d); }
+    }
+
+    // W1d: index.html present → kind=static
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "index.html"), "<h1>hi</h1>");
+        const t = await detectAppType(d);
+        t.kind === "static" ? ok("W1d: index.html → kind=static") : fail("W1d: expected static", JSON.stringify(t));
+      } finally { await cleanup(d); }
+    }
+
+    // W1e: error message mentions index.html, package.json, requirements.txt
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "main.go"), "package main");
+        try {
+          await detectAppType(d);
+          fail("W1e: should throw");
+        } catch (e: any) {
+          const msg: string = e.message ?? "";
+          msg.includes("index.html")
+            ? ok("W1e: error message mentions index.html")
+            : fail("W1e: error message missing index.html", msg);
+          msg.includes("package.json")
+            ? ok("W1e: error message mentions package.json")
+            : fail("W1e: error message missing package.json", msg);
+          msg.includes("requirements.txt")
+            ? ok("W1e: error message mentions requirements.txt")
+            : fail("W1e: error message missing requirements.txt", msg);
+        }
+      } finally { await cleanup(d); }
+    }
+
+    // ── W2: Static output — .dockerignore + nginx conf ───────────────────────
+
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "index.html"), "<h1>hi</h1>");
+        const t = await detectAppType(d);
+        await generateDeployFiles(d, "ssc-w2-test", t);
+
+        // W2a: .dockerignore exists and contains dotfile exclusions
+        let di = "";
+        try { di = await fsTmp.readFile(pathTmp.join(d, ".dockerignore"), "utf8"); } catch {}
+        di.includes(".git") ? ok("W2a: static .dockerignore contains .git") : fail("W2a: .dockerignore missing .git", di);
+        di.includes(".*") ? ok("W2a: static .dockerignore contains .*") : fail("W2a: .dockerignore missing .*", di);
+        di.includes("**/.*") ? ok("W2a: static .dockerignore contains **/.*") : fail("W2a: .dockerignore missing **/.*", di);
+        di.includes("*.pem") ? ok("W2a: static .dockerignore contains *.pem") : fail("W2a: .dockerignore missing *.pem", di);
+        di.includes("*.key") ? ok("W2a: static .dockerignore contains *.key") : fail("W2a: .dockerignore missing *.key", di);
+        di.includes("id_rsa*") ? ok("W2a: static .dockerignore contains id_rsa*") : fail("W2a: .dockerignore missing id_rsa*", di);
+
+        // W2b: ssc-nginx.conf contains server_tokens off and dotfile location block
+        let nc = "";
+        try { nc = await fsTmp.readFile(pathTmp.join(d, "ssc-nginx.conf"), "utf8"); } catch {}
+        nc.includes("server_tokens off") ? ok("W2b: ssc-nginx.conf has server_tokens off") : fail("W2b: ssc-nginx.conf missing server_tokens off", nc);
+        nc.includes("location ~ /\\.") ? ok("W2b: ssc-nginx.conf has dotfile location block") : fail("W2b: ssc-nginx.conf missing dotfile location block", nc);
+        nc.includes("return 404") ? ok("W2b: ssc-nginx.conf returns 404 for dotfiles") : fail("W2b: ssc-nginx.conf missing return 404", nc);
+
+        // W2c: Dockerfile copies ssc-nginx.conf into /etc/nginx/conf.d/default.conf
+        const df = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
+        df.includes("COPY ssc-nginx.conf /etc/nginx/conf.d/default.conf")
+          ? ok("W2c: Dockerfile copies ssc-nginx.conf to /etc/nginx/conf.d/default.conf")
+          : fail("W2c: Dockerfile missing nginx COPY", df);
+
+        // W2d: Dockerfile deletes ssc-nginx.conf from document root
+        df.includes("RUN rm -f /usr/share/nginx/html/ssc-nginx.conf")
+          ? ok("W2d: Dockerfile removes ssc-nginx.conf from document root")
+          : fail("W2d: Dockerfile missing RUN rm for ssc-nginx.conf", df);
+      } finally { await cleanup(d); }
+    }
+
+    // ── W3: Node/Python .dockerignore — .git only, no dotfile glob ───────────
+
+    // W3a: Node .dockerignore
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "package.json"), JSON.stringify({
+          name: "w3-node", version: "1.0.0", scripts: { start: "node app.js" },
+        }));
+        const t = await detectAppType(d);
+        await generateDeployFiles(d, "ssc-w3-node", t);
+        let di = "";
+        try { di = await fsTmp.readFile(pathTmp.join(d, ".dockerignore"), "utf8"); } catch {}
+        di.includes(".git") ? ok("W3a: node .dockerignore contains .git") : fail("W3a: node .dockerignore missing .git", di);
+        !di.includes("*.pem") ? ok("W3a: node .dockerignore does not contain *.pem") : fail("W3a: node .dockerignore should not contain *.pem", di);
+      } finally { await cleanup(d); }
+    }
+
+    // W3b: Python .dockerignore
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "requirements.txt"), "flask\ngunicorn");
+        await fsTmp.writeFile(pathTmp.join(d, "app.py"), "app = None");
+        const t = await detectAppType(d);
+        await generateDeployFiles(d, "ssc-w3-py", t);
+        let di = "";
+        try { di = await fsTmp.readFile(pathTmp.join(d, ".dockerignore"), "utf8"); } catch {}
+        di.includes(".git") ? ok("W3b: python .dockerignore contains .git") : fail("W3b: python .dockerignore missing .git", di);
+        !di.includes("*.pem") ? ok("W3b: python .dockerignore does not contain *.pem") : fail("W3b: python .dockerignore should not contain *.pem", di);
+      } finally { await cleanup(d); }
+    }
+
+    // W3c: user Dockerfile — no .dockerignore written
+    {
+      const d = await mkTmp();
+      try {
+        await fsTmp.writeFile(pathTmp.join(d, "Dockerfile"), "FROM node:20-alpine\nEXPOSE 3000\n");
+        const t = await detectAppType(d);
+        await generateDeployFiles(d, "ssc-w3-df", t);
+        let diExists = false;
+        try { await fsTmp.access(pathTmp.join(d, ".dockerignore")); diExists = true; } catch {}
+        !diExists ? ok("W3c: user-supplied Dockerfile → no .dockerignore written") : fail("W3c: .dockerignore should not be written for user Dockerfile");
+      } finally { await cleanup(d); }
+    }
+
+    // ── W4: Intake zip with no recognised type → fails at detect, no Fly app ──
+
+    {
+      // Enable real deploy so the actual detectAppType is called
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/reset-fly-call-log");
+
+      // Build a zip with no recognised app type (README + image — no .env/index.html/package.json)
+      const textOnlyZip = await buildZip({
+        "README.md": "# My project\nNo server code here.\n",
+        "logo.png": "PNG_PLACEHOLDER",
+      });
+
+      const form = new FormData();
+      form.append("code", textOnlyZip, { filename: "app.zip", contentType: "application/zip" });
+
+      const intakeResp = await request("POST", "/v1/deployments/intake/zip", {
+        headers: { ...authHeaders(keyA), ...form.getHeaders() },
+        formData: form,
+      });
+
+      if (intakeResp.status !== 202) {
+        fail("W4: intake should return 202", `got ${intakeResp.status} ${JSON.stringify(intakeResp.body)}`);
+      } else {
+        ok("W4: intake accepted (202)");
+        const deploymentId = (intakeResp.body as Record<string, unknown>).deployment_id as string;
+
+        // Poll until terminal
+        let pollResult: DeployPollResult;
+        try {
+          pollResult = await pollDeployment(deploymentId, keyA, 10000);
+        } finally {
+          // Always restore stub mode
+          await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+        }
+
+        pollResult.status === "failed"
+          ? ok("W4: deployment status=failed")
+          : fail("W4: expected status=failed", `got ${pollResult.status}`);
+        pollResult.failure_stage === "detect"
+          ? ok("W4: failure_stage=detect (before Fly provisioning)")
+          : fail("W4: expected failure_stage=detect", `got ${pollResult.failure_stage}`);
+        typeof pollResult.failure_message === "string" && pollResult.failure_message.length > 0
+          ? ok("W4: failure_message is set")
+          : fail("W4: failure_message missing", String(pollResult.failure_message));
+
+        // No Fly app should have been created
+        const logResp = await request("GET", "/test/fly-call-log");
+        const calls = ((logResp.body as Record<string, unknown>).calls ?? []) as Array<{ fn: string }>;
+        const createCalls = calls.filter((c) => c.fn === "createFlyApp");
+        createCalls.length === 0
+          ? ok("W4: no createFlyApp call (failed before Fly provisioning)")
+          : fail("W4: createFlyApp was called despite detect failure", JSON.stringify(createCalls));
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

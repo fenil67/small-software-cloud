@@ -90,12 +90,37 @@ CMD ["sh", "-c", "${cmd}"]
 
 // ─── Static (nginx) ───────────────────────────────────────────────────────────
 
+const NGINX_CONF_FILE = "ssc-nginx.conf";
+
+function nginxConfig(): string {
+  return `server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+    server_tokens off;
+    location ~ /\\. {
+        return 404;
+    }
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+`;
+}
+
 function staticDockerfile(): string {
   return `FROM nginx:alpine
+COPY ${NGINX_CONF_FILE} /etc/nginx/conf.d/default.conf
 COPY . /usr/share/nginx/html
+RUN rm -f /usr/share/nginx/html/${NGINX_CONF_FILE}
 EXPOSE 80
 `;
 }
+
+// .dockerignore contents — static excludes dotfiles; node/python exclude only .git
+const STATIC_DOCKERIGNORE = `.git\n.*\n**/.*\n*.pem\n*.key\nid_rsa*\n`;
+const NODE_PYTHON_DOCKERIGNORE = `.git\n`;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -123,15 +148,19 @@ export async function generateDeployFiles(
 
     case "node":
       dockerfile = nodeDockerfile(appType.packageManager, appType.startCommand);
+      await fs.writeFile(path.join(dir, ".dockerignore"), NODE_PYTHON_DOCKERIGNORE);
       break;
 
     case "python":
       dockerfile = pythonDockerfile(appType.server, appType.entrypoint);
+      await fs.writeFile(path.join(dir, ".dockerignore"), NODE_PYTHON_DOCKERIGNORE);
       break;
 
     case "static":
       dockerfile = staticDockerfile();
       internalPort = 80;
+      await fs.writeFile(path.join(dir, NGINX_CONF_FILE), nginxConfig());
+      await fs.writeFile(path.join(dir, ".dockerignore"), STATIC_DOCKERIGNORE);
       break;
   }
 

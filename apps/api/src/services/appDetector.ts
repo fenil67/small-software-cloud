@@ -115,22 +115,8 @@ export async function detectAppType(dir: string): Promise<AppType> {
     return { kind: "static" };
   }
 
-  // Check whether ALL visible files are static assets (no server code)
-  const CODE_EXTENSIONS = new Set([".js", ".ts", ".py", ".rb", ".go", ".rs", ".php"]);
-  const hasCode = entries.some((e) => {
-    const ext = path.extname(e).toLowerCase();
-    return CODE_EXTENSIONS.has(ext);
-  });
-
-  if (!hasCode) {
-    return { kind: "static" };
-  }
-
   throw new Error(
-    "Could not detect app type. Expected one of:\n" +
-      "  • package.json with a \"start\" script (Node)\n" +
-      "  • requirements.txt + app.py/main.py (Python)\n" +
-      "  • index.html (static site)\n" +
-      "  • Dockerfile (custom)"
+    "Couldn't detect an app type. Supported: Node (package.json), Python (requirements.txt), " +
+      "a Dockerfile, or a static site with index.html at the root."
   );
 }
