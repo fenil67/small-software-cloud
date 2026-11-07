@@ -2188,6 +2188,137 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section U — childEnv isolation · static guard · failure-message scrubbing
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("U: childEnv isolation, static guard, failure scrubbing");
+
+    // ── U1: gitEnv() and flyctlEnv() are isolated from secrets ───────────────
+    {
+      const savedFly   = process.env.FLY_API_TOKEN;
+      const savedDb    = process.env.DATABASE_URL;
+      const savedClerk = process.env.CLERK_SECRET_KEY;
+      process.env.FLY_API_TOKEN    = "u1-fake-fly-token";
+      process.env.DATABASE_URL     = "postgres://user:pass@localhost/testdb";
+      process.env.CLERK_SECRET_KEY = "sk_test_u1fake";
+
+      // Force re-evaluation so the module picks up the new env values
+      delete require.cache[require.resolve("../src/lib/childEnv")];
+      const { gitEnv: gE, flyctlEnv: fE } = require("../src/lib/childEnv") as {
+        gitEnv: () => NodeJS.ProcessEnv;
+        flyctlEnv: () => NodeJS.ProcessEnv;
+      };
+
+      const ge = gE();
+      const fe = fE();
+
+      !("FLY_API_TOKEN"    in ge) ? ok("U1: gitEnv has no FLY_API_TOKEN")    : fail("U1: gitEnv must not have FLY_API_TOKEN");
+      !("DATABASE_URL"     in ge) ? ok("U1: gitEnv has no DATABASE_URL")     : fail("U1: gitEnv must not have DATABASE_URL");
+      !("CLERK_SECRET_KEY" in ge) ? ok("U1: gitEnv has no CLERK_SECRET_KEY") : fail("U1: gitEnv must not have CLERK_SECRET_KEY");
+      ge.GIT_TERMINAL_PROMPT === "0" ? ok("U1: gitEnv GIT_TERMINAL_PROMPT=0") : fail("U1: gitEnv missing GIT_TERMINAL_PROMPT");
+      ge.GIT_CONFIG_NOSYSTEM === "1" ? ok("U1: gitEnv GIT_CONFIG_NOSYSTEM=1") : fail("U1: gitEnv missing GIT_CONFIG_NOSYSTEM");
+
+      fe.FLY_API_TOKEN === "u1-fake-fly-token" ? ok("U1: flyctlEnv has FLY_API_TOKEN") : fail("U1: flyctlEnv must have FLY_API_TOKEN", fe.FLY_API_TOKEN ?? "(unset)");
+      !("DATABASE_URL"     in fe) ? ok("U1: flyctlEnv has no DATABASE_URL")     : fail("U1: flyctlEnv must not have DATABASE_URL");
+      !("CLERK_SECRET_KEY" in fe) ? ok("U1: flyctlEnv has no CLERK_SECRET_KEY") : fail("U1: flyctlEnv must not have CLERK_SECRET_KEY");
+      fe.CI === "true" ? ok("U1: flyctlEnv CI=true") : fail("U1: flyctlEnv must have CI=true");
+
+      const gitAllowed = new Set(["PATH", "HOME", "LANG", "TMPDIR", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM"]);
+      const flyAllowed = new Set(["PATH", "HOME", "LANG", "TMPDIR", "FLY_API_TOKEN", "CI"]);
+      const geExtra = Object.keys(ge).filter((k) => !gitAllowed.has(k));
+      const feExtra = Object.keys(fe).filter((k) => !flyAllowed.has(k));
+      geExtra.length === 0 ? ok("U1: gitEnv only allow-listed keys") : fail("U1: gitEnv has extra keys", geExtra.join(", "));
+      feExtra.length === 0 ? ok("U1: flyctlEnv only allow-listed keys") : fail("U1: flyctlEnv has extra keys", feExtra.join(", "));
+
+      if (savedFly   === undefined) delete process.env.FLY_API_TOKEN;    else process.env.FLY_API_TOKEN    = savedFly;
+      if (savedDb    === undefined) delete process.env.DATABASE_URL;     else process.env.DATABASE_URL     = savedDb;
+      if (savedClerk === undefined) delete process.env.CLERK_SECRET_KEY; else process.env.CLERK_SECRET_KEY = savedClerk;
+    }
+
+    // ── U2: Static guard — no ...process.env in apps/api/src .ts files ───────
+    {
+      const srcDir = path.resolve(__dirname, "..", "src");
+      const tsFiles: string[] = [];
+      const walk = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(p);
+          else if (entry.name.endsWith(".ts")) tsFiles.push(p);
+        }
+      };
+      walk(srcDir);
+      const violating = tsFiles.filter((f) => fs.readFileSync(f, "utf8").includes("...process.env"));
+      violating.length === 0
+        ? ok("U2: no ...process.env in any apps/api/src .ts file (static guard)")
+        : fail("U2: ...process.env found", violating.map((f) => path.relative(srcDir, f)).join(", "));
+    }
+
+    // ── U3: Failure message scrubbing — FLY_API_TOKEN must not leak ──────────
+    {
+      const { rows: u3OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id,name,slug) VALUES ('clerk_org_u3','U3 Org','u3-org') RETURNING id",
+      );
+      const u3OrgId = u3OrgRows[0].id;
+      const { fullKey: u3Key, keyPrefix: u3KP, keyHash: u3KH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id,created_by,name,key_prefix,key_hash) VALUES ($1,$2,'u3-key',$3,$4)",
+        [u3OrgId, userId, u3KP, u3KH],
+      );
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "failure-with-token" } });
+      await request("GET", "/test/drain-logs"); // clear prior logs
+
+      const u3Zip = await buildZip({
+        "package.json": JSON.stringify({ name: "u3-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+      const u3Form = new FormData();
+      u3Form.append("code", u3Zip, { filename: "app.zip", contentType: "application/zip" });
+      const u3Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(u3Key), formData: u3Form,
+      });
+      const { deployment_id: u3DepId } = u3Intake.body as Record<string, string>;
+
+      // Collect SSE events
+      const u3Events = await streamRequest(`/v1/deployments/${u3DepId}/stream`, authHeaders(u3Key));
+      const u3Parsed = u3Events
+        .map((e) => { try { return JSON.parse(e); } catch { return null; } })
+        .filter(Boolean) as Array<{ type: string; message?: string }>;
+      const u3ErrorEvent = u3Parsed.find((e) => e.type === "error");
+
+      !u3ErrorEvent?.message?.includes("test-token")
+        ? ok("U3: SSE error event message does not contain FLY_API_TOKEN value")
+        : fail("U3: FLY_API_TOKEN leaked into SSE error event", u3ErrorEvent?.message?.slice(0, 200));
+      u3ErrorEvent?.message?.includes("[REDACTED]")
+        ? ok("U3: SSE error event message contains [REDACTED]")
+        : fail("U3: [REDACTED] missing from SSE error event", JSON.stringify(u3ErrorEvent));
+
+      // Poll for stored failure_message
+      const u3Poll = await pollDeployment(u3DepId, u3Key);
+      !u3Poll.failure_message?.includes("test-token")
+        ? ok("U3: stored failure_message does not contain FLY_API_TOKEN value")
+        : fail("U3: FLY_API_TOKEN leaked into stored failure_message", u3Poll.failure_message?.slice(0, 200));
+      u3Poll.failure_message?.includes("[REDACTED]")
+        ? ok("U3: stored failure_message contains [REDACTED]")
+        : fail("U3: [REDACTED] missing from stored failure_message", u3Poll.failure_message ?? "(null)");
+
+      // Wait a moment then check console.error logs
+      await new Promise<void>((r) => setTimeout(r, 400));
+      const u3Drained = (await request("GET", "/test/drain-logs")).body as { logs: string[] };
+      const u3LogStr = u3Drained.logs.join(" ");
+      !u3LogStr.includes("test-token")
+        ? ok("U3: drain-logs contain no FLY_API_TOKEN value")
+        : fail("U3: FLY_API_TOKEN leaked into console.error logs");
+
+      // Restore server to default state
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await pool.query("DELETE FROM orgs WHERE id=$1", [u3OrgId]);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

@@ -236,11 +236,22 @@ app.post("/test/set-real-deploy", (req, res) => {
   res.json({ ok: true, realDeployEnabled: _realDeployEnabled });
 });
 
-// POST /test/set-flyctl-mode { mode: "success"|"failure" }
-// Rewrites the fake flyctl binary to exit 0 or 1.
+// POST /test/set-flyctl-mode { mode: "success"|"failure"|"failure-with-token" }
+// Rewrites the fake flyctl binary.
+// "failure-with-token": echoes FLY_API_TOKEN to stdout then exits 1 — used by
+// Section U3 to verify scrubSecrets strips the token from outputLines before
+// it reaches the stored failure_message or SSE error event.
 app.post("/test/set-flyctl-mode", (req, res) => {
   const { mode } = req.body as { mode?: string };
-  const script = mode === "failure" ? "#!/bin/sh\nexit 1\n" : "#!/bin/sh\nexit 0\n";
+  let script: string;
+  if (mode === "failure") {
+    script = "#!/bin/sh\nexit 1\n";
+  } else if (mode === "failure-with-token") {
+    // flyctlEnv() passes FLY_API_TOKEN; fake flyctl echoes it then fails
+    script = '#!/bin/sh\necho "unauthorized token=$FLY_API_TOKEN"\nexit 1\n';
+  } else {
+    script = "#!/bin/sh\nexit 0\n";
+  }
   fs.writeFileSync(_fakeFlyctlBin, script, { mode: 0o755 });
   res.json({ ok: true, mode: mode ?? "success" });
 });

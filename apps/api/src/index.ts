@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { execFileSync } from "child_process";
+import { gitEnv, flyctlEnv } from "./lib/childEnv";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -33,14 +34,14 @@ process.on("uncaughtException", (err) => {
   }
 
   // Required binaries
-  const required: { bin: string; args: string[] }[] = [
-    { bin: "flyctl", args: ["version"] },
-    { bin: "git",    args: ["--version"] },
+  const required: { bin: string; args: string[]; env: NodeJS.ProcessEnv }[] = [
+    { bin: "flyctl", args: ["version"], env: flyctlEnv() },
+    { bin: "git",    args: ["--version"], env: gitEnv() },
   ];
 
-  for (const { bin, args } of required) {
+  for (const { bin, args, env } of required) {
     try {
-      const out = execFileSync(bin, args, { encoding: "utf8" }).trim();
+      const out = execFileSync(bin, args, { encoding: "utf8", env }).trim();
       console.log(`[startup] ${bin}: ${out.split("\n")[0]}`);
     } catch {
       console.error(`[startup] FATAL: "${bin}" not found or failed to run. Is it installed in this image?`);

@@ -8,6 +8,7 @@ import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp, checkFlyAppExists } from "./flyClient";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
+import { gitEnv, flyctlEnv } from "../lib/childEnv";
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles } from "./dockerfileGen";
 
@@ -131,7 +132,7 @@ async function extractZip(zipBuffer: Buffer, deploymentId: string): Promise<stri
 async function cloneRepo(githubUrl: string, deploymentId: string): Promise<string> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ssc-${deploymentId.slice(0, 8)}-`));
   try {
-    await execFileP("git", ["clone", "--depth=1", githubUrl, dir]);
+    await execFileP("git", ["clone", "--depth=1", githubUrl, dir], { env: gitEnv() });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("not found") || msg.includes("Repository not found") || msg.includes("128")) {
@@ -163,18 +164,16 @@ export async function runFlyctlDeploy(
       ["deploy", "--remote-only", "--ha=false", "--app", appName, "--yes"],
       {
         cwd: dir,
-        env: {
-          ...process.env,
-          CI: "true", // belt-and-suspenders: suppress interactive prompts
-        },
+        env: flyctlEnv(),
       },
     );
 
     proc.stdout.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
       for (const line of lines) {
-        outputLines.push(line);
-        log(deploymentId, scrubSecrets(line));
+        const scrubbed = scrubSecrets(line);
+        outputLines.push(scrubbed);
+        log(deploymentId, scrubbed);
       }
     });
     // stderr carries flyctl progress, warnings, and error messages — send it
@@ -182,8 +181,9 @@ export async function runFlyctlDeploy(
     proc.stderr.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
       for (const line of lines) {
-        outputLines.push(line);
-        log(deploymentId, scrubSecrets(line));
+        const scrubbed = scrubSecrets(line);
+        outputLines.push(scrubbed);
+        log(deploymentId, scrubbed);
       }
     });
 
