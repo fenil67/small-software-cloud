@@ -2235,7 +2235,7 @@ async function main(): Promise<void> {
       if (savedClerk === undefined) delete process.env.CLERK_SECRET_KEY; else process.env.CLERK_SECRET_KEY = savedClerk;
     }
 
-    // ── U2: Static guard — no ...process.env in apps/api/src .ts files ───────
+    // ── U2: Static guard — every child_process call uses gitEnv()/flyctlEnv() ─
     {
       const srcDir = path.resolve(__dirname, "..", "src");
       const tsFiles: string[] = [];
@@ -2247,10 +2247,61 @@ async function main(): Promise<void> {
         }
       };
       walk(srcDir);
-      const violating = tsFiles.filter((f) => fs.readFileSync(f, "utf8").includes("...process.env"));
-      violating.length === 0
-        ? ok("U2: no ...process.env in any apps/api/src .ts file (static guard)")
-        : fail("U2: ...process.env found", violating.map((f) => path.relative(srcDir, f)).join(", "));
+
+      // Belt-and-suspenders: also catch any raw ...process.env spread
+      const spreadViolations = tsFiles.filter((f) => fs.readFileSync(f, "utf8").includes("...process.env"));
+      spreadViolations.length === 0
+        ? ok("U2: no ...process.env spread in any apps/api/src .ts file")
+        : fail("U2: ...process.env spread found", spreadViolations.map((f) => path.relative(srcDir, f)).join(", "));
+
+      // Scan every child_process call site and require an approved env option.
+      // Approved forms:
+      //   (a) direct: `env: gitEnv()` or `env: flyctlEnv()` inside the call
+      //   (b) indirect: `env` as a shorthand property AND the file contains
+      //       gitEnv()/flyctlEnv() calls (e.g. src/index.ts uses an array of
+      //       { bin, args, env } where env is set to flyctlEnv()/gitEnv()).
+      //
+      // Order matters: longer alternatives before shorter ones (execFileP before execFile).
+      const cpPattern = /\b(execFileP|execFileSync|execFile|spawnSync|spawn|execSync|exec)\s*\(/g;
+      const envViolations: string[] = [];
+
+      for (const filePath of tsFiles) {
+        const src = fs.readFileSync(filePath, "utf8");
+        const relPath = path.relative(srcDir, filePath);
+        // Does the file at all contain calls to the env helpers?
+        const fileHasEnvHelper = /\b(gitEnv|flyctlEnv)\s*\(/.test(src);
+
+        cpPattern.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = cpPattern.exec(src)) !== null) {
+          const fnName = m[1];
+          const parenOpen = m.index + m[0].length - 1; // index of '('
+
+          // Walk forward to find the matching closing paren
+          let depth = 0;
+          let j = parenOpen;
+          for (; j < src.length; j++) {
+            if (src[j] === "(") depth++;
+            else if (src[j] === ")") { depth--; if (depth === 0) break; }
+          }
+          const callText = src.slice(m.index, j + 1);
+          const lineNum = src.slice(0, m.index).split("\n").length;
+
+          // (a) Direct: options object contains `env: gitEnv()` or `env: flyctlEnv()`
+          const hasDirectEnv = /\benv\s*:\s*(gitEnv|flyctlEnv)\s*\(/.test(callText);
+          // (b) Indirect: options contain bare `env` shorthand AND file has env helpers
+          const hasShorthandEnv = /[,{]\s*env\s*[,}]/.test(callText) && fileHasEnvHelper;
+
+          if (!hasDirectEnv && !hasShorthandEnv) {
+            envViolations.push(`${relPath}:${lineNum} — ${fnName}() missing env: gitEnv()/flyctlEnv()`);
+          }
+        }
+      }
+
+      envViolations.length === 0
+        ? ok("U2: every child_process call uses gitEnv() or flyctlEnv() (static guard)")
+        : fail("U2: child_process call(s) missing approved env",
+            "\n    " + envViolations.join("\n    "));
     }
 
     // ── U3: Failure message scrubbing — FLY_API_TOKEN must not leak ──────────
@@ -2285,6 +2336,28 @@ async function main(): Promise<void> {
       const u3Parsed = u3Events
         .map((e) => { try { return JSON.parse(e); } catch { return null; } })
         .filter(Boolean) as Array<{ type: string; message?: string }>;
+
+      // ── NEW: check ALL SSE events (every type) for the raw token value ──────
+      // This catches leakage through "log" events (the live build output stream)
+      // in addition to the "error" event checked below.
+      const u3AllEventsStr = u3Parsed.map((e) => JSON.stringify(e)).join(" ");
+      !u3AllEventsStr.includes("test-token")
+        ? ok("U3: no SSE event of any type contains FLY_API_TOKEN value")
+        : fail("U3: FLY_API_TOKEN leaked into SSE events",
+            u3AllEventsStr.slice(0, 300));
+
+      // ── NEW: assert the deploy actually exercised the scrubbed log() path ───
+      // If no "log" event arrives the scrubbing test is vacuously passing.
+      const u3LogEvents = u3Parsed.filter((e) => e.type === "log");
+      u3LogEvents.length > 0
+        ? ok(`U3: received ${u3LogEvents.length} SSE log event(s) — flyctl output path exercised`)
+        : fail("U3: no SSE log events received — flyctl output path was not exercised");
+      u3LogEvents.some((e) => e.message?.includes("[REDACTED]"))
+        ? ok("U3: at least one SSE log event contains [REDACTED] (scrubbing confirmed on log path)")
+        : fail("U3: no SSE log event contains [REDACTED] — scrubSecrets not applied to log() output",
+            u3LogEvents.map((e) => e.message ?? "").join(" | ").slice(0, 300));
+
+      // ── Existing: "error" event specific checks ──────────────────────────────
       const u3ErrorEvent = u3Parsed.find((e) => e.type === "error");
 
       !u3ErrorEvent?.message?.includes("test-token")
