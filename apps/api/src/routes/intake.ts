@@ -13,6 +13,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { pool } from "../db";
 import { validateZip, ZipValidationError } from "../lib/zipValidate";
 import { checkDeployLimits } from "../lib/deployLimits";
+import { parseGithubUrl, GithubUrlError } from "../lib/githubUrl";
 import { ensureUser, ensureOrg } from "../lib/clerkSync";
 import { runDeploy } from "../services/deployRunner";
 import { asyncHandler } from "../lib/asyncHandler";
@@ -266,17 +267,16 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
     return;
   }
 
-  // Basic URL validation
-  let parsedUrl: URL;
+  // Strict URL validation — returns { owner, repo, cloneUrl } or throws GithubUrlError
+  let parsedGithub: { owner: string; repo: string; cloneUrl: string };
   try {
-    parsedUrl = new URL(github_url);
-  } catch {
-    res.status(400).json({ error: "validation_error", message: "Invalid GitHub URL." });
-    return;
-  }
-  if (parsedUrl.hostname !== "github.com") {
-    res.status(400).json({ error: "validation_error", message: "Only github.com URLs are supported." });
-    return;
+    parsedGithub = parseGithubUrl(github_url);
+  } catch (err) {
+    if (err instanceof GithubUrlError) {
+      res.status(400).json({ error: "invalid_github_url", message: err.message });
+      return;
+    }
+    throw err;
   }
 
   const orgId = await resolveOrgId(req);
@@ -294,7 +294,7 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
 
   const userId = await resolveUserId(req);
   const rawName = (app_name ?? "").trim();
-  const appName = rawName || parsedUrl.pathname.split("/").filter(Boolean)[1] || "app";
+  const appName = rawName || parsedGithub.repo;
   const explicitName = rawName.length > 0;
 
   let deploymentId: string;
@@ -302,7 +302,7 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
 
   try {
     ({ deploymentId, appId } = await createAppAndDeployment(
-      orgId, userId, appName, explicitName, "github", github_url, existingAppId,
+      orgId, userId, appName, explicitName, "github", parsedGithub.cloneUrl, existingAppId,
     ));
   } catch (err) {
     if (err instanceof NameTakenError) {
@@ -319,9 +319,9 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
     throw err;
   }
 
-  // Kick off deploy in background
+  // Kick off deploy in background — use the canonical cloneUrl, not raw input
   setImmediate(() => {
-    runDeploy({ deploymentId, appId, githubUrl: github_url }).catch((e) =>
+    runDeploy({ deploymentId, appId, githubUrl: parsedGithub.cloneUrl }).catch((e) =>
       console.error("[intake] runDeploy error:", safeErr(e)),
     );
   });

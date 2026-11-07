@@ -9,6 +9,7 @@ import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp, checkFlyAppExists } from "./flyClient";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { gitEnv, flyctlEnv } from "../lib/childEnv";
+import { parseGithubUrl, buildCloneArgs, checkDirSize, GithubUrlError } from "../lib/githubUrl";
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles } from "./dockerfileGen";
 
@@ -130,16 +131,54 @@ async function extractZip(zipBuffer: Buffer, deploymentId: string): Promise<stri
 }
 
 async function cloneRepo(githubUrl: string, deploymentId: string): Promise<string> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ssc-${deploymentId.slice(0, 8)}-`));
+  // Defence-in-depth: re-validate even if intake already validated.
+  let cloneUrl: string;
   try {
-    await execFileP("git", ["clone", "--depth=1", githubUrl, dir], { env: gitEnv() });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("not found") || msg.includes("Repository not found") || msg.includes("128")) {
-      throw new DeployError("clone", "Repository not found or is private. Make sure the URL is correct and the repo is public.");
-    }
-    throw new DeployError("clone", "Failed to clone repository. Check that the URL is a valid public GitHub repo.");
+    ({ cloneUrl } = parseGithubUrl(githubUrl));
+  } catch (err) {
+    throw new DeployError(
+      "clone",
+      err instanceof GithubUrlError ? err.message : "Invalid GitHub URL.",
+    );
   }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ssc-${deploymentId.slice(0, 8)}-`));
+
+  try {
+    await execFileP("git", buildCloneArgs(cloneUrl, dir), { env: gitEnv(), timeout: 60000 });
+  } catch (err: unknown) {
+    fs.rm(dir, { recursive: true, force: true }, () => {});
+    if ((err as { killed?: boolean }).killed === true) {
+      throw new DeployError("clone", "Cloning took too long.");
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes("not found") ||
+      msg.includes("Repository not found") ||
+      msg.includes("128")
+    ) {
+      throw new DeployError(
+        "clone",
+        "Repository not found or is private. Make sure the URL is correct and the repo is public.",
+      );
+    }
+    throw new DeployError(
+      "clone",
+      "Failed to clone repository. Check that the URL is a valid public GitHub repo.",
+    );
+  }
+
+  // Size check — same 50 MB cap as zip uploads
+  try {
+    await checkDirSize(dir, 50 * 1024 * 1024);
+  } catch (err) {
+    fs.rm(dir, { recursive: true, force: true }, () => {});
+    throw new DeployError(
+      "clone",
+      err instanceof Error ? err.message : "Repository is too large.",
+    );
+  }
+
   return dir;
 }
 

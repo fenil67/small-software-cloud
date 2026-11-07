@@ -2392,6 +2392,215 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section V — GitHub URL validator · clone args · size cap · intake 400s
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("V: GitHub URL validation, clone args, size cap, intake 400s");
+
+    const { parseGithubUrl, buildCloneArgs, checkDirSize } =
+      require("../src/lib/githubUrl") as {
+        parseGithubUrl: (s: string) => { owner: string; repo: string; cloneUrl: string };
+        buildCloneArgs: (cloneUrl: string, dir: string) => string[];
+        checkDirSize: (dir: string, limitBytes: number) => Promise<void>;
+      };
+
+    // ── V1: validator unit tests ───────────────────────────────────────────────
+    {
+      // Accepted
+      const accepted: { input: string; expectOwner: string; expectRepo: string }[] = [
+        { input: "https://github.com/heroku/node-js-getting-started",        expectOwner: "heroku",   expectRepo: "node-js-getting-started" },
+        { input: "https://github.com/heroku/node-js-getting-started.git",    expectOwner: "heroku",   expectRepo: "node-js-getting-started" },
+        { input: "https://github.com/heroku/node-js-getting-started/",       expectOwner: "heroku",   expectRepo: "node-js-getting-started" },
+      ];
+
+      for (const { input, expectOwner, expectRepo } of accepted) {
+        try {
+          const r = parseGithubUrl(input);
+          r.owner === expectOwner && r.repo === expectRepo
+            ? ok(`V1: accepted "${input.slice(0, 60)}" → cloneUrl=${r.cloneUrl}`)
+            : fail(`V1: wrong owner/repo for "${input}"`, `got ${r.owner}/${r.repo}`);
+          r.cloneUrl === `https://github.com/${expectOwner}/${expectRepo}.git`
+            ? ok(`V1: cloneUrl rebuilt correctly for "${input.slice(0, 60)}"`)
+            : fail(`V1: cloneUrl not rebuilt`, r.cloneUrl);
+        } catch (e) {
+          fail(`V1: should accept "${input}"`, String(e));
+        }
+      }
+
+      // Rejected
+      const rejected: { input: string; label: string }[] = [
+        { input: "http://github.com/a/b",                              label: "http scheme" },
+        { input: "https://gitlab.com/a/b",                             label: "wrong host" },
+        { input: "https://github.com.evil.com/a/b",                    label: "subdomain lookalike" },
+        { input: "https://evil.com/github.com/a/b",                    label: "github.com in path" },
+        { input: "https://user:pass@github.com/a/b",                   label: "credentials" },
+        { input: "https://github.com:443/a/b",                         label: "explicit port :443" },
+        { input: "https://github.com:8080/a/b",                        label: "explicit port :8080" },
+        { input: "https://github.com/a",                               label: "only owner, no repo" },
+        { input: "https://github.com/a/b/c",                           label: "extra path segment" },
+        { input: "https://github.com/a/b?x=1",                         label: "query string" },
+        { input: "https://github.com/a/b#x",                           label: "fragment" },
+        { input: "https://github.com/a/%2e%2e",                        label: "percent-encoded path" },
+        { input: "https://github.com/../b",                            label: "path traversal (..)" },
+        { input: "file:///etc/passwd",                                  label: "file:// scheme" },
+        { input: "ext::sh -c id",                                       label: "ext:: injection" },
+        { input: "git@github.com:a/b.git",                             label: "git@ (SCP format)" },
+        { input: "ssh://git@github.com/a/b",                           label: "ssh:// scheme" },
+        { input: "--upload-pack=touch /tmp/x",                         label: "leading dash (flag injection)" },
+        { input: "https://github.com/a/b\nhttps://evil.com",           label: "URL with newline" },
+        { input: "https://github.com/" + "a".repeat(300),              label: "301-char URL" },
+      ];
+
+      for (const { input, label } of rejected) {
+        let threw = false;
+        try {
+          parseGithubUrl(input);
+        } catch {
+          threw = true;
+        }
+        threw
+          ? ok(`V1: rejected "${label}"`)
+          : fail(`V1: should have rejected "${label}"`, `input=${input.slice(0, 80)}`);
+      }
+    }
+
+    // ── V2: buildCloneArgs ─────────────────────────────────────────────────────
+    {
+      const cloneUrl = "https://github.com/heroku/node-js-getting-started.git";
+      const dir = "/tmp/ssc-test-clone-dir";
+      const args = buildCloneArgs(cloneUrl, dir);
+
+      const joined = args.join(" ");
+      console.log(`  buildCloneArgs: [${args.join(", ")}]`);
+
+      args.some((a, i) => a === "-c" && args[i + 1] === "protocol.allow=never")
+        ? ok("V2: args contain -c protocol.allow=never")
+        : fail("V2: missing -c protocol.allow=never", joined);
+
+      args.some((a, i) => a === "-c" && args[i + 1] === "protocol.https.allow=always")
+        ? ok("V2: args contain -c protocol.https.allow=always")
+        : fail("V2: missing -c protocol.https.allow=always", joined);
+
+      args.some((a, i) => a === "-c" && args[i + 1] === "core.symlinks=false")
+        ? ok("V2: args contain -c core.symlinks=false")
+        : fail("V2: missing -c core.symlinks=false", joined);
+
+      // "--" must immediately precede the URL
+      const dashDashIdx = args.lastIndexOf("--");
+      (dashDashIdx >= 0 && args[dashDashIdx + 1] === cloneUrl)
+        ? ok("V2: \"--\" appears immediately before the clone URL")
+        : fail("V2: \"--\" not immediately before clone URL", joined);
+
+      // URL in args must equal the rebuilt cloneUrl (not raw input)
+      args.includes(cloneUrl)
+        ? ok("V2: args contain the canonical cloneUrl")
+        : fail("V2: canonical cloneUrl missing from args", joined);
+
+      args[args.length - 1] === dir
+        ? ok("V2: destination dir is the last arg")
+        : fail("V2: dir not last arg", args[args.length - 1]);
+    }
+
+    // ── V3: checkDirSize ──────────────────────────────────────────────────────
+    {
+      const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-v3-size-"));
+
+      // Over limit: write 200 bytes, cap at 100 bytes → should throw
+      const bigDir = path.join(tmpBase, "big");
+      fs.mkdirSync(bigDir);
+      fs.writeFileSync(path.join(bigDir, "data.txt"), "x".repeat(200));
+
+      let threwOverLimit = false;
+      try {
+        await checkDirSize(bigDir, 100);
+      } catch {
+        threwOverLimit = true;
+      }
+      threwOverLimit
+        ? ok("V3: checkDirSize throws when directory exceeds limit")
+        : fail("V3: checkDirSize should throw when over limit");
+
+      // Under limit: same dir but cap at 1000 bytes → should not throw
+      let threwUnderLimit = false;
+      try {
+        await checkDirSize(bigDir, 1000);
+      } catch {
+        threwUnderLimit = true;
+      }
+      !threwUnderLimit
+        ? ok("V3: checkDirSize passes when directory is under limit")
+        : fail("V3: checkDirSize should not throw when under limit");
+
+      // .git dir is excluded: put a huge file inside .git, should still pass
+      const gitIgnoreDir = path.join(tmpBase, "gitignore");
+      fs.mkdirSync(gitIgnoreDir);
+      fs.mkdirSync(path.join(gitIgnoreDir, ".git"));
+      fs.writeFileSync(path.join(gitIgnoreDir, ".git", "HUGE"), "x".repeat(10000));
+      fs.writeFileSync(path.join(gitIgnoreDir, "small.txt"), "hi");
+
+      let threwWithGit = false;
+      try {
+        await checkDirSize(gitIgnoreDir, 100); // 2 bytes ("hi") < 100 → should pass
+      } catch {
+        threwWithGit = true;
+      }
+      !threwWithGit
+        ? ok("V3: checkDirSize excludes .git directory from size count")
+        : fail("V3: checkDirSize should exclude .git from size count");
+
+      fs.rmSync(tmpBase, { recursive: true });
+    }
+
+    // ── V4: intake 400 for invalid GitHub URLs ─────────────────────────────────
+    {
+      // Record row counts before the test
+      const { rows: beforeRows } = await pool.query<{ apps: string; deps: string }>(
+        "SELECT (SELECT COUNT(*) FROM apps)::text AS apps, (SELECT COUNT(*) FROM deployments)::text AS deps",
+      );
+      const beforeApps = parseInt(beforeRows[0].apps, 10);
+      const beforeDeps = parseInt(beforeRows[0].deps, 10);
+
+      const v4BadUrls: { url: string; label: string }[] = [
+        { url: "http://github.com/a/b",             label: "http scheme" },
+        { url: "https://gitlab.com/a/b",            label: "wrong host" },
+        { url: "https://github.com.evil.com/a/b",   label: "subdomain lookalike" },
+        { url: "https://user:pass@github.com/a/b",  label: "credentials" },
+        { url: "https://github.com/a",              label: "no repo path" },
+        { url: "https://github.com/a/b/c",          label: "extra path segment" },
+        { url: "--upload-pack=touch /tmp/x",         label: "flag injection" },
+        { url: "https://github.com/a/b?x=1",        label: "query string" },
+      ];
+
+      for (const { url, label } of v4BadUrls) {
+        const r = await request("POST", "/v1/deployments/intake/github", {
+          headers: authHeaders(keyA),
+          body: { github_url: url },
+        });
+        r.status === 400
+          ? ok(`V4: "${label}" → 400`)
+          : fail(`V4: "${label}" should 400`, `got ${r.status} ${JSON.stringify(r.body)}`);
+        (r.body as Record<string, unknown>).error === "invalid_github_url"
+          ? ok(`V4: "${label}" → error=invalid_github_url`)
+          : fail(`V4: "${label}" error field`, `got ${JSON.stringify((r.body as Record<string, unknown>).error)}`);
+      }
+
+      // Verify no rows were written to apps or deployments
+      const { rows: afterRows } = await pool.query<{ apps: string; deps: string }>(
+        "SELECT (SELECT COUNT(*) FROM apps)::text AS apps, (SELECT COUNT(*) FROM deployments)::text AS deps",
+      );
+      const afterApps = parseInt(afterRows[0].apps, 10);
+      const afterDeps = parseInt(afterRows[0].deps, 10);
+
+      afterApps === beforeApps
+        ? ok(`V4: apps row count unchanged (${beforeApps}) — no rows written on 400`)
+        : fail("V4: apps row count changed", `before=${beforeApps} after=${afterApps}`);
+      afterDeps === beforeDeps
+        ? ok(`V4: deployments row count unchanged (${beforeDeps}) — no rows written on 400`)
+        : fail("V4: deployments row count changed", `before=${beforeDeps} after=${afterDeps}`);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
