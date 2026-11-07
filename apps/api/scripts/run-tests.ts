@@ -2982,6 +2982,37 @@ async function main(): Promise<void> {
       errMsg.includes("10.0.0.1")
         ? ok("Y3: error message names the offending host")
         : fail("Y3: error message should name the host", errMsg.slice(0, 200));
+
+      // ?host=evil.example.com → throws
+      let threw3g = false;
+      try { assertSafeDatabaseUrl("postgres://u:secretpw@localhost/db?host=evil.example.com", {}); } catch { threw3g = true; }
+      threw3g ? ok("Y3: ?host=evil.example.com → throws") : fail("Y3: ?host=evil.example.com should throw");
+
+      // ?HOST=evil.example.com → throws (case-insensitive)
+      let threw3h = false;
+      try { assertSafeDatabaseUrl("postgres://u:secretpw@localhost/db?HOST=evil.example.com", {}); } catch { threw3h = true; }
+      threw3h ? ok("Y3: ?HOST=evil.example.com → throws (case-insensitive)") : fail("Y3: ?HOST=evil.example.com should throw case-insensitively");
+
+      // ?hostaddr=10.0.0.5 → throws
+      let threw3i = false; let errMsg3i = "";
+      try { assertSafeDatabaseUrl("postgres://u:secretpw@localhost/db?hostaddr=10.0.0.5", {}); } catch (e) {
+        threw3i = true;
+        errMsg3i = e instanceof Error ? e.message : String(e);
+      }
+      threw3i ? ok("Y3: ?hostaddr=10.0.0.5 → throws") : fail("Y3: ?hostaddr=10.0.0.5 should throw");
+      !errMsg3i.includes("secretpw")
+        ? ok("Y3: ?hostaddr error message does not contain the password")
+        : fail("Y3: ?hostaddr error message leaks password", errMsg3i.slice(0, 200));
+
+      // ?host=/var/run/postgresql → passes (Unix socket via query param, localhost in URL hostname)
+      let passed3j = true;
+      try { assertSafeDatabaseUrl("postgres://u:secretpw@localhost/db?host=/var/run/postgresql", {}); } catch { passed3j = false; }
+      passed3j ? ok("Y3: ?host=/var/run/postgresql → passes (Unix socket)") : fail("Y3: Unix socket ?host should pass");
+
+      // postgres://u@[::1]:5432/db → passes (IPv6 localhost)
+      let passed3k = true;
+      try { assertSafeDatabaseUrl("postgres://u:secretpw@[::1]:5432/db", {}); } catch { passed3k = false; }
+      passed3k ? ok("Y3: postgres://u@[::1]:5432/db → passes (IPv6 localhost)") : fail("Y3: [::1] should pass as IPv6 localhost");
     }
 
     // ── Y4: migrate exits non-zero quickly without connecting to remote DB ────
@@ -3027,6 +3058,68 @@ async function main(): Promise<void> {
       !y4Result.output.includes("[timed out]")
         ? ok("Y4: migrate exited within 3 seconds")
         : fail("Y4: migrate timed out (should fast-fail before connecting)");
+      y4Result.output.includes("10.255.255.1")
+        ? ok("Y4: migrate output contains guard message (guard ran, not just connection failure)")
+        : fail("Y4: migrate output missing guard message text", y4Result.output.slice(0, 300));
+    }
+
+    // ── Y5: src/db.ts refuses remote DATABASE_URL at module load time ─────────
+    {
+      const y5Script = path.join(__dirname, "_y5_db_tmp.ts");
+      try {
+        fs.writeFileSync(
+          y5Script,
+          `import "../src/db";\nprocess.exit(0);\n`,
+          "utf8",
+        );
+
+        const y5Result = await new Promise<{ code: number; output: string }>((resolve) => {
+          const childEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            DATABASE_URL: "postgres://u:secretpw@10.255.255.1:5432/x",
+          };
+          delete childEnv.RAILWAY_ENVIRONMENT;
+          delete childEnv.SSC_ALLOW_REMOTE_DB;
+
+          const child = require("child_process").spawn(
+            tsx,
+            [y5Script],
+            {
+              cwd: path.join(__dirname, ".."),
+              env: childEnv,
+              stdio: ["ignore", "pipe", "pipe"],
+            },
+          );
+          let output = "";
+          child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
+          child.stderr.on("data", (d: Buffer) => { output += d.toString(); });
+
+          const timer = setTimeout(() => {
+            child.kill();
+            resolve({ code: 1, output: output + "\n[timed out]" });
+          }, 5000);
+
+          child.on("close", (code: number) => {
+            clearTimeout(timer);
+            resolve({ code: code ?? 1, output });
+          });
+        });
+
+        y5Result.code !== 0
+          ? ok("Y5: db.ts exits non-zero when remote DATABASE_URL and no RAILWAY_ENVIRONMENT")
+          : fail("Y5: db.ts should exit non-zero with remote DB", `output: ${y5Result.output.slice(0, 300)}`);
+        y5Result.output.includes("10.255.255.1")
+          ? ok("Y5: db.ts output contains guard message text")
+          : fail("Y5: db.ts output missing guard message text", y5Result.output.slice(0, 300));
+        !y5Result.output.includes("secretpw")
+          ? ok("Y5: db.ts output does not contain database password")
+          : fail("Y5: db.ts output leaks password", y5Result.output.slice(0, 300));
+        !y5Result.output.includes("[timed out]")
+          ? ok("Y5: db.ts exited within 5 seconds")
+          : fail("Y5: db.ts timed out (should fast-fail before connecting)");
+      } finally {
+        try { fs.unlinkSync(y5Script); } catch { /* already gone */ }
+      }
     }
   }
 
