@@ -3,7 +3,7 @@
  * Starts the test server, seeds the DB, runs every scenario, then cleans up.
  *
  * Run with:
- *   DATABASE_URL="postgres://fenilpatel@localhost:5432/ssc_test" \
+ *   DATABASE_URL="postgres://postgres@localhost:5433/ssc_test" \
  *   TEST_PORT=4099 \
  *   npx ts-node --project tsconfig.json scripts/run-tests.ts
  *
@@ -17,7 +17,7 @@ if (_rawDbUrl.includes("rlwy.net") || _rawDbUrl.includes("railway.app")) {
   console.error(
     "FATAL: DATABASE_URL points at Railway production — aborting.\n" +
       "  Use a local Postgres DB, e.g.:\n" +
-      '  DATABASE_URL="postgres://fenilpatel@localhost:5432/ssc_test" ...',
+      '  DATABASE_URL="postgres://postgres@localhost:5433/ssc_test" ...',
   );
   process.exit(1);
 }
