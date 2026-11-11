@@ -3423,6 +3423,101 @@ async function main(): Promise<void> {
         : fail("Z5: createFlyApp call(s) missing network argument",
             "\n    " + networkViolations.join("\n    "));
     }
+
+    // ── Z6: real flyClient.ts sends `network` in the POST /apps HTTP body ──────
+    // Strategy: both FLY_API_BASE and FLY_API_TOKEN are read inside makeClient()
+    // at every call, not at module load — so setting process.env before the call
+    // is sufficient; no fresh require is needed.
+    {
+      const { networkForOrg: z6NetworkForOrg } = require("../src/lib/flyNetwork") as {
+        networkForOrg: (orgId: string) => string;
+      };
+      const { createFlyApp: z6CreateFlyApp } = require("../src/services/flyClient") as {
+        createFlyApp: (appName: string, orgSlug: string, network: string) => Promise<void>;
+      };
+
+      const Z6_UUID = "c0ffee00-dead-4bee-cafe-123456789abc";
+      const z6Network = z6NetworkForOrg(Z6_UUID);
+
+      // Record captured requests from the loopback server
+      interface Z6Req { method: string; path: string; headers: Record<string, string>; body: unknown }
+      const z6Captured: Z6Req[] = [];
+
+      const z6Server = await new Promise<import("http").Server>((resolve) => {
+        const srv = require("http").createServer(
+          (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
+            const chunks: Buffer[] = [];
+            req.on("data", (c: Buffer) => chunks.push(c));
+            req.on("end", () => {
+              let body: unknown = null;
+              try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { /* non-JSON */ }
+              z6Captured.push({
+                method: req.method ?? "",
+                path: req.url ?? "",
+                headers: req.headers as Record<string, string>,
+                body,
+              });
+              res.writeHead(201, { "Content-Type": "application/json" });
+              res.end("{}");
+            });
+          },
+        );
+        srv.listen(0, "127.0.0.1", () => resolve(srv));
+      });
+
+      const z6Port = (z6Server.address() as import("net").AddressInfo).port;
+
+      // Stash and override env — makeClient() reads these at call time
+      const prevFlyApiBase  = process.env.FLY_API_BASE;
+      const prevFlyApiToken = process.env.FLY_API_TOKEN;
+      process.env.FLY_API_BASE  = `http://127.0.0.1:${z6Port}`;
+      process.env.FLY_API_TOKEN = "z6-dummy-token";
+
+      try {
+        await z6CreateFlyApp("ssc-z6-test", "test-org", z6Network);
+      } finally {
+        // Restore env unconditionally
+        if (prevFlyApiBase === undefined) delete process.env.FLY_API_BASE;
+        else process.env.FLY_API_BASE = prevFlyApiBase;
+        if (prevFlyApiToken === undefined) delete process.env.FLY_API_TOKEN;
+        else process.env.FLY_API_TOKEN = prevFlyApiToken;
+        await new Promise<void>((r) => z6Server.close(() => r()));
+      }
+
+      // Assertions
+      z6Captured.length === 1
+        ? ok("Z6: exactly one HTTP request reached the loopback server")
+        : fail("Z6: expected exactly 1 request", `got ${z6Captured.length}`);
+
+      const z6Req = z6Captured[0];
+
+      z6Req?.method === "POST"
+        ? ok("Z6: request method is POST")
+        : fail("Z6: expected POST", z6Req?.method);
+
+      (z6Req?.path === "/apps" || z6Req?.path === "/v1/apps")
+        ? ok(`Z6: request path is ${z6Req.path}`)
+        : fail("Z6: expected /apps or /v1/apps path", z6Req?.path);
+
+      const z6Body = z6Req?.body as Record<string, unknown> | null;
+
+      z6Body?.app_name === "ssc-z6-test"
+        ? ok("Z6: body.app_name === 'ssc-z6-test'")
+        : fail("Z6: body.app_name mismatch", JSON.stringify(z6Body?.app_name));
+
+      z6Body?.org_slug === "test-org"
+        ? ok("Z6: body.org_slug === 'test-org'")
+        : fail("Z6: body.org_slug mismatch", JSON.stringify(z6Body?.org_slug));
+
+      z6Body?.network === z6Network
+        ? ok(`Z6: body.network === networkForOrg(uuid) (${z6Network})`)
+        : fail("Z6: body.network mismatch",
+            `got ${JSON.stringify(z6Body?.network)} want ${z6Network}`);
+
+      z6Req?.headers?.authorization === "Bearer z6-dummy-token"
+        ? ok("Z6: Authorization header carries the dummy token")
+        : fail("Z6: Authorization header mismatch", z6Req?.headers?.authorization);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
