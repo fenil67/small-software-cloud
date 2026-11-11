@@ -161,15 +161,15 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
 
 const flyModule = require("../src/services/flyClient");
 
-interface FlyCall { fn: string; arg: string }
+interface FlyCall { fn: string; arg: string; body?: Record<string, unknown> }
 const _flyCallLog: FlyCall[] = [];
 
 let _checkExistsResult = true;
 let _destroyFailuresRemaining = 0;
 let _flyErrorMode = false;
 
-flyModule.createFlyApp = async (name: string) => {
-  _flyCallLog.push({ fn: "createFlyApp", arg: name });
+flyModule.createFlyApp = async (name: string, orgSlug: string, network: string) => {
+  _flyCallLog.push({ fn: "createFlyApp", arg: name, body: { app_name: name, org_slug: orgSlug, network } });
 };
 flyModule.allocateFlyIp = async () => "1.2.3.4";
 flyModule.checkFlyAppExists = async (name: string): Promise<boolean> => {

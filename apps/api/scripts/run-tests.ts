@@ -1697,7 +1697,7 @@ async function main(): Promise<void> {
 
   // Helpers shared by Sections S and T — placed at outer scope so both sections
   // can use them without re-declaration.
-  type FlyCall = { fn: string; arg: string };
+  type FlyCall = { fn: string; arg: string; body?: Record<string, unknown> };
   const getFlyLog = async (): Promise<FlyCall[]> =>
     ((await request("GET", "/test/fly-call-log")).body as { calls?: FlyCall[] }).calls ?? [];
   const resetFlyLog = () => request("POST", "/test/reset-fly-call-log");
@@ -3162,6 +3162,267 @@ async function main(): Promise<void> {
     df.includes("sha256sum")
       ? ok("X4: Dockerfile verifies flyctl download with sha256sum")
       : fail("X4: no sha256sum check of flyctl download in Dockerfile");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section Z — per-org private Fly networks
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("Z: per-org Fly private networks");
+
+    // ── Z1: networkForOrg unit tests ──────────────────────────────────────────
+    {
+      const { networkForOrg } = require("../src/lib/flyNetwork") as {
+        networkForOrg: (orgId: string) => string;
+      };
+
+      // Format: starts with a letter, only [a-z0-9-]
+      const sampleUuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d";
+      const net = networkForOrg(sampleUuid);
+      /^[a-z]/.test(net)
+        ? ok("Z1: networkForOrg result starts with a letter")
+        : fail("Z1: networkForOrg result does not start with a letter", net);
+      /^[a-z0-9-]+$/.test(net)
+        ? ok("Z1: networkForOrg result contains only [a-z0-9-]")
+        : fail("Z1: networkForOrg result has invalid characters", net);
+
+      // Deterministic: same input → same output
+      networkForOrg(sampleUuid) === net
+        ? ok("Z1: networkForOrg is deterministic")
+        : fail("Z1: networkForOrg is not deterministic");
+
+      // Different orgs → different networks
+      const otherUuid = "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e";
+      networkForOrg(otherUuid) !== net
+        ? ok("Z1: different orgIds produce different networks")
+        : fail("Z1: different orgIds should produce different networks");
+
+      // Throws on missing input
+      let threw1 = false;
+      try { networkForOrg(""); } catch { threw1 = true; }
+      threw1 ? ok("Z1: empty orgId → throws") : fail("Z1: empty orgId should throw");
+
+      // Throws on non-UUID input
+      let threw2 = false;
+      try { networkForOrg("not-a-uuid"); } catch { threw2 = true; }
+      threw2 ? ok("Z1: non-UUID orgId → throws") : fail("Z1: non-UUID orgId should throw");
+
+      // Throws on plain string without UUID structure
+      let threw3 = false;
+      try { networkForOrg("org_12345"); } catch { threw3 = true; }
+      threw3 ? ok("Z1: non-UUID string → throws") : fail("Z1: non-UUID string should throw");
+    }
+
+    // ── Z2/Z3/Z4: deploy network propagation (uses real deployRunner) ─────────
+    {
+      // Fresh orgs for Z tests
+      const { rows: zA1Rows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id,name,slug) VALUES ('clerk_org_z1','Z Org A','z-org-a') RETURNING id",
+      );
+      const zOrgAId = zA1Rows[0].id;
+      const { rows: zA2Rows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id,name,slug) VALUES ('clerk_org_z2','Z Org B','z-org-b') RETURNING id",
+      );
+      const zOrgBId = zA2Rows[0].id;
+
+      const { fullKey: zKeyA, keyPrefix: zKPA, keyHash: zKHA } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id,created_by,name,key_prefix,key_hash) VALUES ($1,$2,'z-key-a',$3,$4)",
+        [zOrgAId, userId, zKPA, zKHA],
+      );
+      const { fullKey: zKeyB, keyPrefix: zKPB, keyHash: zKHB } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id,created_by,name,key_prefix,key_hash) VALUES ($1,$2,'z-key-b',$3,$4)",
+        [zOrgBId, userId, zKPB, zKHB],
+      );
+
+      const { networkForOrg } = require("../src/lib/flyNetwork") as {
+        networkForOrg: (orgId: string) => string;
+      };
+      const expectedNetA = networkForOrg(zOrgAId);
+      const expectedNetB = networkForOrg(zOrgBId);
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+
+      const zZip = await buildZip({
+        "package.json": JSON.stringify({
+          name: "z-test-app",
+          version: "1.0.0",
+          scripts: { start: "node index.js" },
+        }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+
+      const afterDeploy = () => new Promise<void>((r) => setTimeout(r, 400));
+
+      // ── Z2: deploy for org A sends networkForOrg(A) in createFlyApp body ─────
+      {
+        await resetFlyLog();
+
+        const z2Form = new FormData();
+        z2Form.append("code", zZip, { filename: "app.zip", contentType: "application/zip" });
+        z2Form.append("app_name", "z2-app");
+        const z2Intake = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(zKeyA), formData: z2Form,
+        });
+        const { deployment_id: z2DepId } = z2Intake.body as Record<string, string>;
+        await pollDeployment(z2DepId, zKeyA);
+        await afterDeploy();
+
+        const z2Log = await getFlyLog();
+        const z2Create = z2Log.find((c) => c.fn === "createFlyApp");
+        z2Create
+          ? ok("Z2: createFlyApp was called for org-A deploy")
+          : fail("Z2: createFlyApp should have been called");
+        z2Create?.body?.network === expectedNetA
+          ? ok(`Z2: createFlyApp body.network === networkForOrg(orgA) (${expectedNetA})`)
+          : fail("Z2: createFlyApp body.network mismatch",
+              `got ${JSON.stringify(z2Create?.body?.network)} want ${expectedNetA}`);
+      }
+
+      // ── Z3: two orgs → different networks; same org → same network ───────────
+      {
+        // Deploy for org B
+        await resetFlyLog();
+
+        const z3FormB = new FormData();
+        z3FormB.append("code", zZip, { filename: "app.zip", contentType: "application/zip" });
+        z3FormB.append("app_name", "z3-app-b");
+        const z3IntakeB = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(zKeyB), formData: z3FormB,
+        });
+        const { deployment_id: z3DepIdB } = z3IntakeB.body as Record<string, string>;
+        await pollDeployment(z3DepIdB, zKeyB);
+        await afterDeploy();
+
+        const z3LogB = await getFlyLog();
+        const z3CreateB = z3LogB.find((c) => c.fn === "createFlyApp");
+        z3CreateB?.body?.network === expectedNetB
+          ? ok("Z3: org-B deploy uses org-B network")
+          : fail("Z3: org-B deploy network mismatch",
+              `got ${JSON.stringify(z3CreateB?.body?.network)} want ${expectedNetB}`);
+
+        expectedNetA !== expectedNetB
+          ? ok("Z3: org-A and org-B networks are different")
+          : fail("Z3: org-A and org-B should have different networks");
+
+        // Second deploy in org A → same network
+        await resetFlyLog();
+
+        const z3FormA2 = new FormData();
+        z3FormA2.append("code", zZip, { filename: "app.zip", contentType: "application/zip" });
+        z3FormA2.append("app_name", "z3-app-a2");
+        const z3IntakeA2 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(zKeyA), formData: z3FormA2,
+        });
+        const { deployment_id: z3DepIdA2 } = z3IntakeA2.body as Record<string, string>;
+        await pollDeployment(z3DepIdA2, zKeyA);
+        await afterDeploy();
+
+        const z3LogA2 = await getFlyLog();
+        const z3CreateA2 = z3LogA2.find((c) => c.fn === "createFlyApp");
+        z3CreateA2?.body?.network === expectedNetA
+          ? ok("Z3: second deploy in org-A uses same network as first")
+          : fail("Z3: second org-A deploy network mismatch",
+              `got ${JSON.stringify(z3CreateA2?.body?.network)} want ${expectedNetA}`);
+      }
+
+      // ── Z4: failed-first-deploy recreate path sends same network ─────────────
+      {
+        // First deploy fails → fly_app_id cleared
+        await request("POST", "/test/set-flyctl-mode", { body: { mode: "failure" } });
+        await resetFlyLog();
+
+        const z4Form1 = new FormData();
+        z4Form1.append("code", zZip, { filename: "app.zip", contentType: "application/zip" });
+        z4Form1.append("app_name", "z4-app");
+        const z4Intake1 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(zKeyA), formData: z4Form1,
+        });
+        const { deployment_id: z4DepId1, app_id: z4AppId } = z4Intake1.body as Record<string, string>;
+        await pollDeployment(z4DepId1, zKeyA);
+        await afterDeploy();
+
+        const z4Log1 = await getFlyLog();
+        const z4Create1 = z4Log1.find((c) => c.fn === "createFlyApp");
+        z4Create1?.body?.network === expectedNetA
+          ? ok("Z4: failed-first-deploy createFlyApp uses org network")
+          : fail("Z4: failed-first-deploy network mismatch",
+              `got ${JSON.stringify(z4Create1?.body?.network)} want ${expectedNetA}`);
+
+        // Redeploy the same app (fly_app_id is NULL → new Fly app via recreate path)
+        await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+        await resetFlyLog();
+
+        const z4Form2 = new FormData();
+        z4Form2.append("code", zZip, { filename: "app.zip", contentType: "application/zip" });
+        z4Form2.append("app_id", z4AppId);
+        const z4Intake2 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(zKeyA), formData: z4Form2,
+        });
+        const { deployment_id: z4DepId2 } = z4Intake2.body as Record<string, string>;
+        await pollDeployment(z4DepId2, zKeyA);
+        await afterDeploy();
+
+        const z4Log2 = await getFlyLog();
+        const z4Create2 = z4Log2.find((c) => c.fn === "createFlyApp");
+        z4Create2?.body?.network === expectedNetA
+          ? ok("Z4: redeploy after failed-first-deploy (recreate path) uses same org network")
+          : fail("Z4: recreate-path network mismatch",
+              `got ${JSON.stringify(z4Create2?.body?.network)} want ${expectedNetA}`);
+      }
+
+      // Cleanup Z sections
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await pool.query("DELETE FROM orgs WHERE id IN ($1,$2)", [zOrgAId, zOrgBId]);
+    }
+
+    // ── Z5: static guard — every createFlyApp call site passes a network ───────
+    {
+      const srcDir = path.join(__dirname, "..", "src");
+      const networkViolations: string[] = [];
+
+      function walkSync(dir: string): string[] {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const files: string[] = [];
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) files.push(...walkSync(full));
+          else if (e.isFile() && (e.name.endsWith(".ts") || e.name.endsWith(".js"))) files.push(full);
+        }
+        return files;
+      }
+
+      for (const filePath of walkSync(srcDir)) {
+        const src = fs.readFileSync(filePath, "utf8");
+        const relPath = path.relative(path.join(__dirname, ".."), filePath);
+        // Find every createFlyApp(...) call. We capture the argument list to
+        // check that at least 3 arguments are present (name, orgSlug, network).
+        // We scan line-by-line so we can report the line number.
+        const lines = src.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (!line.includes("createFlyApp(")) continue;
+          // Count arguments: a call with ≥3 args has at least 2 commas inside the parens.
+          // Heuristic: extract everything from the opening paren to the matching close.
+          const parenStart = line.indexOf("createFlyApp(") + "createFlyApp(".length;
+          // Simple scan for argument count — works for single-line calls.
+          // For multi-line calls, check whether the line contains at least one comma.
+          const afterParen = line.slice(parenStart);
+          const commaCount = (afterParen.match(/,/g) ?? []).length;
+          if (commaCount < 2) {
+            networkViolations.push(`${relPath}:${i + 1}`);
+          }
+        }
+      }
+
+      networkViolations.length === 0
+        ? ok("Z5: every createFlyApp call in apps/api/src passes a network argument (static guard)")
+        : fail("Z5: createFlyApp call(s) missing network argument",
+            "\n    " + networkViolations.join("\n    "));
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════

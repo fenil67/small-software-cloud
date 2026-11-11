@@ -76,9 +76,9 @@ function makeClient() {
   return client;
 }
 
-export async function createFlyApp(appName: string, orgSlug: string): Promise<void> {
+export async function createFlyApp(appName: string, orgSlug: string, network: string): Promise<void> {
   const client = makeClient();
-  await client.post("/apps", { app_name: appName, org_slug: orgSlug });
+  await client.post("/apps", { app_name: appName, org_slug: orgSlug, network });
 }
 
 export async function destroyFlyApp(appName: string): Promise<void> {

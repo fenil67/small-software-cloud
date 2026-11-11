@@ -7,6 +7,7 @@ import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
 import { createFlyApp, destroyFlyApp, checkFlyAppExists } from "./flyClient";
+import { networkForOrg } from "../lib/flyNetwork";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { gitEnv, flyctlEnv } from "../lib/childEnv";
 import { parseGithubUrl, buildCloneArgs, checkDirSize, GithubUrlError } from "../lib/githubUrl";
@@ -341,8 +342,14 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
         const newName = generateFlyAppName();
         log(deploymentId, `Fly app ${appName} not found — recreating as ${newName}`);
         appName = newName;
+        let recreateNetwork: string;
         try {
-          await createFlyApp(appName, process.env.FLY_ORG_SLUG!);
+          recreateNetwork = networkForOrg(app.org_id);
+        } catch {
+          throw new DeployError("provision", "Cannot determine network for this organization. Please contact support.");
+        }
+        try {
+          await createFlyApp(appName, process.env.FLY_ORG_SLUG!, recreateNetwork);
         } catch (err) {
           throw new DeployError("provision", "Failed to create app on Fly.io. Please try again.");
         }
@@ -353,8 +360,14 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     } else {
       appName = generateFlyAppName();
       log(deploymentId, `Creating Fly app: ${appName}`);
+      let createNetwork: string;
       try {
-        await createFlyApp(appName, process.env.FLY_ORG_SLUG!);
+        createNetwork = networkForOrg(app.org_id);
+      } catch {
+        throw new DeployError("provision", "Cannot determine network for this organization. Please contact support.");
+      }
+      try {
+        await createFlyApp(appName, process.env.FLY_ORG_SLUG!, createNetwork);
       } catch (err) {
         throw new DeployError("provision", "Failed to create app on Fly.io. Please try again.");
       }
