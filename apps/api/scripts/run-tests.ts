@@ -3696,6 +3696,648 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AC: App Sharing + Pending Grants");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    // ── AC setup ──────────────────────────────────────────────────────────────
+    // Clerk org IDs from seed(): orgA → "clerk_org_aaa", orgB → "clerk_org_bbb"
+
+    // Admin user for orgA (has a known Clerk user ID and email stored in users)
+    const acAdminClerkId = "clerk_ac_admin";
+    const acAdminRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      [acAdminClerkId, "acadmin@test.local", "AC Admin"],
+    );
+    const acAdminUserId = acAdminRow.rows[0].id;
+
+    // Member user for orgA (non-admin)
+    const acMemberClerkId = "clerk_ac_member";
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)",
+      [acMemberClerkId, "acmember@test.local", "AC Member"],
+    );
+
+    // User for pending-grant conversion (email matches pending row)
+    const acPendingClerkId = "clerk_ac_pending_user";
+    const acPendingRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      [acPendingClerkId, "acpending@test.local", "AC Pending User"],
+    );
+    const acPendingUserId = acPendingRow.rows[0].id;
+
+    // User with empty stored email (simulates unverified primary)
+    const acUnverifiedClerkId = "clerk_ac_unverified";
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)",
+      [acUnverifiedClerkId, "", "AC Unverified"],
+    );
+
+    // App under orgA (with https subdomain for proxy tests)
+    const acAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ac-share-app', 'ac-share-app', 'zip') RETURNING id`,
+      [orgAId, acAdminUserId],
+    );
+    const acAppId = acAppRow.rows[0].id;
+    await pool.query(
+      "UPDATE apps SET subdomain = $1, fly_app_id = $2 WHERE id = $3",
+      ["https://ac-share-app.fly.dev", "ac-share-fly", acAppId],
+    );
+
+    // Issue a proxy token for the app (for /codes tests in AC4/AC5)
+    const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
+    const acProxyToken = await issueProxyToken(acAppId);
+
+    // Admin Clerk headers helper
+    const adminHeaders = (extra: Record<string, string> = {}) => ({
+      "x-test-clerk-user-id": acAdminClerkId,
+      "x-test-clerk-org-id": "clerk_org_aaa",
+      "x-test-clerk-org-role": "org:admin",
+      ...extra,
+    });
+
+    // ── AC1: org admin and API key can GET, POST, DELETE ──────────────────────
+    {
+      // GET — admin Clerk session
+      const r = await request("GET", `/v1/apps/${acAppId}/access`, { headers: adminHeaders() });
+      r.status === 200 && Array.isArray((r.body as any).users) && Array.isArray((r.body as any).pending)
+        ? ok("AC1: admin GET /access → 200 with users+pending arrays")
+        : fail("AC1: admin GET should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      // POST — admin Clerk session, unknown email → pending
+      const r2 = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: adminHeaders(),
+        body: { email: "newuser@example.com" },
+      });
+      r2.status === 201 && (r2.body as any).status === "pending"
+        ? ok("AC1: admin POST with unknown email → 201 pending")
+        : fail("AC1: admin POST pending should 201", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+
+      // DELETE — admin Clerk session
+      const r3 = await request("DELETE", `/v1/apps/${acAppId}/access/${encodeURIComponent("newuser@example.com")}`, {
+        headers: adminHeaders(),
+      });
+      r3.status === 200 && (r3.body as any).removed === true
+        ? ok("AC1: admin DELETE → 200 removed:true")
+        : fail("AC1: admin DELETE should 200", `got ${r3.status} ${JSON.stringify(r3.body)}`);
+
+      // GET — API key (same org)
+      const r4 = await request("GET", `/v1/apps/${acAppId}/access`, { headers: authHeaders(keyA) });
+      r4.status === 200
+        ? ok("AC1: API key GET /access → 200")
+        : fail("AC1: API key GET should 200", `got ${r4.status} ${JSON.stringify(r4.body)}`);
+
+      // POST — API key
+      const r5 = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: authHeaders(keyA),
+        body: { email: "apikey-grant@example.com" },
+      });
+      r5.status === 201
+        ? ok("AC1: API key POST /access → 201")
+        : fail("AC1: API key POST should 201", `got ${r5.status} ${JSON.stringify(r5.body)}`);
+
+      // DELETE — API key
+      const r6 = await request("DELETE", `/v1/apps/${acAppId}/access/${encodeURIComponent("apikey-grant@example.com")}`, {
+        headers: authHeaders(keyA),
+      });
+      r6.status === 200
+        ? ok("AC1: API key DELETE /access → 200")
+        : fail("AC1: API key DELETE should 200", `got ${r6.status} ${JSON.stringify(r6.body)}`);
+    }
+
+    // ── AC2: access control rejections ───────────────────────────────────────
+    {
+      const memberHeaders = {
+        "x-test-clerk-user-id": acMemberClerkId,
+        "x-test-clerk-org-id": "clerk_org_aaa",
+        "x-test-clerk-org-role": "org:member",
+      };
+      const otherOrgClerkHeaders = {
+        "x-test-clerk-user-id": acAdminClerkId,
+        "x-test-clerk-org-id": "clerk_org_bbb",
+        "x-test-clerk-org-role": "org:admin",
+      };
+
+      // Clerk org member (non-admin) → 403 org_admin_required
+      for (const method of ["GET", "POST", "DELETE"] as const) {
+        const path = method === "DELETE"
+          ? `/v1/apps/${acAppId}/access/${encodeURIComponent("x@x.com")}`
+          : `/v1/apps/${acAppId}/access`;
+        const r = await request(method, path, {
+          headers: memberHeaders,
+          body: method === "POST" ? { email: "x@x.com" } : undefined,
+        });
+        r.status === 403 && (r.body as any).error === "org_admin_required"
+          ? ok(`AC2: member ${method} → 403 org_admin_required`)
+          : fail(`AC2: member ${method} should 403`, `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Caller from another org (Clerk) → 404 for all methods
+      for (const method of ["GET", "POST", "DELETE"] as const) {
+        const path = method === "DELETE"
+          ? `/v1/apps/${acAppId}/access/${encodeURIComponent("x@x.com")}`
+          : `/v1/apps/${acAppId}/access`;
+        const r = await request(method, path, {
+          headers: otherOrgClerkHeaders,
+          body: method === "POST" ? { email: "x@x.com" } : undefined,
+        });
+        r.status === 404 && (r.body as any).error === "app_not_found"
+          ? ok(`AC2: other-org Clerk ${method} → 404 app_not_found`)
+          : fail(`AC2: other-org Clerk ${method} should 404`, `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Caller from another org (API key) → 404 for all methods
+      for (const method of ["GET", "POST", "DELETE"] as const) {
+        const path = method === "DELETE"
+          ? `/v1/apps/${acAppId}/access/${encodeURIComponent("x@x.com")}`
+          : `/v1/apps/${acAppId}/access`;
+        const r = await request(method, path, {
+          headers: authHeaders(keyB),
+          body: method === "POST" ? { email: "x@x.com" } : undefined,
+        });
+        r.status === 404 && (r.body as any).error === "app_not_found"
+          ? ok(`AC2: other-org API key ${method} → 404 app_not_found`)
+          : fail(`AC2: other-org API key ${method} should 404`, `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Deleted app → 404
+      const delRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type, deleted_at)
+         VALUES ($1, $2, 'ac-del', 'ac-del', 'zip', now()) RETURNING id`,
+        [orgAId, acAdminUserId],
+      );
+      const delAppId = delRow.rows[0].id;
+      const rDel = await request("GET", `/v1/apps/${delAppId}/access`, { headers: adminHeaders() });
+      rDel.status === 404 && (rDel.body as any).error === "app_not_found"
+        ? ok("AC2: deleted app → 404")
+        : fail("AC2: deleted app should 404", `got ${rDel.status} ${JSON.stringify(rDel.body)}`);
+    }
+
+    // ── AC3: POST email cases ─────────────────────────────────────────────────
+    {
+      // Existing user's email, different case → granted
+      {
+        // acAdminUserId has email "acadmin@test.local"
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "ACADMIN@TEST.LOCAL" },
+        });
+        r.status === 201 && (r.body as any).status === "granted"
+          ? ok("AC3: existing user email (different case) → 201 granted")
+          : fail("AC3: existing user should grant", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+        // Verify the app_access row exists
+        const { rows } = await pool.query(
+          "SELECT 1 FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [acAppId, acAdminUserId],
+        );
+        rows.length > 0
+          ? ok("AC3: app_access row exists after grant")
+          : fail("AC3: app_access row missing after grant");
+      }
+
+      // Unknown email → pending
+      {
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "unknown@pending.test" },
+        });
+        r.status === 201 && (r.body as any).status === "pending"
+          ? ok("AC3: unknown email → 201 pending")
+          : fail("AC3: unknown email should pending", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+        const { rows } = await pool.query(
+          "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "unknown@pending.test"],
+        );
+        rows.length > 0
+          ? ok("AC3: pending_access row exists")
+          : fail("AC3: pending_access row missing");
+      }
+
+      // Invalid email → 400
+      for (const bad of ["notanemail", "missing@", "@domain.com", "a".repeat(255) + "@b.com"]) {
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: bad },
+        });
+        r.status === 400
+          ? ok(`AC3: invalid email "${bad.slice(0, 20)}" → 400`)
+          : fail(`AC3: "${bad.slice(0, 20)}" should 400`, `got ${r.status}`);
+      }
+
+      // Duplicate grant is idempotent — both should return 201 without error
+      {
+        const r1 = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "ACADMIN@TEST.LOCAL" },
+        });
+        const r2 = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "unknown@pending.test" },
+        });
+        r1.status === 201 && r2.status === 201
+          ? ok("AC3: duplicate grants are idempotent (both 201)")
+          : fail("AC3: duplicates should both be 201", `got ${r1.status}, ${r2.status}`);
+      }
+    }
+
+    // ── AC4: pending conversion in /codes ─────────────────────────────────────
+    {
+      // Insert a pending grant for acPendingUserId's email
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, "acpending@test.local"],
+      );
+      // Make sure no direct app_access row exists for this user
+      await pool.query(
+        "DELETE FROM app_access WHERE app_id = $1 AND user_id = $2",
+        [acAppId, acPendingUserId],
+      );
+
+      const acState = crypto.randomBytes(16).toString("base64url");
+      const r = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": acPendingClerkId },
+        body: { app_id: acAppId, state: acState },
+      });
+      r.status === 201
+        ? ok("AC4: user with pending grant gets 201 from /codes")
+        : fail("AC4: pending user should get 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      // app_access row should now exist
+      const { rows: accessRows } = await pool.query(
+        "SELECT 1 FROM app_access WHERE app_id = $1 AND user_id = $2",
+        [acAppId, acPendingUserId],
+      );
+      accessRows.length > 0
+        ? ok("AC4: app_access row created on pending conversion")
+        : fail("AC4: app_access row missing after pending conversion");
+
+      // pending_access row should be gone
+      const { rows: pendingRows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [acAppId, "acpending@test.local"],
+      );
+      pendingRows.length === 0
+        ? ok("AC4: pending_access row deleted after conversion")
+        : fail("AC4: pending_access row should be deleted after conversion");
+
+      // User with empty stored email gets 403 no_access, pending row unchanged
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, ""],  // empty email never matches, but guard is "storedEmail is empty"
+      );
+      // Insert a real pending row for this user (but their email is "")
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, "acunverified@test.local"],
+      );
+      const acState2 = crypto.randomBytes(16).toString("base64url");
+      const r2 = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": acUnverifiedClerkId },
+        body: { app_id: acAppId, state: acState2 },
+      });
+      r2.status === 403 && (r2.body as any).error === "no_access"
+        ? ok("AC4: user with empty stored email → 403 no_access")
+        : fail("AC4: empty-email user should get 403", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+
+      // pending row for unverified@test.local remains (since user's email is "")
+      const { rows: unverPending } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [acAppId, "acunverified@test.local"],
+      );
+      unverPending.length > 0
+        ? ok("AC4: pending_access row untouched for empty-email user")
+        : fail("AC4: pending row should remain when stored email is empty");
+
+      // Cleanup
+      await pool.query(
+        "DELETE FROM pending_access WHERE app_id = $1 AND email IN ($2, $3)",
+        [acAppId, "", "acunverified@test.local"],
+      );
+    }
+
+    // ── AC5: DELETE removes access — /proxy/access and /codes reflect it ──────
+    {
+      // Ensure acAdminUserId has app_access
+      await pool.query(
+        "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, acAdminUserId],
+      );
+      // Confirm /proxy/access returns true
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${acAdminUserId}`, {
+          headers: { Authorization: `Bearer ${acProxyToken}` },
+        });
+        r.status === 200 && (r.body as any).allowed === true
+          ? ok("AC5: /proxy/access allowed=true before DELETE")
+          : fail("AC5: should be allowed before DELETE", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Add a pending row for the same email to verify DELETE removes it too
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, "acadmin@test.local"],
+      );
+
+      // DELETE /v1/apps/:id/access/:email
+      const r = await request(
+        "DELETE",
+        `/v1/apps/${acAppId}/access/${encodeURIComponent("acadmin@test.local")}`,
+        { headers: adminHeaders() },
+      );
+      r.status === 200 && (r.body as any).removed === true
+        ? ok("AC5: DELETE returns 200 removed:true")
+        : fail("AC5: DELETE should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      // /proxy/access now returns false
+      {
+        const r2 = await request("GET", `/v1/proxy/access?user_id=${acAdminUserId}`, {
+          headers: { Authorization: `Bearer ${acProxyToken}` },
+        });
+        r2.status === 200 && (r2.body as any).allowed === false
+          ? ok("AC5: /proxy/access allowed=false after DELETE")
+          : fail("AC5: should not be allowed after DELETE", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+      }
+
+      // /codes returns 403 no_access (no pending row either)
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        const r3 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": acAdminClerkId },
+          body: { app_id: acAppId, state: st },
+        });
+        r3.status === 403 && (r3.body as any).error === "no_access"
+          ? ok("AC5: /codes returns 403 after access revoked")
+          : fail("AC5: /codes should 403 after DELETE", `got ${r3.status} ${JSON.stringify(r3.body)}`);
+      }
+
+      // pending_access row also gone
+      {
+        const { rows } = await pool.query(
+          "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "acadmin@test.local"],
+        );
+        rows.length === 0
+          ? ok("AC5: pending_access row removed by DELETE")
+          : fail("AC5: pending row should be removed by DELETE");
+      }
+
+      // DELETE on already-absent entry is idempotent → 200
+      {
+        const r4 = await request(
+          "DELETE",
+          `/v1/apps/${acAppId}/access/${encodeURIComponent("acadmin@test.local")}`,
+          { headers: adminHeaders() },
+        );
+        r4.status === 200 && (r4.body as any).removed === true
+          ? ok("AC5: second DELETE is idempotent → 200 removed:true")
+          : fail("AC5: second DELETE should still be 200", `got ${r4.status}`);
+      }
+    }
+
+    // ── AC6: ensureUser email selection (unit test, stubbed axios) ─────────────
+    {
+      const { ensureUser } = require("../src/lib/clerkSync") as typeof import("../src/lib/clerkSync");
+      const axiosMod = require("axios") as any;
+      const origGet = axiosMod.get;
+
+      try {
+        // Scenario 1: verified primary address picked
+        {
+          axiosMod.get = async () => ({
+            data: {
+              primary_email_address_id: "addr_primary",
+              email_addresses: [
+                { id: "addr_primary", email_address: "primary@ac6.test", verification: { status: "verified" } },
+                { id: "addr_other", email_address: "other@ac6.test", verification: { status: "verified" } },
+              ],
+              first_name: "AC6", last_name: "One",
+            },
+          });
+          const id = await ensureUser("clerk_ac6_verified");
+          const { rows } = await pool.query<{ email: string }>(
+            "SELECT email FROM users WHERE id = $1", [id],
+          );
+          rows[0]?.email === "primary@ac6.test"
+            ? ok("AC6: verified primary address stored")
+            : fail("AC6: should store verified primary email", `got "${rows[0]?.email}"`);
+          await pool.query("DELETE FROM users WHERE id = $1", [id]);
+        }
+
+        // Scenario 2: primary address is unverified → stores ""
+        {
+          axiosMod.get = async () => ({
+            data: {
+              primary_email_address_id: "addr_primary",
+              email_addresses: [
+                { id: "addr_primary", email_address: "primary@ac6.test", verification: { status: "unverified" } },
+              ],
+              first_name: "AC6", last_name: "Two",
+            },
+          });
+          const id = await ensureUser("clerk_ac6_unverified");
+          const { rows } = await pool.query<{ email: string }>(
+            "SELECT email FROM users WHERE id = $1", [id],
+          );
+          rows[0]?.email === ""
+            ? ok("AC6: unverified primary → empty string stored")
+            : fail("AC6: unverified primary should store empty string", `got "${rows[0]?.email}"`);
+          await pool.query("DELETE FROM users WHERE id = $1", [id]);
+        }
+
+        // Scenario 3: primary_email_address_id has no match → never falls back
+        {
+          axiosMod.get = async () => ({
+            data: {
+              primary_email_address_id: "addr_missing",
+              email_addresses: [
+                { id: "addr_other", email_address: "other@ac6.test", verification: { status: "verified" } },
+              ],
+              first_name: "AC6", last_name: "Three",
+            },
+          });
+          const id = await ensureUser("clerk_ac6_no_primary");
+          const { rows } = await pool.query<{ email: string }>(
+            "SELECT email FROM users WHERE id = $1", [id],
+          );
+          rows[0]?.email === ""
+            ? ok("AC6: no matching primary → empty string; never uses non-primary address")
+            : fail("AC6: should not fall back to non-primary", `got "${rows[0]?.email}"`);
+          await pool.query("DELETE FROM users WHERE id = $1", [id]);
+        }
+      } finally {
+        axiosMod.get = origGet;
+      }
+    }
+
+    // ── AC7: non-UUID app id → 404, never 500 ────────────────────────────────
+    {
+      for (const badId of ["not-a-uuid", "12345", "00000000-0000-0000-0000-00000000000g"]) {
+        for (const [label, hdrs, bdy] of [
+          ["Clerk admin", adminHeaders(), undefined],
+          ["API key",    authHeaders(keyA), undefined],
+        ] as Array<[string, Record<string, string>, unknown]>) {
+          // GET
+          const rGet = await request("GET", `/v1/apps/${badId}/access`, { headers: hdrs });
+          rGet.status === 404 && (rGet.body as any).error === "app_not_found"
+            ? ok(`AC7: ${label} GET non-UUID "${badId}" → 404`)
+            : fail(`AC7: ${label} GET non-UUID should 404`, `got ${rGet.status} ${JSON.stringify(rGet.body)}`);
+
+          // POST
+          const rPost = await request("POST", `/v1/apps/${badId}/access`, {
+            headers: hdrs,
+            body: { email: "x@example.com" },
+          });
+          rPost.status === 404 && (rPost.body as any).error === "app_not_found"
+            ? ok(`AC7: ${label} POST non-UUID "${badId}" → 404`)
+            : fail(`AC7: ${label} POST non-UUID should 404`, `got ${rPost.status} ${JSON.stringify(rPost.body)}`);
+
+          // DELETE
+          const rDel = await request("DELETE", `/v1/apps/${badId}/access/${encodeURIComponent("x@example.com")}`, {
+            headers: hdrs,
+          });
+          rDel.status === 404 && (rDel.body as any).error === "app_not_found"
+            ? ok(`AC7: ${label} DELETE non-UUID "${badId}" → 404`)
+            : fail(`AC7: ${label} DELETE non-UUID should 404`, `got ${rDel.status} ${JSON.stringify(rDel.body)}`);
+        }
+      }
+    }
+
+    // ── AC8: DELETE with percent-encoded email ("%" in address) ──────────────
+    {
+      // Email stored in DB (after lowercasing): "a%b@test.local"
+      const pctEmail = "a%b@test.local";
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+        [acAppId, pctEmail],
+      );
+
+      // URL path: "%" must be percent-encoded as "%25" so the server receives "a%b@test.local"
+      // Express decodes the route param once → req.params.email = "a%b@test.local"; we use it as-is.
+      const urlPath = `/v1/apps/${acAppId}/access/a%25b@test.local`;
+      const r = await request("DELETE", urlPath, { headers: adminHeaders() });
+      r.status === 200 && (r.body as any).removed === true
+        ? ok("AC8: DELETE with %-encoded email → 200 removed:true (no double-decode)")
+        : fail("AC8: DELETE percent email should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      // pending row should be gone
+      const { rows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [acAppId, pctEmail],
+      );
+      rows.length === 0
+        ? ok("AC8: pending row with '%' in email removed correctly")
+        : fail("AC8: pending row should be gone after DELETE");
+    }
+
+    // ── AC9: granted_by is recorded ──────────────────────────────────────────
+    {
+      // Setup: a fresh target user whose email is unique for this test
+      const ac9TargetRow = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_ac9_target", "ac9target@test.local", "AC9 Target"],
+      );
+      const ac9TargetId = ac9TargetRow.rows[0].id;
+
+      // 1. Clerk admin grant — granted_by should be acAdminUserId
+      {
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "ac9target@test.local" },
+        });
+        r.status === 201 && (r.body as any).status === "granted"
+          ? ok("AC9: Clerk admin POST → 201 granted")
+          : fail("AC9: Clerk admin POST should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+        const { rows } = await pool.query<{ granted_by: string | null }>(
+          "SELECT granted_by FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [acAppId, ac9TargetId],
+        );
+        rows[0]?.granted_by === acAdminUserId
+          ? ok("AC9: app_access.granted_by = Clerk admin's users.id")
+          : fail("AC9: app_access.granted_by should be admin's users.id", `got ${rows[0]?.granted_by}`);
+
+        // Clean up for next sub-test
+        await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id = $2", [acAppId, ac9TargetId]);
+      }
+
+      // 2. API-key grant — granted_by should be userId (the seed user who created keyA)
+      {
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: authHeaders(keyA),
+          body: { email: "ac9target@test.local" },
+        });
+        r.status === 201
+          ? ok("AC9: API key POST → 201")
+          : fail("AC9: API key POST should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+        const { rows } = await pool.query<{ granted_by: string | null }>(
+          "SELECT granted_by FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [acAppId, ac9TargetId],
+        );
+        rows[0]?.granted_by === userId
+          ? ok("AC9: app_access.granted_by = API key's created_by (seed userId)")
+          : fail("AC9: app_access.granted_by should be key's created_by", `got ${rows[0]?.granted_by}`);
+
+        await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id = $2", [acAppId, ac9TargetId]);
+      }
+
+      // 3. Pending grant: original granted_by is preserved on conversion
+      {
+        // Admin inserts a pending row — granted_by will be acAdminUserId
+        const r = await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "ac9unknown@test.local" },   // unknown email → pending
+        });
+        r.status === 201 && (r.body as any).status === "pending"
+          ? ok("AC9: pending row inserted with granted_by")
+          : fail("AC9: pending POST should be 201 pending", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+        const { rows: pendRows } = await pool.query<{ granted_by: string | null }>(
+          "SELECT granted_by FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "ac9unknown@test.local"],
+        );
+        pendRows[0]?.granted_by === acAdminUserId
+          ? ok("AC9: pending_access.granted_by = Clerk admin's users.id")
+          : fail("AC9: pending granted_by should be admin's id", `got ${pendRows[0]?.granted_by}`);
+
+        // Now register that user and trigger pending conversion via /codes
+        const ac9NewUserRow = await pool.query<{ id: string }>(
+          "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+          ["clerk_ac9_new", "ac9unknown@test.local", "AC9 New User"],
+        );
+        const ac9NewUserId = ac9NewUserRow.rows[0].id;
+        // issue a proxy token for the app (re-use acProxyToken from setup)
+        const acState9 = crypto.randomBytes(16).toString("base64url");
+        const rCodes = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": "clerk_ac9_new" },
+          body: { app_id: acAppId, state: acState9 },
+        });
+        rCodes.status === 201
+          ? ok("AC9: /codes succeeds for user matching pending grant")
+          : fail("AC9: /codes should 201 on pending conversion", `got ${rCodes.status} ${JSON.stringify(rCodes.body)}`);
+
+        // app_access.granted_by should equal the original pending_access.granted_by (acAdminUserId)
+        const { rows: accRows } = await pool.query<{ granted_by: string | null }>(
+          "SELECT granted_by FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [acAppId, ac9NewUserId],
+        );
+        accRows[0]?.granted_by === acAdminUserId
+          ? ok("AC9: converted app_access.granted_by preserves original pending granted_by")
+          : fail("AC9: converted granted_by should match original", `got ${accRows[0]?.granted_by}`);
+
+        // Cleanup
+        await pool.query("DELETE FROM users WHERE id = $1", [ac9NewUserId]);
+        await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "ac9unknown@test.local"]);
+      }
+
+      await pool.query("DELETE FROM users WHERE id = $1", [ac9TargetId]);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section("AB: Proxy API");
   // ════════════════════════════════════════════════════════════════════════════
 

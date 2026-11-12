@@ -106,26 +106,57 @@ proxyRouter.post(
     // Resolve internal user (look up by clerk_user_id; only call ensureUser if missing)
     const clerkUserId = req.sscAuth.clerkUserId!;
     let internalUserId: string;
+    let internalUserEmail = "";
     {
-      const { rows } = await pool.query<{ id: string }>(
-        "SELECT id FROM users WHERE clerk_user_id = $1",
+      const { rows } = await pool.query<{ id: string; email: string }>(
+        "SELECT id, email FROM users WHERE clerk_user_id = $1",
         [clerkUserId],
       );
       if (rows[0]) {
         internalUserId = rows[0].id;
+        internalUserEmail = rows[0].email ?? "";
       } else {
         internalUserId = await ensureUser(clerkUserId);
+        const { rows: eRows } = await pool.query<{ email: string }>(
+          "SELECT email FROM users WHERE id = $1",
+          [internalUserId],
+        );
+        internalUserEmail = eRows[0]?.email ?? "";
       }
     }
 
-    // Check app_access
+    // Check app_access; if absent, attempt pending-grant conversion
     const { rows: accessRows } = await pool.query(
       "SELECT 1 FROM app_access WHERE app_id = $1 AND user_id = $2",
       [body.app_id, internalUserId],
     );
     if (!accessRows[0]) {
-      res.status(403).json({ error: "no_access" });
-      return;
+      const storedEmail = internalUserEmail.toLowerCase().trim();
+      if (storedEmail) {
+        const { rows: pendingRows } = await pool.query<{ granted_by: string | null }>(
+          "SELECT granted_by FROM pending_access WHERE app_id = $1 AND email = $2",
+          [body.app_id, storedEmail],
+        );
+        if (pendingRows[0]) {
+          // Convert: grant direct access and remove the pending row
+          await pool.query(
+            `INSERT INTO app_access (app_id, user_id, granted_by)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [body.app_id, internalUserId, pendingRows[0].granted_by],
+          );
+          await pool.query(
+            "DELETE FROM pending_access WHERE app_id = $1 AND email = $2",
+            [body.app_id, storedEmail],
+          );
+          // Fall through — user now has access
+        } else {
+          res.status(403).json({ error: "no_access" });
+          return;
+        }
+      } else {
+        res.status(403).json({ error: "no_access" });
+        return;
+      }
     }
 
     // Sanitize return path

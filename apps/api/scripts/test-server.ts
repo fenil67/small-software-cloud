@@ -223,7 +223,16 @@ flyModule.destroyFlyApp = async (appName: string) => {
     const h = req.headers["x-test-clerk-user-id"];
     const clerkUserId = Array.isArray(h) ? h[0] : h;
     if (typeof clerkUserId === "string" && clerkUserId) {
-      req.sscAuth = { type: "clerk", clerkUserId };
+      const orgIdH = req.headers["x-test-clerk-org-id"];
+      const orgRoleH = req.headers["x-test-clerk-org-role"];
+      const clerkOrgId = Array.isArray(orgIdH) ? orgIdH[0] : (orgIdH as string | undefined);
+      const clerkOrgRole = Array.isArray(orgRoleH) ? orgRoleH[0] : (orgRoleH as string | undefined);
+      req.sscAuth = {
+        type: "clerk",
+        clerkUserId,
+        ...(clerkOrgId ? { clerkOrgId } : {}),
+        ...(clerkOrgRole ? { clerkOrgRole } : {}),
+      };
       next();
       return;
     }
@@ -231,9 +240,10 @@ flyModule.destroyFlyApp = async (appName: string) => {
   };
 }
 
-// Load proxy router AFTER the requireAuth patch so it captures the patched function.
-// Must use require() here (not import) — import statements are hoisted before this body runs.
+// Load routers that depend on requireAuth AFTER the patch above.
+// Must use require() here — import statements are hoisted before this body runs.
 const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
+const { appAccessRouter } = require("../src/routes/appAccess") as typeof import("../src/routes/appAccess");
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
@@ -361,6 +371,7 @@ app.get("/test/db-error", async (_req: Request, _res: Response, next: NextFuncti
 // NOTE: no clerkMiddleware() — we only test API-key auth paths
 app.use("/health", healthRouter);
 app.use("/v1/auth", authRouter);
+app.use("/v1/apps/:id/access", appAccessRouter);
 app.use("/v1/apps", appsRouter);
 app.use("/v1/api-keys", apiKeysRouter);
 app.use("/v1/deployments/intake", intakeRouter);

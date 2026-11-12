@@ -46,6 +46,7 @@ installProcessHandlers();
 
 import { healthRouter } from "./routes/health";
 import { appsRouter } from "./routes/apps";
+import { appAccessRouter } from "./routes/appAccess";
 import { orgsRouter } from "./routes/orgs";
 import { apiKeysRouter } from "./routes/apiKeys";
 import { authRouter } from "./routes/auth";
@@ -79,6 +80,7 @@ app.use(clerkMiddleware());
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.use("/health", healthRouter);
 app.use("/v1/auth", authRouter);
+app.use("/v1/apps/:id/access", appAccessRouter);
 app.use("/v1/apps", appsRouter);
 app.use("/v1/orgs", orgsRouter);
 app.use("/v1/api-keys", apiKeysRouter);

@@ -9,7 +9,16 @@ export async function ensureUser(clerkUserId: string): Promise<string> {
     headers: { Authorization: `Bearer ${clerkKey}` },
   });
 
-  const email = data.email_addresses?.[0]?.email_address ?? "";
+  // Use only the primary email address, and only when its verification status
+  // is "verified".  Never fall back to email_addresses[0] or any non-primary.
+  const primaryId: string | undefined = data.primary_email_address_id;
+  const emailAddrs: Array<{ id: string; email_address: string; verification: { status: string } | null }> =
+    data.email_addresses ?? [];
+  const primaryAddr = primaryId ? emailAddrs.find((a) => a.id === primaryId) : undefined;
+  const email =
+    primaryAddr?.verification?.status === "verified"
+      ? (primaryAddr.email_address ?? "")
+      : "";
   const name = `${data.first_name ?? ""} ${data.last_name ?? ""}`.trim();
 
   const { rows } = await pool.query<{ id: string }>(
