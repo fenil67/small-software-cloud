@@ -40,6 +40,7 @@ export class FakeApiServer {
   };
   public usedCodes = new Set<string>();
   public receivedExchangeToken: string | null = null;
+  public receivedExchangeState: string | null = null;
   public receivedAccessToken: string | null = null;
   public accessCallCount = 0;
 
@@ -66,8 +67,8 @@ export class FakeApiServer {
 
       if (req.method === 'POST' && url.pathname === '/v1/proxy/exchange') {
         this.receivedExchangeToken = req.headers.authorization ?? null;
-        let parsed: { code?: string } = {};
-        try { parsed = JSON.parse(body) as { code?: string }; } catch { /* */ }
+        let parsed: { code?: string; state?: string } = {};
+        try { parsed = JSON.parse(body) as { code?: string; state?: string }; } catch { /* */ }
 
         if (parsed.code && this.usedCodes.has(parsed.code)) {
           // Reused code — deny
@@ -76,6 +77,7 @@ export class FakeApiServer {
           return;
         }
         if (parsed.code) this.usedCodes.add(parsed.code);
+        this.receivedExchangeState = parsed.state ?? null;
 
         res.writeHead(this.exchange.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(this.exchange.body));
@@ -118,6 +120,7 @@ export class FakeApiServer {
     this.accessState = { status: 200, body: { allowed: true }, reachable: true };
     this.usedCodes = new Set();
     this.receivedExchangeToken = null;
+    this.receivedExchangeState = null;
     this.receivedAccessToken = null;
     this.accessCallCount = 0;
   }
@@ -176,11 +179,13 @@ export class FakeAppServer {
       return;
     }
 
-    // Sets __ssc_session in Set-Cookie (should be stripped by proxy)
+    // Sets __ssc_* cookies in Set-Cookie (should be stripped by proxy)
     if (url.pathname === '/set-ssc-cookie') {
       res.writeHead(200, {
         'Set-Cookie': [
           '__ssc_session=evil; Path=/',
+          '__ssc_state=evil-state; Path=/',
+          '__ssc_other=evil-other; Path=/',
           'other=ok; Path=/',
         ],
       });

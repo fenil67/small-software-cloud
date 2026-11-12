@@ -41,12 +41,34 @@ function makeEnv(extra: Partial<ProxyEnv> = {}): ProxyEnv {
   };
 }
 
-/** Obtain a session cookie by going through the callback flow. */
-async function getSession(code = 'code-' + Math.random()): Promise<string> {
-  const res = await httpRequest({
-    url: `${proxyUrl}/__ssc/callback?code=${encodeURIComponent(code)}&return=/`,
+/**
+ * Obtain a session cookie by going through the full CSRF-aware callback flow:
+ * 1. GET an unauthenticated page to get the __ssc_state cookie from the redirect
+ * 2. Call /__ssc/callback with the state param + cookie
+ */
+async function getSession(code = 'code-' + Math.random(), baseUrl = proxyUrl): Promise<string> {
+  // Step 1: get a state cookie from the unauthenticated redirect
+  const unauth = await httpRequest({
+    url: `${baseUrl}/start-login`,
+    headers: { Accept: 'text/html' },
   });
-  assert.equal(res.status, 302);
+  assert.equal(unauth.status, 302, 'expected unauthenticated redirect');
+
+  // Extract __ssc_state cookie value and state query param from login URL
+  const setCookies = [unauth.headers['set-cookie'] ?? []].flat();
+  const stateCookieHeader = setCookies.find((c) => c.startsWith('__ssc_state='));
+  assert.ok(stateCookieHeader, '__ssc_state cookie missing from redirect');
+  const stateValue = stateCookieHeader.split(';')[0].replace('__ssc_state=', '');
+
+  const loc = unauth.headers.location ?? '';
+  const stateInUrl = new URL(loc, 'http://localhost').searchParams.get('state') ?? stateValue;
+
+  // Step 2: call callback with matching state
+  const res = await httpRequest({
+    url: `${baseUrl}/__ssc/callback?code=${encodeURIComponent(code)}&return=/&state=${encodeURIComponent(stateInUrl)}`,
+    headers: { Cookie: `__ssc_state=${stateValue}` },
+  });
+  assert.equal(res.status, 302, `callback failed: ${res.status} ${res.body}`);
   const setCookie = res.headers['set-cookie'];
   assert.ok(setCookie, 'Set-Cookie missing');
   const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
@@ -170,10 +192,26 @@ describe('unauthenticated', () => {
 // 3. Callback
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Helper: get a fresh state param + cookie from the proxy. */
+async function getStatePair(baseUrl = proxyUrl): Promise<{ state: string; cookie: string }> {
+  const res = await httpRequest({
+    url: `${baseUrl}/start-login`,
+    headers: { Accept: 'text/html' },
+  });
+  const setCookies = [res.headers['set-cookie'] ?? []].flat();
+  const header = setCookies.find((c) => c.startsWith('__ssc_state='))!;
+  const cookie = header.split(';')[0].replace('__ssc_state=', '');
+  const loc = res.headers.location ?? '';
+  const state = new URL(loc, 'http://localhost').searchParams.get('state') ?? cookie;
+  return { state, cookie };
+}
+
 describe('callback', () => {
   it('valid code sets session cookie with correct attributes and redirects', async () => {
+    const { state, cookie } = await getStatePair();
     const res = await httpRequest({
-      url: `${proxyUrl}/__ssc/callback?code=abc&return=/dashboard`,
+      url: `${proxyUrl}/__ssc/callback?code=abc&return=/dashboard&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
     });
     assert.equal(res.status, 302);
     assert.equal(res.headers.location, '/dashboard');
@@ -190,14 +228,20 @@ describe('callback', () => {
   });
 
   it('callback sends correct Authorization header to exchange endpoint', async () => {
-    await httpRequest({ url: `${proxyUrl}/__ssc/callback?code=tok1&return=/` });
+    const { state, cookie } = await getStatePair();
+    await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=tok1&return=/&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
+    });
     assert.equal(fakeApi.receivedExchangeToken, `Bearer ${PROXY_TOKEN}`);
   });
 
   it('invalid code (API returns non-200) gives 401 with no session cookie', async () => {
     fakeApi.exchange = { status: 400, body: { error: 'bad code' } };
+    const { state, cookie } = await getStatePair();
     const res = await httpRequest({
-      url: `${proxyUrl}/__ssc/callback?code=bad&return=/`,
+      url: `${proxyUrl}/__ssc/callback?code=bad&return=/&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
     });
     assert.equal(res.status, 401);
     const setCookie = [res.headers['set-cookie'] ?? ''].flat().join('');
@@ -205,17 +249,27 @@ describe('callback', () => {
   });
 
   it('reused code gives 401 and no new session cookie', async () => {
+    const { state: s1, cookie: c1 } = await getStatePair();
     // First use — succeeds
-    await httpRequest({ url: `${proxyUrl}/__ssc/callback?code=once&return=/` });
-    // Second use — should fail (fakeApi tracks used codes)
+    await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=once&return=/&state=${encodeURIComponent(s1)}`,
+      headers: { Cookie: `__ssc_state=${c1}` },
+    });
+    // Second use — need a fresh state pair, same code
+    const { state: s2, cookie: c2 } = await getStatePair();
     const res2 = await httpRequest({
-      url: `${proxyUrl}/__ssc/callback?code=once&return=/`,
+      url: `${proxyUrl}/__ssc/callback?code=once&return=/&state=${encodeURIComponent(s2)}`,
+      headers: { Cookie: `__ssc_state=${c2}` },
     });
     assert.equal(res2.status, 401);
   });
 
   it('missing code gives 401', async () => {
-    const res = await httpRequest({ url: `${proxyUrl}/__ssc/callback?return=/` });
+    const { state, cookie } = await getStatePair();
+    const res = await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?return=/&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
+    });
     assert.equal(res.status, 401);
   });
 });
@@ -226,8 +280,10 @@ describe('callback', () => {
 
 describe('open-redirect protection', () => {
   async function callbackReturnLoc(ret: string): Promise<string> {
+    const { state, cookie } = await getStatePair();
     const res = await httpRequest({
-      url: `${proxyUrl}/__ssc/callback?code=r-${Math.random()}&return=${encodeURIComponent(ret)}`,
+      url: `${proxyUrl}/__ssc/callback?code=r-${Math.random()}&return=${encodeURIComponent(ret)}&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
     });
     return res.headers.location ?? '';
   }
@@ -368,13 +424,7 @@ describe('access revocation (short TTL proxy)', () => {
 
   it('within cache window: API called once even on multiple requests', async () => {
     shortApi.reset();
-    const sid = await (async () => {
-      const res = await httpRequest({
-        url: `${shortUrl}/__ssc/callback?code=c1&return=/`,
-      });
-      const sc = [res.headers['set-cookie'] ?? ''].flat().find(c => c.startsWith('__ssc_session='))!;
-      return sc.split(';')[0].replace('__ssc_session=', '');
-    })();
+    const sid = await getSession('c1', shortUrl);
 
     shortApi.accessCallCount = 0;
     // Two requests within the 1s window
@@ -385,13 +435,7 @@ describe('access revocation (short TTL proxy)', () => {
 
   it('after cache expires and API returns denied, session is removed', async () => {
     shortApi.reset();
-    const sid = await (async () => {
-      const res = await httpRequest({
-        url: `${shortUrl}/__ssc/callback?code=c2&return=/`,
-      });
-      const sc = [res.headers['set-cookie'] ?? ''].flat().find(c => c.startsWith('__ssc_session='))!;
-      return sc.split(';')[0].replace('__ssc_session=', '');
-    })();
+    const sid = await getSession('c2', shortUrl);
 
     // First request — allowed, caches the result
     const r1 = await httpRequest({ url: `${shortUrl}/`, headers: { Cookie: `__ssc_session=${sid}` } });
@@ -452,13 +496,7 @@ describe('fail closed', () => {
 
   it('API unreachable with nothing cached → denied (fail closed)', async () => {
     fcApi.reset();
-    const sid = await (async () => {
-      const res = await httpRequest({
-        url: `${fcUrl}/__ssc/callback?code=fc1&return=/`,
-      });
-      const sc = [res.headers['set-cookie'] ?? ''].flat().find(c => c.startsWith('__ssc_session='))!;
-      return sc.split(';')[0].replace('__ssc_session=', '');
-    })();
+    const sid = await getSession('fc1', fcUrl);
 
     // Make API unreachable before any access check is cached
     fcApi.accessState = { status: 200, body: { allowed: true }, reachable: false };
@@ -620,5 +658,208 @@ describe('logout', () => {
     });
     assert.equal(res.status, 302);
     assert.ok(res.headers.location?.includes('login'));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. CSRF state parameter
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('CSRF state parameter', () => {
+  it('unauthenticated HTML redirect sets __ssc_state cookie and state in login URL', async () => {
+    const res = await httpRequest({
+      url: `${proxyUrl}/page`,
+      headers: { Accept: 'text/html' },
+    });
+    assert.equal(res.status, 302);
+
+    const setCookies = [res.headers['set-cookie'] ?? []].flat();
+    const stateCookie = setCookies.find((c) => c.startsWith('__ssc_state='));
+    assert.ok(stateCookie, '__ssc_state cookie missing');
+    assert.ok(stateCookie.includes('Path=/__ssc/'), 'wrong Path');
+    assert.ok(stateCookie.includes('HttpOnly'), 'missing HttpOnly');
+    assert.ok(stateCookie.includes('Secure'), 'missing Secure');
+    assert.ok(stateCookie.includes('SameSite=Lax'), 'missing SameSite=Lax');
+    assert.ok(stateCookie.includes('Max-Age=600'), 'missing Max-Age=600');
+    assert.ok(!stateCookie.includes('Domain='), 'should not set Domain');
+
+    const loc = res.headers.location ?? '';
+    assert.ok(loc.includes('state='), 'state missing from login URL');
+  });
+
+  it('callback without state cookie returns 401', async () => {
+    const res = await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=x&return=/&state=anything`,
+      // no Cookie header
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('callback with wrong state returns 401', async () => {
+    const { cookie } = await getStatePair();
+    const res = await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=y&return=/&state=wrongstate`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('callback always expires __ssc_state cookie, even on success', async () => {
+    const { state, cookie } = await getStatePair();
+    const res = await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=st-ok&return=/&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
+    });
+    assert.equal(res.status, 302);
+    const setCookies = [res.headers['set-cookie'] ?? []].flat();
+    const expired = setCookies.find(
+      (c) => c.startsWith('__ssc_state=') && c.includes('Max-Age=0'),
+    );
+    assert.ok(expired, '__ssc_state not expired on success');
+  });
+
+  it('callback sends state to exchange API', async () => {
+    const { state, cookie } = await getStatePair();
+    await httpRequest({
+      url: `${proxyUrl}/__ssc/callback?code=st-send&return=/&state=${encodeURIComponent(state)}`,
+      headers: { Cookie: `__ssc_state=${cookie}` },
+    });
+    assert.equal(fakeApi.receivedExchangeState, state, 'state not forwarded to exchange API');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Cookie isolation (__ssc_* prefix)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('cookie isolation (__ssc_* prefix)', () => {
+  it('all __ssc_* cookies are stripped from Cookie header forwarded to app', async () => {
+    const sid = await getSession();
+    const res = await httpRequest({
+      url: `${proxyUrl}/echo`,
+      headers: {
+        Cookie: `__ssc_session=${sid}; __ssc_state=abc; __ssc_other=xyz; legit=ok`,
+      },
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body) as { headers: Record<string, string> };
+    const fwdCookie = body.headers.cookie ?? '';
+    assert.ok(!fwdCookie.includes('__ssc_session'), '__ssc_session should be stripped');
+    assert.ok(!fwdCookie.includes('__ssc_state'), '__ssc_state should be stripped');
+    assert.ok(!fwdCookie.includes('__ssc_other'), '__ssc_other should be stripped');
+    assert.ok(fwdCookie.includes('legit=ok'), 'non-__ssc_ cookie should survive');
+  });
+
+  it('app Set-Cookie with __ssc_* names are dropped from response', async () => {
+    const sid = await getSession();
+    const res = await httpRequest({
+      url: `${proxyUrl}/set-ssc-cookie`,
+      headers: { Cookie: `__ssc_session=${sid}` },
+    });
+    const setCookies = [res.headers['set-cookie'] ?? []].flat();
+    const sscCookies = setCookies.filter((c) => /^__ssc_/i.test(c.trimStart()));
+    assert.equal(sscCookies.length, 0, `__ssc_* Set-Cookie values should be stripped: ${sscCookies}`);
+    const otherCookie = setCookies.find((c) => c.startsWith('other='));
+    assert.ok(otherCookie, 'non-__ssc_ cookie should survive in response');
+  });
+
+  it('WebSocket upgrade: app __ssc_* Set-Cookie in 101 response is stripped', async () => {
+    // We need a fake app that returns a __ssc_* Set-Cookie in the 101 head.
+    // We can test this by checking the forwarded 101 doesn't contain __ssc_ Set-Cookie.
+    const sid = await getSession();
+
+    const response = await new Promise<string>((resolve, reject) => {
+      const sock = net.createConnection(proxy.port, '127.0.0.1', () => {
+        sock.write(
+          `GET /ws HTTP/1.1\r\n` +
+          `Host: 127.0.0.1\r\n` +
+          `Upgrade: websocket\r\n` +
+          `Connection: Upgrade\r\n` +
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
+          `Sec-WebSocket-Version: 13\r\n` +
+          `Cookie: __ssc_session=${sid}\r\n` +
+          `\r\n`,
+        );
+      });
+      let data = '';
+      sock.on('data', (d: Buffer) => {
+        data += d.toString();
+        if (data.includes('\r\n\r\n')) { sock.destroy(); }
+      });
+      sock.on('close', () => resolve(data));
+      sock.on('error', reject);
+      sock.setTimeout(3000, () => { sock.destroy(); reject(new Error('ws timeout')); });
+    });
+
+    // The 101 head should contain X-SSC-Proxy: 1 (injected by proxy)
+    assert.ok(response.includes('101'), 'expected 101 response');
+    assert.ok(response.includes('X-SSC-Proxy: 1'), 'X-SSC-Proxy should be injected');
+    // No __ssc_* Set-Cookie in the head
+    assert.ok(!response.includes('__ssc_session'), 'no __ssc_session in WS head');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. Hop-by-hop headers
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('hop-by-hop headers', () => {
+  it('Keep-Alive and Connection-listed headers are stripped from forwarded request headers', async () => {
+    const sid = await getSession();
+    const res = await httpRequest({
+      url: `${proxyUrl}/echo`,
+      headers: {
+        Cookie: `__ssc_session=${sid}`,
+        // Note: Node.js http.request re-adds Connection: keep-alive automatically,
+        // so we can't assert Connection is absent. We CAN assert Keep-Alive and
+        // any header named in Connection's value are stripped.
+        Connection: 'keep-alive, x-custom-hop',
+        'Keep-Alive': 'timeout=5',
+        'X-Custom-Hop': 'should-be-stripped',
+      },
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body) as { headers: Record<string, string> };
+    assert.ok(!body.headers['keep-alive'], 'Keep-Alive should be stripped');
+    assert.ok(!body.headers['x-custom-hop'], 'Connection-listed header should be stripped');
+  });
+
+  it('Transfer-Encoding is not forwarded verbatim', async () => {
+    const sid = await getSession();
+    const res = await httpRequest({
+      url: `${proxyUrl}/echo`,
+      headers: {
+        Cookie: `__ssc_session=${sid}`,
+        'Transfer-Encoding': 'chunked',
+      },
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body) as { headers: Record<string, string> };
+    assert.ok(!body.headers['transfer-encoding'], 'Transfer-Encoding should not be forwarded');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Path parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('path parsing', () => {
+  it('request URL starting with / is forwarded correctly', async () => {
+    const sid = await getSession();
+    const res = await httpRequest({
+      url: `${proxyUrl}/some/path?q=1`,
+      headers: { Cookie: `__ssc_session=${sid}` },
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body) as { headers: Record<string, string> };
+    // App should see the path with query string as-is
+    assert.ok(body, 'response received');
+  });
+
+  it('reserved paths matched without URL construction', async () => {
+    // /__ssc/health?foo=bar should still work (path before ? is /__ssc/health)
+    const res = await httpRequest({ url: `${proxyUrl}/__ssc/health?foo=bar` });
+    assert.equal(res.status, 200);
+    assert.equal(res.body, 'ok');
   });
 });

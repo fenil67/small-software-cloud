@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { loadConfig } from './config';
 import { SessionStore } from './session';
 import { AccessCache } from './access';
@@ -14,6 +15,38 @@ const access = new AccessCache(
   config.API_URL,
   config.PROXY_TOKEN,
 );
+
+// ── Hop-by-hop headers ────────────────────────────────────────────────────────
+
+const HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+/**
+ * Returns the set of header names that must NOT be forwarded end-to-end.
+ * Includes the static hop-by-hop set plus any extra names listed in the
+ * Connection header value (HTTP/1.1 §14.10).
+ */
+function hopByHopSet(headers: http.IncomingHttpHeaders): Set<string> {
+  const result = new Set(HOP_BY_HOP);
+  const conn = headers.connection;
+  if (conn) {
+    const val = Array.isArray(conn) ? conn.join(',') : conn;
+    for (const name of val.split(',')) {
+      const trimmed = name.trim().toLowerCase();
+      if (trimmed) result.add(trimmed);
+    }
+  }
+  return result;
+}
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +88,18 @@ function safeReturnPath(raw: string | null): string {
     if (decoded.charCodeAt(i) < 32) return '/';
   }
   return raw; // return original URL-encoded value for Location header
+}
+
+/** Extract the pathname portion (before ?) from a raw URL string. */
+function getPathname(rawUrl: string): string {
+  const q = rawUrl.indexOf('?');
+  return q >= 0 ? rawUrl.slice(0, q) : rawUrl;
+}
+
+/** Extract query string from a raw URL string (without leading ?). */
+function getSearch(rawUrl: string): string {
+  const q = rawUrl.indexOf('?');
+  return q >= 0 ? rawUrl.slice(q) : '';
 }
 
 /** Make an outbound JSON POST to the SSC API (exchange endpoint). */
@@ -101,6 +146,11 @@ const EXPIRED_COOKIE =
   `__ssc_session=; Path=/; HttpOnly; Secure; SameSite=Lax; ` +
   `Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
 
+/** Expire the CSRF state cookie immediately. */
+const EXPIRED_STATE_COOKIE =
+  `__ssc_state=; Path=/__ssc/; HttpOnly; Secure; SameSite=Lax; ` +
+  `Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+
 function proxyHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return { 'X-SSC-Proxy': '1', ...extra };
 }
@@ -109,13 +159,12 @@ function sendHtml(
   res: http.ServerResponse,
   status: number,
   body: string,
-  extra: Record<string, string> = {},
+  extra: Record<string, string | string[]> = {},
 ): void {
   const headers = proxyHeaders({
     'Content-Type': 'text/html; charset=utf-8',
-    ...extra,
   });
-  res.writeHead(status, headers);
+  res.writeHead(status, { ...headers, ...extra });
   res.end(body);
 }
 
@@ -134,8 +183,12 @@ function sendJson(
   res.end(payload);
 }
 
-function send302(res: http.ServerResponse, location: string, extra: Record<string, string> = {}): void {
-  res.writeHead(302, proxyHeaders({ Location: location, ...extra }));
+function send302(
+  res: http.ServerResponse,
+  location: string,
+  extra: Record<string, string | string[]> = {},
+): void {
+  res.writeHead(302, { ...proxyHeaders({ Location: location }), ...extra });
   res.end();
 }
 
@@ -155,10 +208,23 @@ function handleUnauth(req: http.IncomingMessage, res: http.ServerResponse): void
     return;
   }
 
+  // Generate CSRF state: 16 random bytes as base64url
+  const state = randomBytes(16)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+
   const rawPath = (req.url ?? '/');
   const returnParam = encodeURIComponent(rawPath);
-  const loginUrl = `${config.LOGIN_URL}?app=${encodeURIComponent(config.APP_ID)}&return=${returnParam}`;
-  send302(res, loginUrl);
+  const loginUrl =
+    `${config.LOGIN_URL}?app=${encodeURIComponent(config.APP_ID)}` +
+    `&return=${returnParam}&state=${encodeURIComponent(state)}`;
+
+  const stateCookie =
+    `__ssc_state=${state}; Path=/__ssc/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`;
+
+  send302(res, loginUrl, { 'Set-Cookie': stateCookie });
 }
 
 // ── Reserved path handlers ────────────────────────────────────────────────────
@@ -172,12 +238,40 @@ async function handleCallback(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://localhost`);
-  const code = url.searchParams.get('code');
-  const returnPath = safeReturnPath(url.searchParams.get('return'));
+  const rawUrl = req.url ?? '/';
+  const qs = getSearch(rawUrl);
+  const params = new URLSearchParams(qs.startsWith('?') ? qs.slice(1) : qs);
+  const code = params.get('code');
+  const returnPath = safeReturnPath(params.get('return'));
+  const stateParam = params.get('state') ?? '';
+
+  // Always expire the state cookie, whatever the outcome
+  const expireState = EXPIRED_STATE_COOKIE;
 
   if (!code) {
-    sendHtml(res, 401, '<h1>401 Unauthorized</h1>');
+    sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
+    return;
+  }
+
+  // Verify CSRF state: must match __ssc_state cookie
+  const cookies = parseCookies(req.headers.cookie);
+  const stateCookie = cookies.get('__ssc_state') ?? '';
+
+  if (!stateParam || !stateCookie) {
+    sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
+    return;
+  }
+
+  // Constant-time comparison (pad to equal length)
+  const a = Buffer.from(stateParam);
+  const b = Buffer.from(stateCookie);
+  const maxLen = Math.max(a.length, b.length);
+  const aPadded = Buffer.concat([a, Buffer.alloc(maxLen - a.length)]);
+  const bPadded = Buffer.concat([b, Buffer.alloc(maxLen - b.length)]);
+  const stateOk = a.length === b.length && timingSafeEqual(aPadded, bPadded);
+
+  if (!stateOk) {
+    sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
     return;
   }
 
@@ -185,27 +279,29 @@ async function handleCallback(
     const result = await apiPost(
       `${config.API_URL}/v1/proxy/exchange`,
       config.PROXY_TOKEN,
-      { code },
+      { code, state: stateParam },
     );
 
     if (result.status !== 200) {
-      sendHtml(res, 401, '<h1>401 Unauthorized</h1>');
+      sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
       return;
     }
 
     const body = result.body as { user_id?: string; email?: string };
     if (!body.user_id || !body.email) {
-      sendHtml(res, 401, '<h1>401 Unauthorized</h1>');
+      sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
       return;
     }
 
     const sessionId = sessions.create(body.user_id, body.email);
-    const cookie =
+    const sessionCookie =
       `__ssc_session=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Lax; ` +
       `Max-Age=${config.SESSION_TTL_SECONDS}`;
-    send302(res, returnPath, { 'Set-Cookie': cookie });
+
+    // Set both cookies: expire state, set session
+    send302(res, returnPath, { 'Set-Cookie': [expireState, sessionCookie] });
   } catch {
-    sendHtml(res, 401, '<h1>401 Unauthorized</h1>');
+    sendHtml(res, 401, '<h1>401 Unauthorized</h1>', { 'Set-Cookie': expireState });
   }
 }
 
@@ -223,10 +319,13 @@ function buildForwardHeaders(
   userId: string,
   email: string,
 ): Record<string, string | string[]> {
-  // Copy headers, using lowercase keys
+  const hbh = hopByHopSet(req.headers);
   const out: Record<string, string | string[]> = {};
+
   for (const [k, v] of Object.entries(req.headers)) {
     if (v === undefined) continue;
+    // Drop hop-by-hop (but keep Connection: Upgrade / Upgrade for WebSocket)
+    if (hbh.has(k.toLowerCase())) continue;
     out[k] = v as string | string[];
   }
 
@@ -235,13 +334,15 @@ function buildForwardHeaders(
     if (k.toLowerCase().startsWith('x-ssc-')) delete out[k];
   }
 
-  // Rewrite Cookie: remove __ssc_session
+  // Rewrite Cookie: remove all __ssc_* cookies (proxy namespace)
   const cookieStr = Array.isArray(out.cookie)
     ? out.cookie.join('; ')
     : (out.cookie as string | undefined);
   if (cookieStr) {
     const jar = parseCookies(cookieStr);
-    jar.delete('__ssc_session');
+    for (const name of jar.keys()) {
+      if (name.toLowerCase().startsWith('__ssc_')) jar.delete(name);
+    }
     if (jar.size === 0) {
       delete out.cookie;
     } else {
@@ -258,48 +359,83 @@ function buildForwardHeaders(
   return out;
 }
 
+/** Returns true if a Set-Cookie header value sets a cookie whose name starts with __ssc_. */
+function isSscCookie(setCookieVal: string): boolean {
+  // Cookie name is the part before the first = (leading whitespace trimmed)
+  const eqIdx = setCookieVal.indexOf('=');
+  if (eqIdx < 0) return false;
+  const name = setCookieVal.slice(0, eqIdx).trimStart();
+  return name.toLowerCase().startsWith('__ssc_');
+}
+
+/** Filter response headers: drop hop-by-hop, __ssc_* Set-Cookie values, inject X-SSC-Proxy. */
+function filterResponseHeaders(
+  headers: http.IncomingHttpHeaders,
+): http.OutgoingHttpHeaders {
+  // Build the hop-by-hop set from the app's response Connection header value
+  const appConn = headers.connection;
+  const hbh = new Set(HOP_BY_HOP);
+  if (appConn) {
+    const val = Array.isArray(appConn) ? appConn.join(',') : appConn;
+    for (const name of val.split(',')) {
+      const trimmed = name.trim().toLowerCase();
+      if (trimmed) hbh.add(trimmed);
+    }
+  }
+
+  const out: http.OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    // Drop hop-by-hop headers from the app response (Transfer-Encoding etc.)
+    if (hbh.has(lk)) continue;
+    if (lk === 'set-cookie') {
+      const cookies = Array.isArray(v) ? v : [v as string];
+      const filtered = cookies.filter((c) => !isSscCookie(c));
+      if (filtered.length > 0) out[k] = filtered;
+    } else {
+      out[k] = v;
+    }
+  }
+  out['x-ssc-proxy'] = '1';
+  return out;
+}
+
 function forwardRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   userId: string,
   email: string,
 ): void {
-  const url = new URL(req.url ?? '/', `http://127.0.0.1`);
+  const rawUrl = req.url ?? '/';
   const fwdHeaders = buildForwardHeaders(req, userId, email);
 
   const appReq = http.request(
     {
       hostname: '127.0.0.1',
       port: config.APP_PORT,
-      path: url.pathname + url.search,
+      path: rawUrl,
       method: req.method,
       headers: fwdHeaders,
     },
     (appRes) => {
-      // Build outbound headers: filter Set-Cookie for __ssc_session, inject X-SSC-Proxy
-      const outHeaders: http.OutgoingHttpHeaders = {};
-      for (const [k, v] of Object.entries(appRes.headers)) {
-        if (k.toLowerCase() === 'set-cookie') {
-          const cookies = Array.isArray(v) ? v : [v as string];
-          const filtered = cookies.filter(
-            (c) => !/^__ssc_session\s*=/i.test(c),
-          );
-          if (filtered.length > 0) outHeaders[k] = filtered;
-        } else {
-          outHeaders[k] = v;
-        }
-      }
-      outHeaders['x-ssc-proxy'] = '1';
-
+      const outHeaders = filterResponseHeaders(appRes.headers);
       res.writeHead(appRes.statusCode ?? 502, appRes.statusMessage, outHeaders);
       appRes.pipe(res);
+      appRes.on('error', () => res.destroy());
     },
   );
 
   appReq.on('error', () => {
     if (!res.headersSent) {
       sendHtml(res, 502, '<h1>502 Bad Gateway</h1>');
+    } else {
+      res.destroy();
     }
+  });
+
+  // Propagate client abort to the upstream request
+  req.on('close', () => {
+    if (!req.complete) appReq.destroy();
   });
 
   req.pipe(appReq);
@@ -315,6 +451,9 @@ function tunnelWebSocket(
   email: string,
 ): void {
   const fwdHeaders = buildForwardHeaders(req, userId, email);
+  // For WebSocket, we must keep Connection and Upgrade in the forwarded request
+  fwdHeaders['connection'] = 'Upgrade';
+  fwdHeaders['upgrade'] = req.headers.upgrade ?? 'websocket';
 
   const appSocket = net.createConnection(
     { host: '127.0.0.1', port: config.APP_PORT },
@@ -330,19 +469,66 @@ function tunnelWebSocket(
       upgradeReq += '\r\n';
       appSocket.write(upgradeReq);
       if (head.length > 0) appSocket.write(head);
-      socket.pipe(appSocket);
-      appSocket.pipe(socket);
+
+      // Buffer the app's response head, rewrite it, then pipe the rest
+      let headBuf = Buffer.alloc(0);
+      let headDone = false;
+
+      appSocket.on('data', (chunk: Buffer) => {
+        if (headDone) {
+          socket.write(chunk);
+          return;
+        }
+
+        headBuf = Buffer.concat([headBuf, chunk]);
+        const sep = headBuf.indexOf('\r\n\r\n');
+        if (sep < 0) return; // still accumulating head
+
+        headDone = true;
+        const headStr = headBuf.slice(0, sep).toString('utf8');
+        const rest = headBuf.slice(sep + 4);
+
+        // Rewrite: filter __ssc_* Set-Cookie lines, inject X-SSC-Proxy: 1
+        const lines = headStr.split('\r\n');
+        const rewritten: string[] = [];
+        let hasProxy = false;
+        for (const line of lines) {
+          if (/^set-cookie\s*:/i.test(line)) {
+            // Extract cookie name after "set-cookie:"
+            const val = line.slice(line.indexOf(':') + 1).trimStart();
+            if (isSscCookie(val)) continue;
+          }
+          if (/^x-ssc-proxy\s*:/i.test(line)) {
+            hasProxy = true;
+          }
+          rewritten.push(line);
+        }
+        if (!hasProxy) rewritten.push('X-SSC-Proxy: 1');
+
+        socket.write(rewritten.join('\r\n') + '\r\n\r\n');
+        if (rest.length > 0) socket.write(rest);
+
+        // Now pipe bidirectionally for the data phase
+        appSocket.on('data', (d: Buffer) => socket.write(d));
+      });
+
+      // Cross-close: either side closing closes the other
+      socket.on('data', (d: Buffer) => appSocket.write(d));
     },
   );
 
   appSocket.on('error', () => {
-    socket.write(
-      'HTTP/1.1 502 Bad Gateway\r\nX-SSC-Proxy: 1\r\nContent-Length: 0\r\n\r\n',
-    );
-    socket.destroy();
+    if (!socket.destroyed) {
+      socket.write(
+        'HTTP/1.1 502 Bad Gateway\r\nX-SSC-Proxy: 1\r\nContent-Length: 0\r\n\r\n',
+      );
+      socket.destroy();
+    }
   });
 
-  socket.on('error', () => appSocket.destroy());
+  appSocket.on('close', () => { if (!socket.destroyed) socket.destroy(); });
+  socket.on('error', () => { if (!appSocket.destroyed) appSocket.destroy(); });
+  socket.on('close', () => { if (!appSocket.destroyed) appSocket.destroy(); });
 }
 
 // ── Main request handler ──────────────────────────────────────────────────────
@@ -355,9 +541,15 @@ async function handleRequest(
   const method = req.method ?? 'GET';
   const rawUrl = req.url ?? '/';
 
+  // Reject any request whose URL doesn't start with /
+  if (!rawUrl.startsWith('/')) {
+    sendHtml(res, 400, '<h1>400 Bad Request</h1>');
+    log(method, rawUrl, 400, start);
+    return;
+  }
+
   try {
-    const url = new URL(rawUrl, 'http://localhost');
-    const pathname = url.pathname;
+    const pathname = getPathname(rawUrl);
 
     // ── Reserved /__ssc/* paths ──────────────────────────────────────────────
     if (pathname === '/__ssc/health') {
@@ -468,7 +660,9 @@ async function handleUpgrade(
 
 function log(method: string, path: string, status: number, start: number): void {
   // Scrub anything that looks like a code or session from the logged path
-  const safePath = path.replace(/([?&]code=)[^&]*/gi, '$1[redacted]');
+  const safePath = path
+    .replace(/([?&]code=)[^&]*/gi, '$1[redacted]')
+    .replace(/([?&]state=)[^&]*/gi, '$1[redacted]');
   console.log(`[proxy] ${method} ${safePath} ${status} ${Date.now() - start}ms`);
 }
 
