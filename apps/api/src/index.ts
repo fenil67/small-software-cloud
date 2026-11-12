@@ -52,6 +52,7 @@ import { authRouter } from "./routes/auth";
 import { intakeRouter } from "./routes/intake";
 import { deployStreamRouter } from "./routes/deployStream";
 import { deploymentsRouter } from "./routes/deployments";
+import { proxyRouter } from "./routes/proxy";
 import { startReaper } from "./lib/reaper";
 
 const app = express();
@@ -84,6 +85,7 @@ app.use("/v1/api-keys", apiKeysRouter);
 app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
+app.use("/v1/proxy", proxyRouter);
 
 // ─── 404 fallback ────────────────────────────────────────────────────────────
 app.use((_req, res) => {

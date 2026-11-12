@@ -48,7 +48,7 @@ import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
 import { apiKeysRouter } from "../src/routes/apiKeys";
 import { authRouter } from "../src/routes/auth";
-import { startReaper, reapOrphanedFlyApps } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes } from "../src/lib/reaper";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
 import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/errorHandler";
@@ -208,6 +208,33 @@ flyModule.destroyFlyApp = async (appName: string) => {
   // else: succeed (no-op)
 };
 
+// ── Clerk auth shim ───────────────────────────────────────────────────────────
+// TEST-ONLY: a request header "x-test-clerk-user-id" makes requireAuth treat
+// the request as a Clerk session for that clerk user id.
+// This patch is applied here, before proxy.ts is loaded (via require() below),
+// so the proxy router's /codes route captures the patched function.
+// This header check MUST NOT exist in src/.
+{
+  const _raMod = require("../src/middleware/requireAuth") as {
+    requireAuth: (req: express.Request, res: express.Response, next: express.NextFunction) => void;
+  };
+  const _origRA = _raMod.requireAuth;
+  _raMod.requireAuth = function testRequireAuth(req, res, next) {
+    const h = req.headers["x-test-clerk-user-id"];
+    const clerkUserId = Array.isArray(h) ? h[0] : h;
+    if (typeof clerkUserId === "string" && clerkUserId) {
+      req.sscAuth = { type: "clerk", clerkUserId };
+      next();
+      return;
+    }
+    _origRA(req, res, next);
+  };
+}
+
+// Load proxy router AFTER the requireAuth patch so it captures the patched function.
+// Must use require() here (not import) — import statements are hoisted before this body runs.
+const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
+
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
@@ -303,6 +330,17 @@ app.post("/test/run-reaper", async (_req, res) => {
   }
 });
 
+// POST /test/run-proxy-code-reaper
+// Runs reapExpiredProxyCodes() — used by AB tests to exercise the cleanup path.
+app.post("/test/run-proxy-code-reaper", async (_req, res) => {
+  try {
+    const deleted = await reapExpiredProxyCodes();
+    res.json({ ok: true, deleted });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // GET /test/drain-logs
 // Returns and clears the captured console.error log lines.
 app.get("/test/drain-logs", (_req, res) => {
@@ -328,6 +366,7 @@ app.use("/v1/api-keys", apiKeysRouter);
 app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
+app.use("/v1/proxy", proxyRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 
 // Final error middleware — catches anything forwarded via next(err)

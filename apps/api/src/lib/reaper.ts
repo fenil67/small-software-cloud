@@ -71,6 +71,18 @@ export async function reapOrphanedFlyApps(): Promise<number> {
   return destroyed;
 }
 
+/** Delete proxy_codes rows whose expires_at is more than 1 hour in the past. */
+export async function reapExpiredProxyCodes(): Promise<number> {
+  const { rowCount } = await pool.query(
+    `DELETE FROM proxy_codes WHERE expires_at < now() - INTERVAL '1 hour'`,
+  );
+  const count = rowCount ?? 0;
+  if (count > 0) {
+    console.log(`[reaper] deleted ${count} expired proxy code(s)`);
+  }
+  return count;
+}
+
 export function startReaper(): void {
   reapStalledDeployments().catch((err) =>
     console.error("[reaper] boot run failed:", safeErr(err)),
@@ -78,12 +90,18 @@ export function startReaper(): void {
   reapOrphanedFlyApps().catch((err) =>
     console.error("[reaper] orphan boot run failed:", safeErr(err)),
   );
+  reapExpiredProxyCodes().catch((err) =>
+    console.error("[reaper] proxy-codes boot run failed:", safeErr(err)),
+  );
   setInterval(() => {
     reapStalledDeployments().catch((err) =>
       console.error("[reaper] interval run failed:", safeErr(err)),
     );
     reapOrphanedFlyApps().catch((err) =>
       console.error("[reaper] orphan interval run failed:", safeErr(err)),
+    );
+    reapExpiredProxyCodes().catch((err) =>
+      console.error("[reaper] proxy-codes interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
 }

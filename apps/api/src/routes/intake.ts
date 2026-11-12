@@ -237,6 +237,16 @@ intakeRouter.post(
       throw err;
     }
 
+    // Grant creator access on new-app creation (not on redeployment)
+    if (!existingAppId && userId) {
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id, granted_by)
+         VALUES ($1, $2, NULL)
+         ON CONFLICT DO NOTHING`,
+        [appId, userId],
+      );
+    }
+
     // Kick off deploy in background
     const zipBuffer = req.file.buffer;
     setImmediate(() => {
@@ -317,6 +327,16 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
       return;
     }
     throw err;
+  }
+
+  // Grant creator access on new-app creation (not on redeployment)
+  if (!existingAppId && userId) {
+    await pool.query(
+      `INSERT INTO app_access (app_id, user_id, granted_by)
+       VALUES ($1, $2, NULL)
+       ON CONFLICT DO NOTHING`,
+      [appId, userId],
+    );
   }
 
   // Kick off deploy in background — use the canonical cloneUrl, not raw input

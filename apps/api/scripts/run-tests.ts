@@ -3696,6 +3696,568 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AB: Proxy API");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    // ── AB setup: users, apps, access, proxy credentials ──────────────────────
+    const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
+
+    // User 1 — has access to the proxy app
+    const abClerkUserId1 = "clerk_ab_user_1";
+    const abUser1Row = await pool.query<{ id: string; email: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id, email",
+      [abClerkUserId1, "ab1@test.local", "AB User One"],
+    );
+    const abUserId1 = abUser1Row.rows[0].id;
+    const abUser1Email = abUser1Row.rows[0].email;
+
+    // User 2 — no access to the proxy app (used for 403 no_access check)
+    const abClerkUserId2 = "clerk_ab_user_2";
+    const abUser2Row = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      [abClerkUserId2, "ab2@test.local", "AB User Two"],
+    );
+    const abUserId2 = abUser2Row.rows[0].id;
+
+    // App under orgA with https subdomain
+    const abAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ab-proxy-app', 'ab-proxy-app', 'zip') RETURNING id`,
+      [orgAId, abUserId1],
+    );
+    const abAppId = abAppRow.rows[0].id;
+    await pool.query(
+      "UPDATE apps SET subdomain = $1, fly_app_id = $2 WHERE id = $3",
+      ["https://ab-proxy-app.fly.dev", "ab-proxy-fly", abAppId],
+    );
+
+    // App with no subdomain (for 409 non-https check)
+    const abAppNoSubRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ab-no-sub', 'ab-no-sub', 'zip') RETURNING id`,
+      [orgAId, abUserId1],
+    );
+    const abAppNoSubId = abAppNoSubRow.rows[0].id;
+
+    // grant abUserId1 access to abAppId
+    await pool.query(
+      "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL)",
+      [abAppId, abUserId1],
+    );
+    // grant abUserId1 access to abAppNoSubId too
+    await pool.query(
+      "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL)",
+      [abAppNoSubId, abUserId1],
+    );
+
+    // Issue proxy token for abAppId
+    const proxyToken = await issueProxyToken(abAppId);
+
+    // Collect sensitive values for AB6 log-leak check
+    const abSensitiveValues: string[] = [proxyToken];
+
+    // ── AB1: three tables exist ──────────────────────────────────────────────
+    {
+      const tables = ["app_access", "proxy_codes", "proxy_credentials"];
+      for (const t of tables) {
+        const { rows } = await pool.query<{ exists: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = $1
+           ) AS exists`,
+          [t],
+        );
+        rows[0].exists
+          ? ok(`AB1: table ${t} exists`)
+          : fail(`AB1: table ${t} missing`);
+      }
+    }
+
+    // ── AB2: POST /codes ─────────────────────────────────────────────────────
+    {
+      const abState1 = crypto.randomBytes(16).toString("base64url");
+      abSensitiveValues.push(abState1);
+
+      // Happy path
+      const r = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": abClerkUserId1 },
+        body: { app_id: abAppId, state: abState1 },
+      });
+      r.status === 201
+        ? ok("AB2: /codes happy path → 201")
+        : fail("AB2: /codes happy path should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      let redirectUrl = "";
+      if (r.status === 201) {
+        redirectUrl = (r.body as any).redirect_url ?? "";
+        redirectUrl.startsWith("https://ab-proxy-app.fly.dev/__ssc/callback")
+          ? ok("AB2: redirect_url built from stored subdomain")
+          : fail("AB2: redirect_url wrong", redirectUrl);
+
+        const parsedRedir = new URL(redirectUrl);
+        const code = parsedRedir.searchParams.get("code") ?? "";
+        abSensitiveValues.push(code);
+        const stateInUrl = parsedRedir.searchParams.get("state") ?? "";
+        code.length > 0
+          ? ok("AB2: code present in redirect_url")
+          : fail("AB2: code missing from redirect_url");
+        stateInUrl === abState1
+          ? ok("AB2: state echoed in redirect_url")
+          : fail("AB2: state mismatch", `got ${stateInUrl}`);
+
+        // Stored row should have hash, not plaintext code
+        const { rows: codeRows } = await pool.query<{ code_hash: string }>(
+          "SELECT code_hash FROM proxy_codes WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [abAppId],
+        );
+        const storedHash = codeRows[0]?.code_hash ?? "";
+        const expectedHash = crypto.createHash("sha256").update(code).digest("hex");
+        storedHash === expectedHash
+          ? ok("AB2: DB stores SHA-256 hash, not plaintext code")
+          : fail("AB2: stored hash does not match expected", `stored=${storedHash.slice(0, 16)}…`);
+        !storedHash.includes(code)
+          ? ok("AB2: plaintext code not in DB")
+          : fail("AB2: plaintext code leaked into DB");
+      }
+
+      // return path sanitization — valid return
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r2 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: abAppId, state: st, return: "/dashboard?ref=1" },
+        });
+        if (r2.status === 201) {
+          const redir2 = new URL((r2.body as any).redirect_url);
+          const returnInUrl = redir2.searchParams.get("return") ?? "";
+          returnInUrl === "/dashboard?ref=1"
+            ? ok("AB2: valid return path preserved")
+            : fail("AB2: valid return path not preserved", returnInUrl);
+          abSensitiveValues.push(redir2.searchParams.get("code") ?? "");
+        } else {
+          fail("AB2: return-path test request failed", `${r2.status}`);
+        }
+      }
+
+      // return path sanitization — invalid return (open redirect attempt) → "/"
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r3 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: abAppId, state: st, return: "//evil.com/steal" },
+        });
+        if (r3.status === 201) {
+          const redir3 = new URL((r3.body as any).redirect_url);
+          const returnVal = redir3.searchParams.get("return") ?? "";
+          returnVal === "/"
+            ? ok("AB2: open-redirect return path sanitized to /")
+            : fail("AB2: open-redirect not sanitized", returnVal);
+          abSensitiveValues.push(redir3.searchParams.get("code") ?? "");
+        } else {
+          fail("AB2: open-redirect test request failed", `${r3.status}`);
+        }
+      }
+
+      // 403 no_access — user 2 has no app_access row
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r4 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId2 },
+          body: { app_id: abAppId, state: st },
+        });
+        r4.status === 403 && (r4.body as any).error === "no_access"
+          ? ok("AB2: no_access → 403")
+          : fail("AB2: no_access should 403", `got ${r4.status} ${JSON.stringify(r4.body)}`);
+      }
+
+      // 404 deleted app
+      {
+        const delAppRow = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, owner_id, name, slug, source_type, deleted_at)
+           VALUES ($1, $2, 'ab-del-app', 'ab-del-app', 'zip', now()) RETURNING id`,
+          [orgAId, abUserId1],
+        );
+        const delAppId = delAppRow.rows[0].id;
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r5 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: delAppId, state: st },
+        });
+        r5.status === 404 && (r5.body as any).error === "app_not_found"
+          ? ok("AB2: deleted app → 404")
+          : fail("AB2: deleted app should 404", `got ${r5.status} ${JSON.stringify(r5.body)}`);
+      }
+
+      // 403 clerk_session_required for API-key auth
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r6 = await request("POST", "/v1/proxy/codes", {
+          headers: authHeaders(keyA),
+          body: { app_id: abAppId, state: st },
+        });
+        r6.status === 403 && (r6.body as any).error === "clerk_session_required"
+          ? ok("AB2: API key auth → 403 clerk_session_required")
+          : fail("AB2: API key should get clerk_session_required", `got ${r6.status} ${JSON.stringify(r6.body)}`);
+      }
+
+      // 400 bad state — too short
+      {
+        const r7 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: abAppId, state: "tooshort" },
+        });
+        r7.status === 400 && (r7.body as any).error === "validation_error"
+          ? ok("AB2: short state → 400 validation_error")
+          : fail("AB2: short state should 400", `got ${r7.status} ${JSON.stringify(r7.body)}`);
+      }
+
+      // 400 bad state — invalid chars
+      {
+        const r8 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: abAppId, state: "contains invalid chars!!!!" },
+        });
+        r8.status === 400 && (r8.body as any).error === "validation_error"
+          ? ok("AB2: invalid state chars → 400 validation_error")
+          : fail("AB2: invalid state chars should 400", `got ${r8.status} ${JSON.stringify(r8.body)}`);
+      }
+
+      // 409 non-https subdomain — app with no subdomain set
+      {
+        const st = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(st);
+        const r9 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": abClerkUserId1 },
+          body: { app_id: abAppNoSubId, state: st },
+        });
+        r9.status === 409 && (r9.body as any).error === "app_not_configured"
+          ? ok("AB2: no subdomain → 409 app_not_configured")
+          : fail("AB2: no subdomain should 409", `got ${r9.status} ${JSON.stringify(r9.body)}`);
+      }
+    }
+
+    // ── AB3: POST /exchange ──────────────────────────────────────────────────
+    {
+      // Helper: issue a fresh code and return { code, state }
+      const issueCode = async (clerkUserId: string, appId: string): Promise<{ code: string; state: string }> => {
+        const state = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(state);
+        const r = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": clerkUserId },
+          body: { app_id: appId, state },
+        });
+        if (r.status !== 201) throw new Error(`issueCode failed: ${r.status} ${JSON.stringify(r.body)}`);
+        const redir = new URL((r.body as any).redirect_url);
+        const code = redir.searchParams.get("code") ?? "";
+        abSensitiveValues.push(code);
+        return { code, state };
+      };
+
+      // Valid exchange → 200 with user_id and email, used_at set
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code, state },
+        });
+        r.status === 200
+          ? ok("AB3: valid exchange → 200")
+          : fail("AB3: valid exchange should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+        (r.body as any).user_id === abUserId1
+          ? ok("AB3: exchange returns correct user_id")
+          : fail("AB3: wrong user_id", `got ${(r.body as any).user_id}`);
+        (r.body as any).email === abUser1Email
+          ? ok("AB3: exchange returns correct email")
+          : fail("AB3: wrong email", `got ${(r.body as any).email}`);
+
+        // used_at should be set in DB
+        const { rows: usedRows } = await pool.query<{ used_at: Date | null }>(
+          `SELECT used_at FROM proxy_codes WHERE code_hash = $1`,
+          [crypto.createHash("sha256").update(code).digest("hex")],
+        );
+        usedRows[0]?.used_at !== null
+          ? ok("AB3: used_at set after successful exchange")
+          : fail("AB3: used_at not set after exchange");
+
+        // Reuse same code → 401
+        const r2 = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code, state },
+        });
+        r2.status === 401 && (r2.body as any).error === "invalid_code"
+          ? ok("AB3: reuse of used code → 401 invalid_code")
+          : fail("AB3: reuse should 401", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+      }
+
+      // Wrong state → 401
+      {
+        const { code } = await issueCode(abClerkUserId1, abAppId);
+        const wrongState = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(wrongState);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code, state: wrongState },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_code"
+          ? ok("AB3: wrong state → 401 invalid_code")
+          : fail("AB3: wrong state should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Expired code → 401
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const codeHash = crypto.createHash("sha256").update(code).digest("hex");
+        // Force expires_at to the past
+        await pool.query(
+          "UPDATE proxy_codes SET expires_at = now() - INTERVAL '5 minutes' WHERE code_hash = $1",
+          [codeHash],
+        );
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code, state },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_code"
+          ? ok("AB3: expired code → 401 invalid_code")
+          : fail("AB3: expired code should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Cross-app token: issue code for abAppId but exchange with a token for a different app
+      {
+        const appBRow = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+           VALUES ($1, $2, 'ab-app-b', 'ab-app-b', 'zip') RETURNING id`,
+          [orgAId, abUserId1],
+        );
+        const abAppBId = appBRow.rows[0].id;
+        await pool.query(
+          "UPDATE apps SET subdomain = $1 WHERE id = $2",
+          ["https://ab-app-b.fly.dev", abAppBId],
+        );
+        await pool.query(
+          "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL)",
+          [abAppBId, abUserId1],
+        );
+        const proxyTokenB = await issueProxyToken(abAppBId);
+        abSensitiveValues.push(proxyTokenB);
+
+        // Issue code for appA, try to exchange with appB's token
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyTokenB}` },
+          body: { code, state },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_code"
+          ? ok("AB3: cross-app token → 401 invalid_code")
+          : fail("AB3: cross-app token should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Unknown code → 401
+      {
+        const fakeCode = crypto.randomBytes(32).toString("base64url");
+        const fakeState = crypto.randomBytes(16).toString("base64url");
+        abSensitiveValues.push(fakeCode, fakeState);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code: fakeCode, state: fakeState },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_code"
+          ? ok("AB3: unknown code → 401 invalid_code")
+          : fail("AB3: unknown code should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Non-sscp_ token → 401
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: "Bearer not_a_proxy_token_at_all" },
+          body: { code, state },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_proxy_token"
+          ? ok("AB3: non-sscp_ token → 401 invalid_proxy_token")
+          : fail("AB3: non-sscp_ token should 401 invalid_proxy_token", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // API key instead of proxy token → 401 invalid_proxy_token
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: authHeaders(keyA),
+          body: { code, state },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_proxy_token"
+          ? ok("AB3: API key on /exchange → 401 invalid_proxy_token")
+          : fail("AB3: API key on /exchange should 401 invalid_proxy_token", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Access removed after code issued → 401
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        await pool.query(
+          "DELETE FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [abAppId, abUserId1],
+        );
+        const r = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+          body: { code, state },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_code"
+          ? ok("AB3: access removed after code issued → 401")
+          : fail("AB3: revoked access should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+        // Restore access for subsequent tests
+        await pool.query(
+          "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING",
+          [abAppId, abUserId1],
+        );
+      }
+
+      // Concurrent exchange — exactly one 200, one 401
+      {
+        const { code, state } = await issueCode(abClerkUserId1, abAppId);
+        const [r1, r2] = await Promise.all([
+          request("POST", "/v1/proxy/exchange", {
+            headers: { Authorization: `Bearer ${proxyToken}` },
+            body: { code, state },
+          }),
+          request("POST", "/v1/proxy/exchange", {
+            headers: { Authorization: `Bearer ${proxyToken}` },
+            body: { code, state },
+          }),
+        ]);
+        const statuses = [r1.status, r2.status].sort();
+        statuses[0] === 200 && statuses[1] === 401
+          ? ok("AB3: concurrent exchange — exactly one 200 and one 401")
+          : fail("AB3: concurrent exchange should give one 200 and one 401", `got ${r1.status} and ${r2.status}`);
+      }
+    }
+
+    // ── AB4: GET /access ─────────────────────────────────────────────────────
+    {
+      // True: user has app_access
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${abUserId1}`, {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+        });
+        r.status === 200 && (r.body as any).allowed === true
+          ? ok("AB4: /access → true for user with access")
+          : fail("AB4: /access should return allowed=true", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // False: user 2 has no app_access
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${abUserId2}`, {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+        });
+        r.status === 200 && (r.body as any).allowed === false
+          ? ok("AB4: /access → false for user without access")
+          : fail("AB4: /access should return allowed=false", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Non-UUID user_id → 200 { allowed: false } (no DB error)
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=not-a-uuid`, {
+          headers: { Authorization: `Bearer ${proxyToken}` },
+        });
+        r.status === 200 && (r.body as any).allowed === false
+          ? ok("AB4: /access with non-UUID user_id → 200 allowed=false")
+          : fail("AB4: non-UUID user_id should return allowed=false", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Unknown/invalid proxy token → 401
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${abUserId1}`, {
+          headers: { Authorization: "Bearer not-a-proxy-token" },
+        });
+        r.status === 401 && (r.body as any).error === "invalid_proxy_token"
+          ? ok("AB4: /access with unknown token → 401 invalid_proxy_token")
+          : fail("AB4: unknown token should 401", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+    // ── AB5: intake with API key having created_by adds app_access ───────────
+    {
+      // Create an API key where created_by = abUserId1
+      const { generateApiKey } = require("../src/lib/apiKeys") as typeof import("../src/lib/apiKeys");
+      const { fullKey: ab5Key, keyPrefix: ab5Prefix, keyHash: ab5Hash } = generateApiKey();
+      await pool.query(
+        `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash)
+         VALUES ($1, $2, 'AB5 Key', $3, $4)`,
+        [orgAId, abUserId1, ab5Prefix, ab5Hash],
+      );
+
+      const zip = await buildZip({ "index.js": "// ab5 app", "package.json": '{"name":"ab5"}' });
+      const form = new FormData();
+      form.append("code", zip, { filename: "ab5.zip", contentType: "application/zip" });
+      form.append("app_name", "ab5-access-test");
+
+      const r = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(ab5Key),
+        formData: form,
+      });
+      r.status === 202
+        ? ok("AB5: intake with API key → 202")
+        : fail("AB5: intake should 202", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      if (r.status === 202) {
+        const ab5AppId = (r.body as any).app_id ?? "";
+        // Wait briefly for setImmediate in intake to run
+        await new Promise((res) => setTimeout(res, 150));
+        const { rows } = await pool.query(
+          "SELECT 1 FROM app_access WHERE app_id = $1 AND user_id = $2",
+          [ab5AppId, abUserId1],
+        );
+        rows.length > 0
+          ? ok("AB5: creator's app_access row inserted by intake")
+          : fail("AB5: app_access row missing for creator");
+      }
+    }
+
+    // ── AB6: drain-logs contains no proxy token or state values ──────────────
+    {
+      const logsResp = await request("GET", "/test/drain-logs");
+      const logs: string[] = (logsResp.body as any).logs ?? [];
+      const joined = logs.join("\n");
+
+      let leaked = false;
+      for (const secret of abSensitiveValues) {
+        if (secret && joined.includes(secret)) {
+          fail("AB6: sensitive value leaked into error logs", `value: ${secret.slice(0, 20)}…`);
+          leaked = true;
+        }
+      }
+      if (!leaked) {
+        ok("AB6: no proxy tokens, codes, or states appear in error logs");
+      }
+    }
+
+    // ── AB7: static guard — no src file contains x-test-clerk-user-id ────────
+    {
+      const srcDir = path.join(__dirname, "../src");
+      function walkFiles(dir: string): string[] {
+        const result: string[] = [];
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) result.push(...walkFiles(full));
+          else if (entry.isFile()) result.push(full);
+        }
+        return result;
+      }
+      const srcFiles = walkFiles(srcDir);
+      const offenders = srcFiles.filter((f) =>
+        fs.readFileSync(f, "utf8").includes("x-test-clerk-user-id"),
+      );
+      offenders.length === 0
+        ? ok("AB7: no src file contains 'x-test-clerk-user-id'")
+        : fail("AB7: test-only header found in src", offenders.join(", "));
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
