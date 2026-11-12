@@ -151,9 +151,16 @@ export class FakeAppServer {
         `\r\n`,
       );
       // Echo each received frame back unmasked
+      let wsBuf = Buffer.alloc(0);
       socket.on('data', (data: Buffer) => {
-        const frame = parseWsFrame(data);
-        if (frame) {
+        wsBuf = Buffer.concat([wsBuf, data]);
+        while (true) {
+          const frame = parseWsFrame(wsBuf);
+          if (!frame) break;
+          const lenByte = wsBuf[1] & 0x7f;
+          const hdr = lenByte === 126 ? 4 : lenByte === 127 ? 10 : 2;
+          const maskLen = (wsBuf[1] & 0x80) !== 0 ? 4 : 0;
+          wsBuf = wsBuf.slice(hdr + maskLen + frame.payload.length);
           socket.write(buildWsFrame(frame.payload));
         }
       });
@@ -220,7 +227,7 @@ export class FakeAppServer {
 
 // ── WebSocket helpers ─────────────────────────────────────────────────────────
 
-function wsAccept(key: string): string {
+export function wsAccept(key: string): string {
   // The key needs to be combined with the magic string and SHA-1'd.
   // We use node:crypto for this.
   const { createHash } = require('node:crypto') as typeof import('node:crypto');

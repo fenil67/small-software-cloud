@@ -11,7 +11,9 @@ import {
   httpRequest,
   sleep,
   buildClientWsFrame,
+  buildWsFrame,
   parseWsFrame,
+  wsAccept,
 } from './helpers';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -861,5 +863,286 @@ describe('path parsing', () => {
     const res = await httpRequest({ url: `${proxyUrl}/__ssc/health?foo=bar` });
     assert.equal(res.status, 200);
     assert.equal(res.body, 'ok');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. WebSocket tunnel correctness
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('WebSocket tunnel correctness', () => {
+  // ── 15a. Exactly-once forwarding ───────────────────────────────────────────
+  //
+  // The client sends 3 distinct messages to the echoing fake app and must
+  // receive exactly those 3 echoes, in order, with nothing extra within 1
+  // second after the third echo arrives.
+
+  it('each message is echoed exactly once (no duplication)', async () => {
+    const sid = await getSession();
+    const messages = ['alpha', 'beta', 'gamma'];
+
+    const received = await new Promise<string[]>((resolve, reject) => {
+      const sock = net.createConnection(proxy.port, '127.0.0.1', () => {
+        sock.write(
+          `GET /ws HTTP/1.1\r\n` +
+          `Host: 127.0.0.1\r\n` +
+          `Upgrade: websocket\r\n` +
+          `Connection: Upgrade\r\n` +
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
+          `Sec-WebSocket-Version: 13\r\n` +
+          `Cookie: __ssc_session=${sid}\r\n` +
+          `\r\n`,
+        );
+      });
+
+      let upgraded = false;
+      let sentCount = 0;
+      const frames: string[] = [];
+      let buf = Buffer.alloc(0);
+      let doneTimer: ReturnType<typeof setTimeout> | null = null;
+
+      sock.on('data', (d: Buffer) => {
+        if (!upgraded) {
+          const str = d.toString();
+          if (str.includes('101')) {
+            upgraded = true;
+            // Send all 3 messages back-to-back
+            for (const msg of messages) {
+              sock.write(buildClientWsFrame(msg));
+              sentCount++;
+            }
+          }
+          return;
+        }
+
+        // Accumulate and parse frames
+        buf = Buffer.concat([buf, d]);
+        while (true) {
+          const frame = parseWsFrame(buf);
+          if (!frame) break;
+          frames.push(frame.payload.toString('utf8'));
+          // Consume the bytes that make up this frame
+          const headerLen = buf[1] & 0x7f;
+          let headerBytes = 2;
+          if (headerLen === 126) headerBytes = 4;
+          else if (headerLen === 127) headerBytes = 10;
+          const masked = (buf[1] & 0x80) !== 0;
+          buf = buf.slice(headerBytes + (masked ? 4 : 0) + frame.payload.length);
+
+          if (frames.length === sentCount) {
+            // Start a 1-second wait to catch any duplicate frames
+            if (doneTimer) clearTimeout(doneTimer);
+            doneTimer = setTimeout(() => {
+              sock.destroy();
+              resolve(frames);
+            }, 1000);
+          }
+        }
+      });
+
+      sock.on('error', reject);
+      sock.setTimeout(10000, () => { sock.destroy(); reject(new Error('ws exactly-once timeout')); });
+    });
+
+    assert.deepEqual(received, messages, `expected ${JSON.stringify(messages)}, got ${JSON.stringify(received)}`);
+  });
+
+  // ── 15b. Server push ───────────────────────────────────────────────────────
+  //
+  // The fake upstream sends msg1 in the same TCP write as the 101 head, and
+  // msg2 in a separate later write.  The client must receive each exactly once.
+
+  it('server-push frames coalesced with 101 head and later are each delivered once', async () => {
+    // Build a raw TCP server that acts as the WebSocket app
+    const pushMsg1 = 'push-one';
+    const pushMsg2 = 'push-two';
+
+    const appServer = net.createServer((conn) => {
+      let reqBuf = '';
+      conn.on('data', (d: Buffer) => {
+        reqBuf += d.toString();
+        if (!reqBuf.includes('\r\n\r\n')) return;
+
+        // Extract Sec-WebSocket-Key
+        const m = /sec-websocket-key:\s*(\S+)/i.exec(reqBuf);
+        const accept = m ? wsAccept(m[1]) : '';
+
+        // 101 head + first push frame, all in one write
+        const frame1 = buildWsFrame(pushMsg1);
+        const head =
+          `HTTP/1.1 101 Switching Protocols\r\n` +
+          `Upgrade: websocket\r\n` +
+          `Connection: Upgrade\r\n` +
+          `Sec-WebSocket-Accept: ${accept}\r\n` +
+          `\r\n`;
+        conn.write(Buffer.concat([Buffer.from(head), frame1]));
+
+        // Second push frame in a separate write after a short delay
+        setTimeout(() => {
+          if (!conn.destroyed) conn.write(buildWsFrame(pushMsg2));
+        }, 50);
+      });
+      conn.on('error', () => { /* ignore */ });
+    });
+
+    const appPort = await getFreePort();
+    await new Promise<void>((r) => appServer.listen(appPort, '127.0.0.1', r));
+
+    const pushApi = new FakeApiServer();
+    await pushApi.start();
+    const pushPort = await getFreePort();
+    const pushProxy = await startProxy({
+      SSC_APP_ID: APP_ID,
+      SSC_API_URL: `http://127.0.0.1:${pushApi.port}`,
+      SSC_PROXY_TOKEN: PROXY_TOKEN,
+      SSC_LOGIN_URL: `http://127.0.0.1:${pushApi.port}/login`,
+      LISTEN_PORT: String(pushPort),
+      APP_PORT: String(appPort),
+      SESSION_TTL_SECONDS: '3600',
+      ACCESS_CACHE_SECONDS: '60',
+    });
+
+    try {
+      const sid = await getSession('push-sess', `http://127.0.0.1:${pushPort}`);
+
+      const received = await new Promise<string[]>((resolve, reject) => {
+        const sock = net.createConnection(pushPort, '127.0.0.1', () => {
+          sock.write(
+            `GET /ws HTTP/1.1\r\n` +
+            `Host: 127.0.0.1\r\n` +
+            `Upgrade: websocket\r\n` +
+            `Connection: Upgrade\r\n` +
+            `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
+            `Sec-WebSocket-Version: 13\r\n` +
+            `Cookie: __ssc_session=${sid}\r\n` +
+            `\r\n`,
+          );
+        });
+
+        let upgraded = false;
+        const frames: string[] = [];
+        let buf = Buffer.alloc(0);
+        let doneTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const tryFlush = () => {
+          while (true) {
+            const frame = parseWsFrame(buf);
+            if (!frame) break;
+            frames.push(frame.payload.toString('utf8'));
+            const headerLen = buf[1] & 0x7f;
+            let headerBytes = 2;
+            if (headerLen === 126) headerBytes = 4;
+            else if (headerLen === 127) headerBytes = 10;
+            const masked = (buf[1] & 0x80) !== 0;
+            buf = buf.slice(headerBytes + (masked ? 4 : 0) + frame.payload.length);
+
+            if (frames.length >= 2) {
+              // 1-second silence window to catch any duplicates
+              if (doneTimer) clearTimeout(doneTimer);
+              doneTimer = setTimeout(() => { sock.destroy(); resolve(frames); }, 1000);
+            }
+          }
+        };
+
+        sock.on('data', (d: Buffer) => {
+          if (!upgraded) {
+            const str = d.toString();
+            if (str.includes('101')) {
+              upgraded = true;
+              // The 101 response may contain frame bytes after the head
+              const sepIdx = d.indexOf('\r\n\r\n');
+              if (sepIdx >= 0) {
+                const after = d.slice(sepIdx + 4);
+                if (after.length > 0) { buf = Buffer.concat([buf, after]); tryFlush(); }
+              }
+            }
+            return;
+          }
+          buf = Buffer.concat([buf, d]);
+          tryFlush();
+        });
+
+        sock.on('error', reject);
+        sock.setTimeout(8000, () => { sock.destroy(); reject(new Error('server-push timeout')); });
+      });
+
+      assert.deepEqual(received, [pushMsg1, pushMsg2],
+        `expected [${pushMsg1}, ${pushMsg2}], got ${JSON.stringify(received)}`);
+    } finally {
+      await pushProxy.stop();
+      await pushApi.stop();
+      await new Promise<void>((r) => appServer.close(() => r()));
+    }
+  });
+
+  // ── 15c. Oversized head ────────────────────────────────────────────────────
+  //
+  // A fake upstream sends 20 KiB of header bytes with no \r\n\r\n terminator.
+  // The client's connection must be closed within 5 seconds, and the proxy
+  // must stay alive (health check still returns 200 afterwards).
+
+  it('oversized response head closes client connection; proxy stays healthy', async () => {
+    // Raw TCP server: accepts the upgrade request then sends 20 KiB of junk
+    const bigServer = net.createServer((conn) => {
+      let reqBuf = '';
+      conn.on('data', (d: Buffer) => {
+        reqBuf += d.toString();
+        if (!reqBuf.includes('\r\n\r\n')) return;
+        // Send 20 KiB with no \r\n\r\n — deliberately exceeds the 16 KiB limit
+        const junk = Buffer.alloc(20 * 1024, 0x41); // 'A' × 20480
+        conn.write(junk);
+      });
+      conn.on('error', () => { /* ignore */ });
+    });
+
+    const bigAppPort = await getFreePort();
+    await new Promise<void>((r) => bigServer.listen(bigAppPort, '127.0.0.1', r));
+
+    const bigApi = new FakeApiServer();
+    await bigApi.start();
+    const bigProxyPort = await getFreePort();
+    const bigProxy = await startProxy({
+      SSC_APP_ID: APP_ID,
+      SSC_API_URL: `http://127.0.0.1:${bigApi.port}`,
+      SSC_PROXY_TOKEN: PROXY_TOKEN,
+      SSC_LOGIN_URL: `http://127.0.0.1:${bigApi.port}/login`,
+      LISTEN_PORT: String(bigProxyPort),
+      APP_PORT: String(bigAppPort),
+      SESSION_TTL_SECONDS: '3600',
+      ACCESS_CACHE_SECONDS: '60',
+    });
+
+    try {
+      const sid = await getSession('big-sess', `http://127.0.0.1:${bigProxyPort}`);
+
+      // Connect to proxy via WebSocket upgrade; expect connection to be closed
+      const closed = await new Promise<boolean>((resolve, reject) => {
+        const sock = net.createConnection(bigProxyPort, '127.0.0.1', () => {
+          sock.write(
+            `GET /ws HTTP/1.1\r\n` +
+            `Host: 127.0.0.1\r\n` +
+            `Upgrade: websocket\r\n` +
+            `Connection: Upgrade\r\n` +
+            `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
+            `Sec-WebSocket-Version: 13\r\n` +
+            `Cookie: __ssc_session=${sid}\r\n` +
+            `\r\n`,
+          );
+        });
+        sock.on('close', () => resolve(true));
+        sock.on('error', () => resolve(true)); // also counts as closed
+        sock.setTimeout(5000, () => { sock.destroy(); reject(new Error('oversized-head: client not closed within 5s')); });
+      });
+
+      assert.ok(closed, 'client connection should have been closed');
+
+      // Proxy must still be alive
+      const health = await httpRequest({ url: `http://127.0.0.1:${bigProxyPort}/__ssc/health` });
+      assert.equal(health.status, 200, 'proxy should still be healthy after oversized head');
+    } finally {
+      await bigProxy.stop();
+      await bigApi.stop();
+      await new Promise<void>((r) => bigServer.close(() => r()));
+    }
   });
 });

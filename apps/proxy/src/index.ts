@@ -482,7 +482,7 @@ function tunnelWebSocket(
 
         headBuf = Buffer.concat([headBuf, chunk]);
         const sep = headBuf.indexOf('\r\n\r\n');
-        if (sep < 0) return; // still accumulating head
+        if (sep < 0) { if (headBuf.length > 16 * 1024) { socket.destroy(); appSocket.destroy(); } return; }
 
         headDone = true;
         const headStr = headBuf.slice(0, sep).toString('utf8');
@@ -507,9 +507,6 @@ function tunnelWebSocket(
 
         socket.write(rewritten.join('\r\n') + '\r\n\r\n');
         if (rest.length > 0) socket.write(rest);
-
-        // Now pipe bidirectionally for the data phase
-        appSocket.on('data', (d: Buffer) => socket.write(d));
       });
 
       // Cross-close: either side closing closes the other
