@@ -3521,6 +3521,181 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section AA — config.ts: DEFAULT_API_URL, precedence, URL validation
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("AA: DEFAULT_API_URL · config precedence · URL validation · ssc login");
+
+    const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
+    // Shared script: requires config.ts directly (HOME is set via env in each spawn)
+    const aaScript = path.join(__dirname, "_aa_config_tmp.ts");
+    fs.writeFileSync(
+      aaScript,
+      `import { resolveConfig } from "../../../packages/client/src/config";\n` +
+      `try {\n` +
+      `  const { apiUrl } = resolveConfig();\n` +
+      `  process.stdout.write(JSON.stringify({ ok: true, apiUrl }) + "\\n");\n` +
+      `} catch (e) {\n` +
+      `  process.stdout.write(JSON.stringify({ ok: false, error: String(e) }) + "\\n");\n` +
+      `}\n`,
+    );
+
+    type AaResult = { ok: boolean; apiUrl?: string; error?: string };
+
+    async function spawnConfig(
+      tmpHome: string,
+      extraEnv: Record<string, string | undefined> = {},
+    ): Promise<AaResult> {
+      return new Promise((resolve) => {
+        const childEnv: NodeJS.ProcessEnv = { ...process.env, HOME: tmpHome };
+        delete childEnv.SSC_API_URL;
+        delete childEnv.SSC_API_KEY;
+        Object.assign(childEnv, extraEnv);
+        const child = require("child_process").spawn(tsx, [aaScript], {
+          cwd: __dirname,
+          env: childEnv,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        child.stdout.on("data", (d: Buffer) => { out += d.toString(); });
+        child.stderr.on("data", (d: Buffer) => { out += d.toString(); });
+        child.on("close", () => {
+          try { resolve(JSON.parse(out.trim().split("\n").find(l => l.startsWith("{")) ?? "{}")); }
+          catch { resolve({ ok: false, error: out }); }
+        });
+      });
+    }
+
+    try {
+      // ── AA1: no env, no config file → DEFAULT_API_URL ───────────────────────
+      {
+        const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-aa1-"));
+        try {
+          const r = await spawnConfig(tmpHome);
+          r.ok && r.apiUrl === "https://api.utir.dev"
+            ? ok("AA1: no env + no config → DEFAULT_API_URL (https://api.utir.dev)")
+            : fail("AA1: expected DEFAULT_API_URL", JSON.stringify(r));
+        } finally {
+          fs.rmSync(tmpHome, { recursive: true, force: true });
+        }
+      }
+
+      // ── AA2: precedence ──────────────────────────────────────────────────────
+      {
+        const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-aa2-"));
+        try {
+          const cfgDir = path.join(tmpHome, ".config", "ssc");
+          fs.mkdirSync(cfgDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(cfgDir, "config.json"),
+            JSON.stringify({ api_url: "https://from-config.example.com" }) + "\n",
+            { mode: 0o600 },
+          );
+
+          // AA2a: config file overrides default (no SSC_API_URL)
+          const r2a = await spawnConfig(tmpHome);
+          r2a.ok && r2a.apiUrl === "https://from-config.example.com"
+            ? ok("AA2a: config file api_url overrides DEFAULT_API_URL")
+            : fail("AA2a: config file should override default", JSON.stringify(r2a));
+
+          // AA2b: SSC_API_URL env overrides config file
+          const r2b = await spawnConfig(tmpHome, { SSC_API_URL: "https://from-env.example.com" });
+          r2b.ok && r2b.apiUrl === "https://from-env.example.com"
+            ? ok("AA2b: SSC_API_URL env overrides config file api_url")
+            : fail("AA2b: SSC_API_URL should override config file", JSON.stringify(r2b));
+        } finally {
+          fs.rmSync(tmpHome, { recursive: true, force: true });
+        }
+      }
+
+      // ── AA3: local http allowed by validateApiUrl ────────────────────────────
+      {
+        const { validateApiUrl } = require("../../../packages/client/src/config") as {
+          validateApiUrl: (url: string) => void;
+        };
+
+        let aa3aOk = true;
+        try { validateApiUrl("http://localhost:4099"); } catch { aa3aOk = false; }
+        aa3aOk
+          ? ok("AA3: http://localhost:4099 is accepted (local dev)")
+          : fail("AA3: http://localhost:4099 should be accepted");
+
+        let aa3bOk = true;
+        try { validateApiUrl("http://127.0.0.1:4099"); } catch { aa3bOk = false; }
+        aa3bOk
+          ? ok("AA3: http://127.0.0.1:4099 is accepted (local dev)")
+          : fail("AA3: http://127.0.0.1:4099 should be accepted");
+      }
+
+      // ── AA4: invalid URLs rejected; no error leaks API key ───────────────────
+      {
+        const { validateApiUrl } = require("../../../packages/client/src/config") as {
+          validateApiUrl: (url: string) => void;
+        };
+
+        // keyA is used to verify no error message leaks the test API key value
+        const badCases: Array<{ url: string; label: string }> = [
+          { url: "http://api.utir.dev",              label: "http with non-local host" },
+          { url: "http://example.com",               label: "http with non-local host (example.com)" },
+          { url: "https://user:pass@api.utir.dev",   label: "https with embedded credentials" },
+          { url: "not-a-url",                        label: "non-URL string" },
+        ];
+
+        for (const { url, label } of badCases) {
+          let threw = false;
+          let errMsg = "";
+          try { validateApiUrl(url); } catch (e) { threw = true; errMsg = e instanceof Error ? e.message : String(e); }
+          threw
+            ? ok(`AA4: ${label} → throws`)
+            : fail(`AA4: ${label} should throw`);
+          !errMsg.includes(keyA)
+            ? ok(`AA4: error for ${label} does not contain API key`)
+            : fail(`AA4: error for ${label} leaks API key`, errMsg.slice(0, 200));
+        }
+      }
+
+      // ── AA5: ssc login still saves api_url when SSC_API_URL is set ──────────
+      {
+        const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-aa5-"));
+        try {
+          const cliPath = path.join(__dirname, "../../../packages/cli/src/index.ts");
+          const aa5Result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+            const child = require("child_process").spawn(tsx, [cliPath, "login"], {
+              env: { ...process.env, HOME: tmpHome, SSC_API_URL: BASE_URL },
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            let stdout = "";
+            let stderr = "";
+            child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+            child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+            child.on("close", (code: number) => resolve({ code: code ?? 1, stdout, stderr }));
+            child.stdin!.write(keyA + "\n");
+            child.stdin!.end();
+          });
+
+          aa5Result.code === 0
+            ? ok("AA5: ssc login exits 0 without requiring SSC_API_URL explicitly")
+            : fail("AA5: ssc login should exit 0", `code=${aa5Result.code} stderr=${aa5Result.stderr.slice(0, 300)}`);
+
+          const cfgPath = path.join(tmpHome, ".config", "ssc", "config.json");
+          if (fs.existsSync(cfgPath)) {
+            const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+            cfg.api_url === BASE_URL
+              ? ok(`AA5: config file api_url === BASE_URL (${BASE_URL})`)
+              : fail("AA5: config file api_url should equal BASE_URL", JSON.stringify(cfg.api_url));
+          } else {
+            fail("AA5: config file not created by ssc login", cfgPath);
+          }
+        } finally {
+          fs.rmSync(tmpHome, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(aaScript); } catch {}
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

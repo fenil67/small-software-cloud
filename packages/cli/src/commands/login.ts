@@ -1,5 +1,5 @@
 import readline from "readline";
-import { SscClient, writeConfigFile } from "@ssc/client";
+import { SscClient, writeConfigFile, resolveConfig } from "@ssc/client";
 
 /**
  * Read the API key from the user.
@@ -64,12 +64,14 @@ export async function login(): Promise<void> {
     process.exit(1);
   }
 
-  const apiUrl = process.env.SSC_API_URL;
-  if (!apiUrl) {
-    console.error(
-      "Error: SSC_API_URL is not set. " +
-        "Set SSC_API_URL to the SSC server URL before running ssc login.",
-    );
+  // Resolve the API URL using the same precedence as all other commands:
+  // SSC_API_URL env var > config file api_url > DEFAULT_API_URL.
+  // SSC_API_URL is no longer required; the default is used when nothing is set.
+  let apiUrl: string;
+  try {
+    ({ apiUrl } = resolveConfig());
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
 
