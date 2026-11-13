@@ -5457,6 +5457,10 @@ async function main(): Promise<void> {
     }
 
     // ── AE4: proxy token security — token in stdin, not in argv ───────────────
+    // WHY THE OLD TEST WAS BLIND: the fake flyctl script wrote argv with ">" (overwrite),
+    // so a deploy sequence (secrets import → flyctl deploy) left only the deploy call's
+    // argv in the file.  The secrets call's argv was gone by the time the test read it,
+    // so token leakage there would have been invisible.
     {
       await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
       await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
@@ -5470,20 +5474,33 @@ async function main(): Promise<void> {
         ? ok("AE4: deploy succeeded")
         : fail("AE4: deploy should succeed", `stage=${ae4Poll.failure_stage} msg=${ae4Poll.failure_message}`);
 
-      const capture = await request("GET", "/test/get-flyctl-capture");
-      const { argv, stdin } = capture.body as { argv: string; stdin: string };
+      // get-flyctl-calls returns ALL invocations since the last clear
+      const capture = await request("GET", "/test/get-flyctl-calls");
+      const { calls, stdin } = capture.body as { calls: string[]; stdin: string };
 
-      // argv of the most recent flyctl call should NOT contain the token
-      const tokenInArgv = argv.includes("sscp_") || argv.includes("SSC_PROXY_TOKEN");
-      !tokenInArgv
-        ? ok("AE4: proxy token NOT in flyctl argv")
-        : fail("AE4: proxy token must not appear in flyctl argv", argv.slice(0, 100));
+      // (a) exactly one "secrets import" call
+      const secretsCalls = calls.filter((a) => a.startsWith("secrets "));
+      secretsCalls.length === 1
+        ? ok("AE4: exactly one 'secrets import' call")
+        : fail("AE4: expected exactly one secrets call", `got ${secretsCalls.length}: ${JSON.stringify(calls)}`);
 
-      // stdin should contain the token assignment
-      const tokenInStdin = stdin.includes("SSC_PROXY_TOKEN=sscp_");
-      tokenInStdin
+      // (b) stdin of that call contains the proxy token prefix
+      stdin.includes("SSC_PROXY_TOKEN=sscp_")
         ? ok("AE4: proxy token delivered via stdin (SSC_PROXY_TOKEN=sscp_...)")
         : fail("AE4: proxy token missing from flyctl stdin", stdin.slice(0, 100));
+
+      // (c) NO call's argv — across ALL invocations — contains the token
+      const leakyCall = calls.find((a) => a.includes("sscp_") || a.includes("SSC_PROXY_TOKEN"));
+      leakyCall === undefined
+        ? ok("AE4: proxy token NOT in any flyctl argv")
+        : fail("AE4: proxy token must not appear in any flyctl argv", leakyCall.slice(0, 100));
+
+      // (d) captured API error logs contain no "sscp_"
+      const { body: { logs: ae4ErrorLogs } } = await request("GET", "/test/drain-logs");
+      const leakyLog = (ae4ErrorLogs as string[]).find((l: string) => l.includes("sscp_"));
+      leakyLog === undefined
+        ? ok("AE4: proxy token NOT in any API error log")
+        : fail("AE4: proxy token leaked into API error log", leakyLog.slice(0, 100));
 
       // Verify the proxy_credentials row exists in the DB
       const { rows: credRows } = await pool.query<{ app_id: string }>(

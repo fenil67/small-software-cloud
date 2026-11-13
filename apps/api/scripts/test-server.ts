@@ -71,6 +71,9 @@ const _fakeFlyctlDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-test-flyctl-")
 const _fakeFlyctlBin = path.join(_fakeFlyctlDir, "flyctl");
 const _flyctlArgvFile = path.join(_fakeFlyctlDir, "flyctl-argv");
 const _flyctlStdinFile = path.join(_fakeFlyctlDir, "flyctl-stdin");
+// Full calls log — APPENDED on every invocation so argv from every call is visible,
+// not just the last one.  One line per invocation (space-joined args).
+const _flyctlArgvLog = path.join(_fakeFlyctlDir, "flyctl-argv-log");
 
 function writeFlyctlScript(exitCode: number, stdoutCmd?: string): void {
   // The "secrets" branch always exits 0 — failure modes only apply to other
@@ -78,6 +81,7 @@ function writeFlyctlScript(exitCode: number, stdoutCmd?: string): void {
   // secrets import is a separate, independent call.
   const script = `#!/bin/sh
 echo "$@" > ${_flyctlArgvFile}
+printf '%s\\n' "$*" >> ${_flyctlArgvLog}
 if [ "$1" = "secrets" ]; then
   cat > ${_flyctlStdinFile}
   exit 0
@@ -389,11 +393,26 @@ app.get("/test/get-flyctl-capture", (_req, res) => {
   res.json({ argv, stdin });
 });
 
-// POST /test/clear-flyctl-capture — clears capture files
+// POST /test/clear-flyctl-capture — clears all capture files including the full calls log
 app.post("/test/clear-flyctl-capture", (_req, res) => {
   try { fs.unlinkSync(_flyctlArgvFile); } catch { /* ok */ }
   try { fs.unlinkSync(_flyctlStdinFile); } catch { /* ok */ }
+  try { fs.unlinkSync(_flyctlArgvLog); } catch { /* ok */ }
   res.json({ ok: true });
+});
+
+// GET /test/get-flyctl-calls — returns every flyctl invocation's argv since last clear
+// { calls: string[], stdin: string }
+// calls: one entry per invocation (space-joined args, in order)
+// stdin: content written to the most recent "secrets import" stdin pipe
+app.get("/test/get-flyctl-calls", (_req, res) => {
+  const calls = fs.existsSync(_flyctlArgvLog)
+    ? fs.readFileSync(_flyctlArgvLog, "utf8").split("\n").filter(Boolean)
+    : [];
+  const stdin = fs.existsSync(_flyctlStdinFile)
+    ? fs.readFileSync(_flyctlStdinFile, "utf8")
+    : "";
+  res.json({ calls, stdin });
 });
 
 // POST /test/gen-fly-toml { appName, appId, kind?, appPort? }
