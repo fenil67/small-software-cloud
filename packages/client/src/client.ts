@@ -10,7 +10,7 @@
 import fs from "fs";
 import path from "path";
 import FormData from "form-data";
-import { makeAxios, extractErrorMessage } from "./http";
+import { makeAxios, extractErrorMessage, extractSharingError } from "./http";
 import { resolveConfig, SscConfig } from "./config";
 import { zipDirectory } from "./zip";
 import type {
@@ -18,6 +18,7 @@ import type {
   IntakeResponse,
   DeployOptions,
   DeployEvent,
+  AccessList,
 } from "./types";
 
 /** Read the "name" field from package.json in dirPath, or return null. */
@@ -127,6 +128,43 @@ export class SscClient {
       return data;
     } catch (err) {
       throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  // ─── Sharing ───────────────────────────────────────────────────────────────
+
+  /** Grant access to an app by email. Returns {status:"granted"|"pending"}. */
+  async shareApp(appId: string, email: string): Promise<{ status: "granted" | "pending" }> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.post<{ status: "granted" | "pending" }>(
+        `/v1/apps/${appId}/access`,
+        { email },
+      );
+      return data;
+    } catch (err) {
+      throw new Error(extractSharingError(err));
+    }
+  }
+
+  /** Revoke access to an app by email (removes both app_access and pending rows). */
+  async unshareApp(appId: string, email: string): Promise<void> {
+    const ax = makeAxios(this.config);
+    try {
+      await ax.delete(`/v1/apps/${appId}/access/${encodeURIComponent(email)}`);
+    } catch (err) {
+      throw new Error(extractSharingError(err));
+    }
+  }
+
+  /** List current users and pending grants for an app. */
+  async listAccess(appId: string): Promise<AccessList> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<AccessList>(`/v1/apps/${appId}/access`);
+      return data;
+    } catch (err) {
+      throw new Error(extractSharingError(err));
     }
   }
 

@@ -3,6 +3,9 @@ import { Command } from "commander";
 import { login } from "./commands/login";
 import { deploy } from "./commands/deploy";
 import { status } from "./commands/status";
+import { share } from "./commands/share";
+import { unshare } from "./commands/unshare";
+import { listAppAccess } from "./commands/access";
 
 const program = new Command();
 
@@ -36,6 +39,30 @@ program
   .description("Print the current status of a deployment (JSON)")
   .action(async (deploymentId: string) => {
     await status(deploymentId);
+  });
+
+// ─── share ────────────────────────────────────────────────────────────────────
+program
+  .command("share <app-id> <email>")
+  .description("Grant a user access to an app by email")
+  .action(async (appId: string, email: string) => {
+    await share(appId, email);
+  });
+
+// ─── unshare ──────────────────────────────────────────────────────────────────
+program
+  .command("unshare <app-id> <email>")
+  .description("Revoke a user's access to an app")
+  .action(async (appId: string, email: string) => {
+    await unshare(appId, email);
+  });
+
+// ─── access ───────────────────────────────────────────────────────────────────
+program
+  .command("access <app-id>")
+  .description("List who has access to an app")
+  .action(async (appId: string) => {
+    await listAppAccess(appId);
   });
 
 program.parseAsync(process.argv).catch((err) => {

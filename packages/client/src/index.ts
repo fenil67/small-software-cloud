@@ -8,4 +8,7 @@ export type {
   IntakeResponse,
   DeployOptions,
   DeployEvent,
+  AccessUser,
+  PendingGrant,
+  AccessList,
 } from "./types";

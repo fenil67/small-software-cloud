@@ -33,6 +33,24 @@ export interface DeployOptions {
   appName?: string;
 }
 
+// ─── App access types ─────────────────────────────────────────────────────────
+
+export interface AccessUser {
+  user_id: string;
+  email: string;
+  granted_at: string;
+}
+
+export interface PendingGrant {
+  email: string;
+  granted_at: string;
+}
+
+export interface AccessList {
+  users: AccessUser[];
+  pending: PendingGrant[];
+}
+
 // ─── SSE event types ──────────────────────────────────────────────────────────
 
 export type DeployEvent =

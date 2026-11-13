@@ -4900,6 +4900,186 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AD: CLI sharing commands");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
+    const cliPath = path.join(__dirname, "../../../packages/cli/src/index.ts");
+
+    // ── AD setup ──────────────────────────────────────────────────────────────
+    // Existing user whose email we can share directly (grants status)
+    const adUserRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      ["clerk_ad_known", "adknown@test.local", "AD Known User"],
+    );
+    const adUserId = adUserRow.rows[0].id;
+
+    // App under orgA (keyA has access to this org)
+    const adAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ad-cli-app', 'ad-cli-app', 'zip') RETURNING id`,
+      [orgAId, adUserId],
+    );
+    const adAppId = adAppRow.rows[0].id;
+
+    // App under orgB (keyA should NOT have access — expect "App not found")
+    const adOrgBAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ad-orgb-app', 'ad-orgb-app', 'zip') RETURNING id`,
+      [orgBId, adUserId],
+    );
+    const adOrgBAppId = adOrgBAppRow.rows[0].id;
+
+    // Helper: run a CLI command with orgA key and test server
+    type CliResult = { code: number; stdout: string; stderr: string };
+    const run = (...args: string[]): Promise<CliResult> =>
+      new Promise((resolve) => {
+        const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-ad-"));
+        const child = require("child_process").spawn(tsx, [cliPath, ...args], {
+          env: {
+            ...process.env,
+            HOME: tmpHome,
+            SSC_API_URL: BASE_URL,
+            SSC_API_KEY: keyA,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+        child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+        child.on("close", (code: number) => {
+          try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+          resolve({ code: code ?? 1, stdout, stderr });
+        });
+      });
+
+    // ── AD1: share ────────────────────────────────────────────────────────────
+    {
+      // Unknown email → pending message
+      const r1 = await run("share", adAppId, "adunknown@test.local");
+      r1.code === 0
+        ? ok("AD1: share unknown email → exit 0")
+        : fail("AD1: share unknown should exit 0", `code=${r1.code} ${r1.stderr}`);
+      r1.stdout.includes("Invitation pending for adunknown@test.local")
+        ? ok("AD1: share unknown email → pending message")
+        : fail("AD1: pending message missing", r1.stdout.trim());
+
+      // Verify pending row in DB
+      const { rows: pendRows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [adAppId, "adunknown@test.local"],
+      );
+      pendRows.length > 0
+        ? ok("AD1: pending_access row created")
+        : fail("AD1: pending_access row missing");
+
+      // Known user's email → granted message
+      const r2 = await run("share", adAppId, "adknown@test.local");
+      r2.code === 0
+        ? ok("AD1: share known email → exit 0")
+        : fail("AD1: share known should exit 0", `code=${r2.code} ${r2.stderr}`);
+      r2.stdout.includes("Access granted to adknown@test.local")
+        ? ok("AD1: share known email → granted message")
+        : fail("AD1: granted message missing", r2.stdout.trim());
+    }
+
+    // ── AD2: access list, then unshare ────────────────────────────────────────
+    {
+      // access lists both entries
+      const r1 = await run("access", adAppId);
+      r1.code === 0
+        ? ok("AD2: access → exit 0")
+        : fail("AD2: access should exit 0", `code=${r1.code} ${r1.stderr}`);
+      r1.stdout.includes("adknown@test.local")
+        ? ok("AD2: access lists granted user")
+        : fail("AD2: access missing granted user", r1.stdout.trim());
+      r1.stdout.includes("adunknown@test.local")
+        ? ok("AD2: access lists pending email")
+        : fail("AD2: access missing pending email", r1.stdout.trim());
+
+      // unshare the granted user
+      const r2 = await run("unshare", adAppId, "adknown@test.local");
+      r2.code === 0
+        ? ok("AD2: unshare → exit 0")
+        : fail("AD2: unshare should exit 0", `code=${r2.code} ${r2.stderr}`);
+      r2.stdout.includes("Access removed for adknown@test.local")
+        ? ok("AD2: unshare → correct message")
+        : fail("AD2: unshare message missing", r2.stdout.trim());
+
+      // unshare the pending email
+      const r3 = await run("unshare", adAppId, "adunknown@test.local");
+      r3.code === 0
+        ? ok("AD2: unshare pending → exit 0")
+        : fail("AD2: unshare pending should exit 0", `code=${r3.code} ${r3.stderr}`);
+
+      // access now shows empty
+      const r4 = await run("access", adAppId);
+      r4.code === 0
+        ? ok("AD2: access after unshare → exit 0")
+        : fail("AD2: access after unshare should exit 0", `code=${r4.code} ${r4.stderr}`);
+      r4.stdout.includes("No one has access yet.")
+        ? ok("AD2: access after unshare → empty message")
+        : fail("AD2: empty message missing", r4.stdout.trim());
+    }
+
+    // ── AD3: error cases ──────────────────────────────────────────────────────
+    {
+      // App from another org → "App not found"
+      const r1 = await run("share", adOrgBAppId, "x@test.local");
+      r1.code === 1
+        ? ok("AD3: cross-org share → exit 1")
+        : fail("AD3: cross-org share should exit 1", `code=${r1.code}`);
+      (r1.stdout + r1.stderr).includes("App not found")
+        ? ok("AD3: cross-org share → 'App not found'")
+        : fail("AD3: cross-org should print 'App not found'", (r1.stdout + r1.stderr).trim());
+
+      // Invalid email → API's 400 message
+      const r2 = await run("share", adAppId, "not-an-email");
+      r2.code === 1
+        ? ok("AD3: invalid email → exit 1")
+        : fail("AD3: invalid email should exit 1", `code=${r2.code}`);
+      (r2.stdout + r2.stderr).length > 0 && r2.code === 1
+        ? ok("AD3: invalid email → prints API error message")
+        : fail("AD3: invalid email should print error", (r2.stdout + r2.stderr).trim());
+    }
+
+    // ── AD4: email with "+" round-trips share → unshare ───────────────────────
+    {
+      const plusEmail = "a+b@test.local";
+
+      const r1 = await run("share", adAppId, plusEmail);
+      r1.code === 0
+        ? ok("AD4: share a+b@test.local → exit 0")
+        : fail("AD4: share plus-email should exit 0", `code=${r1.code} ${r1.stderr}`);
+
+      // Verify pending row was created with the exact email
+      const { rows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [adAppId, plusEmail],
+      );
+      rows.length > 0
+        ? ok("AD4: pending row created for a+b@test.local")
+        : fail("AD4: pending row missing for plus-email");
+
+      // Unshare removes the row
+      const r2 = await run("unshare", adAppId, plusEmail);
+      r2.code === 0
+        ? ok("AD4: unshare a+b@test.local → exit 0")
+        : fail("AD4: unshare plus-email should exit 0", `code=${r2.code} ${r2.stderr}`);
+
+      const { rows: after } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [adAppId, plusEmail],
+      );
+      after.length === 0
+        ? ok("AD4: pending row removed for a+b@test.local")
+        : fail("AD4: pending row should be gone after unshare");
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
