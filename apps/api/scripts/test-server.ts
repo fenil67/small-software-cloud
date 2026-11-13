@@ -33,6 +33,8 @@ process.env.WEB_URL = `http://localhost:${_testPort}`;
 process.env.SSC_VERIFY_BASE_URL = `http://localhost:${_testPort}`;
 // Keep verification fast in tests (1 s timeout, 100 ms poll)
 process.env.SSC_VERIFY_TIMEOUT_MS = "1000";
+// Fake Clerk API — clerkSync uses this base URL when SSC_TEST=1 and this var is set
+process.env.SSC_TEST_CLERK_API_BASE = `http://localhost:${_testPort}/clerk-stub`;
 
 // ── Log capture (intercept console.error BEFORE any module imports) ───────────
 // Section N drains these to verify no secret leaks in error logs.
@@ -486,6 +488,70 @@ app.post("/test/run-proxy-code-reaper", async (_req, res) => {
 // Returns and clears the captured console.error log lines.
 app.get("/test/drain-logs", (_req, res) => {
   res.json({ logs: _recentErrorLogs.splice(0) });
+});
+
+// ── Fake Clerk API stub ───────────────────────────────────────────────────────
+// clerkSync uses SSC_TEST_CLERK_API_BASE (set above) to route Clerk API calls
+// here when SSC_TEST=1.  Tests configure per-user responses via /test/set-clerk-user.
+
+interface ClerkUserStub {
+  id: string;
+  primary_email_address_id: string | null;
+  email_addresses: Array<{ id: string; email_address: string; verification: { status: string } }>;
+  first_name: string;
+  last_name: string;
+}
+
+const _clerkUserStubs = new Map<string, ClerkUserStub>();
+
+// GET /clerk-stub/users/:id — fake Clerk GET /v1/users/:id
+// Returns 404 for any user not explicitly registered via POST /test/set-clerk-user so that
+// missing test setup fails loudly (500 from ensureUser) rather than silently storing "".
+app.get("/clerk-stub/users/:id", (req, res) => {
+  const stub = _clerkUserStubs.get(req.params.id);
+  if (stub) {
+    res.json(stub);
+  } else {
+    res.status(404).json({ error: "not_found", message: `No stub registered for Clerk user ${req.params.id}` });
+  }
+});
+
+// GET /clerk-stub/organizations/:id — fake Clerk GET /v1/organizations/:id
+app.get("/clerk-stub/organizations/:id", (req, res) => {
+  res.json({ id: req.params.id, name: req.params.id, slug: req.params.id });
+});
+
+// POST /test/set-clerk-user { clerkUserId, email, verified }
+// Configures what the fake Clerk endpoint returns for the given clerkUserId.
+// verified=true  → primary address is verified; ensureUser stores the email.
+// verified=false → primary address is unverified; ensureUser stores "".
+// Omit email (or pass "") → no primary address; ensureUser stores "".
+app.post("/test/set-clerk-user", (req, res) => {
+  const { clerkUserId, email, verified } = req.body as { clerkUserId?: string; email?: string; verified?: boolean };
+  if (!clerkUserId) { res.status(400).json({ error: "clerkUserId required" }); return; }
+  const e = (email ?? "").trim();
+  if (e) {
+    _clerkUserStubs.set(clerkUserId, {
+      id: clerkUserId,
+      primary_email_address_id: "addr_primary",
+      email_addresses: [{
+        id: "addr_primary",
+        email_address: e,
+        verification: { status: verified ? "verified" : "unverified" },
+      }],
+      first_name: "",
+      last_name: "",
+    });
+  } else {
+    _clerkUserStubs.set(clerkUserId, {
+      id: clerkUserId,
+      primary_email_address_id: null,
+      email_addresses: [],
+      first_name: "",
+      last_name: "",
+    });
+  }
+  res.json({ ok: true });
 });
 
 // GET /test/db-error — deliberately queries a nonexistent table

@@ -103,27 +103,17 @@ proxyRouter.post(
       return;
     }
 
-    // Resolve internal user (look up by clerk_user_id; only call ensureUser if missing)
+    // Always call ensureUser to refresh the stored email to the verified primary
+    // address from Clerk (or "" if unverified / no primary).  This prevents the
+    // duplicate-row bug where a stale users row sharing the same email would
+    // block the real account from converting a pending grant.
     const clerkUserId = req.sscAuth.clerkUserId!;
-    let internalUserId: string;
-    let internalUserEmail = "";
-    {
-      const { rows } = await pool.query<{ id: string; email: string }>(
-        "SELECT id, email FROM users WHERE clerk_user_id = $1",
-        [clerkUserId],
-      );
-      if (rows[0]) {
-        internalUserId = rows[0].id;
-        internalUserEmail = rows[0].email ?? "";
-      } else {
-        internalUserId = await ensureUser(clerkUserId);
-        const { rows: eRows } = await pool.query<{ email: string }>(
-          "SELECT email FROM users WHERE id = $1",
-          [internalUserId],
-        );
-        internalUserEmail = eRows[0]?.email ?? "";
-      }
-    }
+    const internalUserId = await ensureUser(clerkUserId);
+    const { rows: emailRows } = await pool.query<{ email: string }>(
+      "SELECT email FROM users WHERE id = $1",
+      [internalUserId],
+    );
+    const internalUserEmail = emailRows[0]?.email ?? "";
 
     // Check app_access; if absent, attempt pending-grant conversion
     const { rows: accessRows } = await pool.query(

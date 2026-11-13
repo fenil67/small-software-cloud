@@ -3749,6 +3749,13 @@ async function main(): Promise<void> {
     const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
     const acProxyToken = await issueProxyToken(acAppId);
 
+    // Set up fake Clerk responses for existing AC users — required because /codes now
+    // always calls ensureUser (which hits the fake Clerk endpoint on the test server).
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: acAdminClerkId, email: "acadmin@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: acPendingClerkId, email: "acpending@test.local", verified: true } });
+    // acUnverifiedClerkId: Clerk returns an unverified primary → ensureUser stores ""
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: acUnverifiedClerkId, email: "acunverified@test.local", verified: false } });
+
     // Admin Clerk headers helper
     const adminHeaders = (extra: Record<string, string> = {}) => ({
       "x-test-clerk-user-id": acAdminClerkId,
@@ -3765,14 +3772,14 @@ async function main(): Promise<void> {
         ? ok("AC1: admin GET /access → 200 with users+pending arrays")
         : fail("AC1: admin GET should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
 
-      // POST — admin Clerk session, unknown email → pending
+      // POST — admin Clerk session, any email → 201 granted (always pending_access internally)
       const r2 = await request("POST", `/v1/apps/${acAppId}/access`, {
         headers: adminHeaders(),
         body: { email: "newuser@example.com" },
       });
-      r2.status === 201 && (r2.body as any).status === "pending"
-        ? ok("AC1: admin POST with unknown email → 201 pending")
-        : fail("AC1: admin POST pending should 201", `got ${r2.status} ${JSON.stringify(r2.body)}`);
+      r2.status === 201 && (r2.body as any).status === "granted"
+        ? ok("AC1: admin POST → 201 {status:granted} (always, regardless of whether email is known)")
+        : fail("AC1: admin POST should return 201 granted", `got ${r2.status} ${JSON.stringify(r2.body)}`);
 
       // DELETE — admin Clerk session
       const r3 = await request("DELETE", `/v1/apps/${acAppId}/access/${encodeURIComponent("newuser@example.com")}`, {
@@ -3876,7 +3883,8 @@ async function main(): Promise<void> {
 
     // ── AC3: POST email cases ─────────────────────────────────────────────────
     {
-      // Existing user's email, different case → granted
+      // Existing user's email, different case → 201 granted + pending_access row
+      // (POST no longer creates app_access directly; conversion happens at /codes)
       {
         // acAdminUserId has email "acadmin@test.local"
         const r = await request("POST", `/v1/apps/${acAppId}/access`, {
@@ -3885,27 +3893,29 @@ async function main(): Promise<void> {
         });
         r.status === 201 && (r.body as any).status === "granted"
           ? ok("AC3: existing user email (different case) → 201 granted")
-          : fail("AC3: existing user should grant", `got ${r.status} ${JSON.stringify(r.body)}`);
+          : fail("AC3: existing user should return 201 granted", `got ${r.status} ${JSON.stringify(r.body)}`);
 
-        // Verify the app_access row exists
+        // Verify pending_access row exists (NOT app_access — that's created at /codes)
         const { rows } = await pool.query(
-          "SELECT 1 FROM app_access WHERE app_id = $1 AND user_id = $2",
-          [acAppId, acAdminUserId],
+          "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "acadmin@test.local"],
         );
         rows.length > 0
-          ? ok("AC3: app_access row exists after grant")
-          : fail("AC3: app_access row missing after grant");
+          ? ok("AC3: pending_access row exists after POST (app_access NOT created directly)")
+          : fail("AC3: pending_access row missing after POST");
+        // Cleanup pending row so it doesn't interfere with AC5
+        await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "acadmin@test.local"]);
       }
 
-      // Unknown email → pending
+      // Unknown email → also 201 granted (always creates pending_access)
       {
         const r = await request("POST", `/v1/apps/${acAppId}/access`, {
           headers: adminHeaders(),
           body: { email: "unknown@pending.test" },
         });
-        r.status === 201 && (r.body as any).status === "pending"
-          ? ok("AC3: unknown email → 201 pending")
-          : fail("AC3: unknown email should pending", `got ${r.status} ${JSON.stringify(r.body)}`);
+        r.status === 201 && (r.body as any).status === "granted"
+          ? ok("AC3: unknown email → 201 granted (pending_access created)")
+          : fail("AC3: unknown email should return 201 granted", `got ${r.status} ${JSON.stringify(r.body)}`);
 
         const { rows } = await pool.query(
           "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
@@ -4095,6 +4105,68 @@ async function main(): Promise<void> {
           ? ok("AC5: second DELETE is idempotent → 200 removed:true")
           : fail("AC5: second DELETE should still be 200", `got ${r4.status}`);
       }
+
+      // Extended: converted user (pending → app_access) loses access after DELETE
+      {
+        const ac5ExtRow = await pool.query<{ id: string }>(
+          "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+          ["clerk_ac5_ext", "ac5ext@test.local", "AC5 Ext User"],
+        );
+        const ac5ExtId = ac5ExtRow.rows[0].id;
+        await request("POST", "/test/set-clerk-user", {
+          body: { clerkUserId: "clerk_ac5_ext", email: "ac5ext@test.local", verified: true },
+        });
+
+        // Share → pending_access
+        await request("POST", `/v1/apps/${acAppId}/access`, {
+          headers: adminHeaders(),
+          body: { email: "ac5ext@test.local" },
+        });
+
+        // /codes → conversion
+        const stExt = crypto.randomBytes(16).toString("base64url");
+        const rConvert = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": "clerk_ac5_ext" },
+          body: { app_id: acAppId, state: stExt },
+        });
+        rConvert.status === 201
+          ? ok("AC5: converted user gets code after pending grant")
+          : fail("AC5: conversion should 201", `got ${rConvert.status} ${JSON.stringify(rConvert.body)}`);
+
+        // /proxy/access → allowed
+        const rAccess1 = await request("GET", `/v1/proxy/access?user_id=${ac5ExtId}`, {
+          headers: { Authorization: `Bearer ${acProxyToken}` },
+        });
+        rAccess1.status === 200 && (rAccess1.body as any).allowed === true
+          ? ok("AC5: converted user has allowed=true")
+          : fail("AC5: converted user should be allowed", `got ${rAccess1.status} ${JSON.stringify(rAccess1.body)}`);
+
+        // DELETE access
+        await request("DELETE", `/v1/apps/${acAppId}/access/${encodeURIComponent("ac5ext@test.local")}`, {
+          headers: adminHeaders(),
+        });
+
+        // /proxy/access → denied
+        const rAccess2 = await request("GET", `/v1/proxy/access?user_id=${ac5ExtId}`, {
+          headers: { Authorization: `Bearer ${acProxyToken}` },
+        });
+        rAccess2.status === 200 && (rAccess2.body as any).allowed === false
+          ? ok("AC5: unshared converted user has allowed=false")
+          : fail("AC5: unshared converted user should be denied", `got ${rAccess2.status} ${JSON.stringify(rAccess2.body)}`);
+
+        // /codes → 403
+        const stExt2 = crypto.randomBytes(16).toString("base64url");
+        const rCodes2 = await request("POST", "/v1/proxy/codes", {
+          headers: { "x-test-clerk-user-id": "clerk_ac5_ext" },
+          body: { app_id: acAppId, state: stExt2 },
+        });
+        rCodes2.status === 403 && (rCodes2.body as any).error === "no_access"
+          ? ok("AC5: unshared converted user gets 403 at /codes")
+          : fail("AC5: /codes should 403 for unshared converted user", `got ${rCodes2.status} ${JSON.stringify(rCodes2.body)}`);
+
+        // Cleanup
+        await pool.query("DELETE FROM users WHERE id = $1", [ac5ExtId]);
+      }
     }
 
     // ── AC6: ensureUser email selection (unit test, stubbed axios) ─────────────
@@ -4241,7 +4313,7 @@ async function main(): Promise<void> {
       );
       const ac9TargetId = ac9TargetRow.rows[0].id;
 
-      // 1. Clerk admin grant — granted_by should be acAdminUserId
+      // 1. Clerk admin grant — creates pending_access; granted_by recorded there
       {
         const r = await request("POST", `/v1/apps/${acAppId}/access`, {
           headers: adminHeaders(),
@@ -4251,19 +4323,20 @@ async function main(): Promise<void> {
           ? ok("AC9: Clerk admin POST → 201 granted")
           : fail("AC9: Clerk admin POST should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
 
+        // POST now writes to pending_access, not app_access
         const { rows } = await pool.query<{ granted_by: string | null }>(
-          "SELECT granted_by FROM app_access WHERE app_id = $1 AND user_id = $2",
-          [acAppId, ac9TargetId],
+          "SELECT granted_by FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "ac9target@test.local"],
         );
         rows[0]?.granted_by === acAdminUserId
-          ? ok("AC9: app_access.granted_by = Clerk admin's users.id")
-          : fail("AC9: app_access.granted_by should be admin's users.id", `got ${rows[0]?.granted_by}`);
+          ? ok("AC9: pending_access.granted_by = Clerk admin's users.id")
+          : fail("AC9: pending_access.granted_by should be admin's users.id", `got ${rows[0]?.granted_by}`);
 
         // Clean up for next sub-test
-        await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id = $2", [acAppId, ac9TargetId]);
+        await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "ac9target@test.local"]);
       }
 
-      // 2. API-key grant — granted_by should be userId (the seed user who created keyA)
+      // 2. API-key grant — also creates pending_access; granted_by is key creator
       {
         const r = await request("POST", `/v1/apps/${acAppId}/access`, {
           headers: authHeaders(keyA),
@@ -4274,26 +4347,26 @@ async function main(): Promise<void> {
           : fail("AC9: API key POST should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
 
         const { rows } = await pool.query<{ granted_by: string | null }>(
-          "SELECT granted_by FROM app_access WHERE app_id = $1 AND user_id = $2",
-          [acAppId, ac9TargetId],
+          "SELECT granted_by FROM pending_access WHERE app_id = $1 AND email = $2",
+          [acAppId, "ac9target@test.local"],
         );
         rows[0]?.granted_by === userId
-          ? ok("AC9: app_access.granted_by = API key's created_by (seed userId)")
-          : fail("AC9: app_access.granted_by should be key's created_by", `got ${rows[0]?.granted_by}`);
+          ? ok("AC9: pending_access.granted_by = API key's created_by (seed userId)")
+          : fail("AC9: pending_access.granted_by should be key's created_by", `got ${rows[0]?.granted_by}`);
 
-        await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id = $2", [acAppId, ac9TargetId]);
+        await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "ac9target@test.local"]);
       }
 
-      // 3. Pending grant: original granted_by is preserved on conversion
+      // 3. Pending grant: original granted_by is preserved on conversion at /codes
       {
-        // Admin inserts a pending row — granted_by will be acAdminUserId
+        // Admin shares — always goes to pending_access now
         const r = await request("POST", `/v1/apps/${acAppId}/access`, {
           headers: adminHeaders(),
-          body: { email: "ac9unknown@test.local" },   // unknown email → pending
+          body: { email: "ac9unknown@test.local" },
         });
-        r.status === 201 && (r.body as any).status === "pending"
+        r.status === 201 && (r.body as any).status === "granted"
           ? ok("AC9: pending row inserted with granted_by")
-          : fail("AC9: pending POST should be 201 pending", `got ${r.status} ${JSON.stringify(r.body)}`);
+          : fail("AC9: pending POST should be 201 granted", `got ${r.status} ${JSON.stringify(r.body)}`);
 
         const { rows: pendRows } = await pool.query<{ granted_by: string | null }>(
           "SELECT granted_by FROM pending_access WHERE app_id = $1 AND email = $2",
@@ -4303,13 +4376,16 @@ async function main(): Promise<void> {
           ? ok("AC9: pending_access.granted_by = Clerk admin's users.id")
           : fail("AC9: pending granted_by should be admin's id", `got ${pendRows[0]?.granted_by}`);
 
-        // Now register that user and trigger pending conversion via /codes
+        // Register user and configure fake Clerk to return their email as verified
         const ac9NewUserRow = await pool.query<{ id: string }>(
           "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
           ["clerk_ac9_new", "ac9unknown@test.local", "AC9 New User"],
         );
         const ac9NewUserId = ac9NewUserRow.rows[0].id;
-        // issue a proxy token for the app (re-use acProxyToken from setup)
+        await request("POST", "/test/set-clerk-user", {
+          body: { clerkUserId: "clerk_ac9_new", email: "ac9unknown@test.local", verified: true },
+        });
+
         const acState9 = crypto.randomBytes(16).toString("base64url");
         const rCodes = await request("POST", "/v1/proxy/codes", {
           headers: { "x-test-clerk-user-id": "clerk_ac9_new" },
@@ -4334,6 +4410,194 @@ async function main(): Promise<void> {
       }
 
       await pool.query("DELETE FROM users WHERE id = $1", [ac9TargetId]);
+    }
+
+    // ── AC10: duplicate email users — conversion goes to the signing-in user ──
+    {
+      // Two users share the same email in the DB (stale row + real row)
+      const ac10StaleRow = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_ac10_stale", "dup@ac10.test.local", "AC10 Stale"],
+      );
+      const ac10StaleId = ac10StaleRow.rows[0].id;
+
+      const ac10RealRow = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_ac10_real", "dup@ac10.test.local", "AC10 Real"],
+      );
+      const ac10RealId = ac10RealRow.rows[0].id;
+
+      // Fake Clerk knows real user has the email verified
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: "clerk_ac10_real", email: "dup@ac10.test.local", verified: true },
+      });
+
+      // Share the email → pending_access
+      const rShare = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: adminHeaders(),
+        body: { email: "dup@ac10.test.local" },
+      });
+      rShare.status === 201
+        ? ok("AC10: share duplicated email → 201")
+        : fail("AC10: share should 201", `got ${rShare.status} ${JSON.stringify(rShare.body)}`);
+
+      // /codes as the REAL user — should convert and succeed
+      const ac10State = crypto.randomBytes(16).toString("base64url");
+      const rCodes = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": "clerk_ac10_real" },
+        body: { app_id: acAppId, state: ac10State },
+      });
+      rCodes.status === 201
+        ? ok("AC10: /codes succeeds for real user despite duplicate email in DB")
+        : fail("AC10: /codes should 201 for real user", `got ${rCodes.status} ${JSON.stringify(rCodes.body)}`);
+
+      // app_access row belongs to the real user, not the stale user
+      const { rows: accRows } = await pool.query<{ user_id: string }>(
+        "SELECT user_id FROM app_access WHERE app_id = $1 AND user_id IN ($2, $3)",
+        [acAppId, ac10StaleId, ac10RealId],
+      );
+      accRows.length === 1 && accRows[0].user_id === ac10RealId
+        ? ok("AC10: app_access granted to real user only, not stale row")
+        : fail("AC10: should only have real user in app_access", `rows=${JSON.stringify(accRows)}`);
+
+      // Cleanup
+      await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id IN ($2, $3)", [acAppId, ac10StaleId, ac10RealId]);
+      await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "dup@ac10.test.local"]);
+      await pool.query("DELETE FROM users WHERE id IN ($1, $2)", [ac10StaleId, ac10RealId]);
+    }
+
+    // ── AC11: stale stored email — /codes refreshes and converts pending grant ─
+    {
+      // User's stored email is old; Clerk now has a new verified email
+      const ac11Row = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_ac11_user", "old@ac11.test.local", "AC11 User"],
+      );
+      const ac11UserId = ac11Row.rows[0].id;
+
+      // Clerk returns the NEW email as verified
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: "clerk_ac11_user", email: "new@ac11.test.local", verified: true },
+      });
+
+      // Share the NEW email → pending_access
+      const rShare = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: adminHeaders(),
+        body: { email: "new@ac11.test.local" },
+      });
+      rShare.status === 201
+        ? ok("AC11: share new email → 201 pending")
+        : fail("AC11: share should 201", `got ${rShare.status} ${JSON.stringify(rShare.body)}`);
+
+      // /codes — ensureUser refreshes stored email to new@, pending row matches → 201
+      const ac11State = crypto.randomBytes(16).toString("base64url");
+      const rCodes = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": "clerk_ac11_user" },
+        body: { app_id: acAppId, state: ac11State },
+      });
+      rCodes.status === 201
+        ? ok("AC11: /codes succeeds after ensureUser refreshes stale email")
+        : fail("AC11: /codes should 201 after refresh", `got ${rCodes.status} ${JSON.stringify(rCodes.body)}`);
+
+      // Stored email is now the new address
+      const { rows: emailRows } = await pool.query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1",
+        [ac11UserId],
+      );
+      emailRows[0]?.email === "new@ac11.test.local"
+        ? ok("AC11: stored email updated to new address after /codes")
+        : fail("AC11: stored email should be new address", `got "${emailRows[0]?.email}"`);
+
+      // Cleanup
+      await pool.query("DELETE FROM app_access WHERE app_id = $1 AND user_id = $2", [acAppId, ac11UserId]);
+      await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "new@ac11.test.local"]);
+      await pool.query("DELETE FROM users WHERE id = $1", [ac11UserId]);
+    }
+
+    // ── AC12: unverified primary — pending row untouched, /codes → 403 ─────────
+    {
+      const ac12Row = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_ac12_user", "unver@ac12.test.local", "AC12 User"],
+      );
+      const ac12UserId = ac12Row.rows[0].id;
+
+      // Clerk has an unverified primary email for this user
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: "clerk_ac12_user", email: "unver@ac12.test.local", verified: false },
+      });
+
+      // Share the email → pending_access
+      const rShare = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: adminHeaders(),
+        body: { email: "unver@ac12.test.local" },
+      });
+      rShare.status === 201
+        ? ok("AC12: share unverified email → pending_access created")
+        : fail("AC12: share should 201", `got ${rShare.status} ${JSON.stringify(rShare.body)}`);
+
+      // /codes — ensureUser stores "" (unverified primary), storedEmail is "", → 403
+      const ac12State = crypto.randomBytes(16).toString("base64url");
+      const rCodes = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": "clerk_ac12_user" },
+        body: { app_id: acAppId, state: ac12State },
+      });
+      rCodes.status === 403 && (rCodes.body as any).error === "no_access"
+        ? ok("AC12: /codes → 403 no_access when Clerk email is unverified")
+        : fail("AC12: /codes should 403 for unverified Clerk email", `got ${rCodes.status} ${JSON.stringify(rCodes.body)}`);
+
+      // pending_access row was NOT consumed — the grant can be claimed once the email is verified
+      const { rows: pendRows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [acAppId, "unver@ac12.test.local"],
+      );
+      pendRows.length > 0
+        ? ok("AC12: pending_access row not consumed after 403")
+        : fail("AC12: pending row should remain after failed /codes");
+
+      // Cleanup
+      await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, "unver@ac12.test.local"]);
+      await pool.query("DELETE FROM users WHERE id = $1", [ac12UserId]);
+    }
+
+    // ── AC13: share never creates app_access directly ─────────────────────────
+    {
+      const shareEmail = "ac13direct@test.local";
+
+      const { rows: countBefore } = await pool.query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM app_access WHERE app_id = $1",
+        [acAppId],
+      );
+      const appAccessBefore = Number(countBefore[0].count);
+
+      const rShare = await request("POST", `/v1/apps/${acAppId}/access`, {
+        headers: adminHeaders(),
+        body: { email: shareEmail },
+      });
+      rShare.status === 201
+        ? ok("AC13: POST /access → 201")
+        : fail("AC13: share should 201", `got ${rShare.status}`);
+
+      // app_access count must not have grown
+      const { rows: countAfter } = await pool.query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM app_access WHERE app_id = $1",
+        [acAppId],
+      );
+      Number(countAfter[0].count) === appAccessBefore
+        ? ok("AC13: POST /access does not create any app_access row")
+        : fail("AC13: share must not write app_access", `before=${appAccessBefore} after=${countAfter[0].count}`);
+
+      // pending_access row was created instead
+      const { rows: pendRows } = await pool.query(
+        "SELECT 1 FROM pending_access WHERE app_id = $1 AND email = $2",
+        [acAppId, shareEmail],
+      );
+      pendRows.length > 0
+        ? ok("AC13: POST /access writes only a pending_access row")
+        : fail("AC13: pending_access should exist after share");
+
+      // Cleanup
+      await pool.query("DELETE FROM pending_access WHERE app_id = $1 AND email = $2", [acAppId, shareEmail]);
     }
   }
 
@@ -4398,6 +4662,12 @@ async function main(): Promise<void> {
 
     // Collect sensitive values for AB6 log-leak check
     const abSensitiveValues: string[] = [proxyToken];
+
+    // Register AB users with the fake Clerk endpoint — required because /v1/proxy/codes
+    // now always calls ensureUser (which hits /clerk-stub/users/:id).  Without this,
+    // ensureUser would receive a 404 and throw, causing /codes to return 500.
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: abClerkUserId1, email: "ab1@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: abClerkUserId2, email: "ab2@test.local", verified: true } });
 
     // ── AB1: three tables exist ──────────────────────────────────────────────
     {
@@ -4957,14 +5227,14 @@ async function main(): Promise<void> {
 
     // ── AD1: share ────────────────────────────────────────────────────────────
     {
-      // Unknown email → pending message
+      // Unknown email → unified granted message (share always writes pending_access and reports granted)
       const r1 = await run("share", adAppId, "adunknown@test.local");
       r1.code === 0
         ? ok("AD1: share unknown email → exit 0")
         : fail("AD1: share unknown should exit 0", `code=${r1.code} ${r1.stderr}`);
-      r1.stdout.includes("Invitation pending for adunknown@test.local")
-        ? ok("AD1: share unknown email → pending message")
-        : fail("AD1: pending message missing", r1.stdout.trim());
+      r1.stdout.includes("Access granted to adunknown@test.local. They get in the next time they sign in with this email.")
+        ? ok("AD1: share unknown email → unified granted message")
+        : fail("AD1: unified granted message missing", r1.stdout.trim());
 
       // Verify pending row in DB
       const { rows: pendRows } = await pool.query(
@@ -4975,14 +5245,14 @@ async function main(): Promise<void> {
         ? ok("AD1: pending_access row created")
         : fail("AD1: pending_access row missing");
 
-      // Known user's email → granted message
+      // Known user's email → same unified granted message
       const r2 = await run("share", adAppId, "adknown@test.local");
       r2.code === 0
         ? ok("AD1: share known email → exit 0")
         : fail("AD1: share known should exit 0", `code=${r2.code} ${r2.stderr}`);
-      r2.stdout.includes("Access granted to adknown@test.local")
-        ? ok("AD1: share known email → granted message")
-        : fail("AD1: granted message missing", r2.stdout.trim());
+      r2.stdout.includes("Access granted to adknown@test.local. They get in the next time they sign in with this email.")
+        ? ok("AD1: share known email → unified granted message")
+        : fail("AD1: unified granted message missing", r2.stdout.trim());
     }
 
     // ── AD2: access list, then unshare ────────────────────────────────────────

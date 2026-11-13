@@ -1,11 +1,23 @@
 import axios from "axios";
 import { pool } from "../db";
 
+/**
+ * Returns the Clerk API base URL.
+ * Production always uses https://api.clerk.com/v1.
+ * When SSC_TEST=1 and SSC_TEST_CLERK_API_BASE is set, that value is used instead,
+ * allowing tests to point at a fake Clerk endpoint on the test server.
+ */
+function clerkApiBase(): string {
+  if (process.env.SSC_TEST === "1" && process.env.SSC_TEST_CLERK_API_BASE) {
+    return process.env.SSC_TEST_CLERK_API_BASE;
+  }
+  return "https://api.clerk.com/v1";
+}
+
 export async function ensureUser(clerkUserId: string): Promise<string> {
-  const clerkApiBase = "https://api.clerk.com/v1";
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
 
-  const { data } = await axios.get(`${clerkApiBase}/users/${clerkUserId}`, {
+  const { data } = await axios.get(`${clerkApiBase()}/users/${clerkUserId}`, {
     headers: { Authorization: `Bearer ${clerkKey}` },
   });
 
@@ -32,10 +44,9 @@ export async function ensureUser(clerkUserId: string): Promise<string> {
 }
 
 export async function ensureOrg(clerkOrgId: string): Promise<string> {
-  const clerkApiBase = "https://api.clerk.com/v1";
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
 
-  const { data } = await axios.get(`${clerkApiBase}/organizations/${clerkOrgId}`, {
+  const { data } = await axios.get(`${clerkApiBase()}/organizations/${clerkOrgId}`, {
     headers: { Authorization: `Bearer ${clerkKey}` },
   });
 

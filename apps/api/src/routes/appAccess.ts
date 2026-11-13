@@ -136,27 +136,16 @@ appAccessRouter.post(
       return;
     }
 
-    // If a users row already has this email, grant direct access
-    const { rows: userRows } = await pool.query<{ id: string }>(
-      "SELECT id FROM users WHERE lower(email) = $1 LIMIT 1",
-      [rawEmail],
+    // Always write to pending_access — /proxy/codes converts to app_access on first
+    // sign-in, using the actual verified Clerk identity of the signing-in user.
+    // This prevents the duplicate-row race where LIMIT 1 on users.email could
+    // resolve to a stale row from an older Clerk instance.
+    await pool.query(
+      `INSERT INTO pending_access (app_id, email, granted_by)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [appId, rawEmail, granterId],
     );
-
-    if (userRows[0]) {
-      await pool.query(
-        `INSERT INTO app_access (app_id, user_id, granted_by)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-        [appId, userRows[0].id, granterId],
-      );
-      res.status(201).json({ status: "granted" });
-    } else {
-      await pool.query(
-        `INSERT INTO pending_access (app_id, email, granted_by)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-        [appId, rawEmail, granterId],
-      );
-      res.status(201).json({ status: "pending" });
-    }
+    res.status(201).json({ status: "granted" });
   }),
 );
 
