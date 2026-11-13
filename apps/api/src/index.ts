@@ -42,6 +42,45 @@ installProcessHandlers();
       process.exit(1);
     }
   }
+
+  // PROXY_IMAGE must be a digest-pinned registry.fly.io image
+  const proxyImage = process.env.PROXY_IMAGE ?? "";
+  if (!/^registry\.fly\.io\/[a-z0-9-]+@sha256:[0-9a-f]{64}$/.test(proxyImage)) {
+    console.error(
+      "[startup] FATAL: PROXY_IMAGE must be a digest-pinned registry.fly.io image " +
+        "(e.g. registry.fly.io/my-proxy@sha256:<64-hex-chars>).",
+    );
+    process.exit(1);
+  }
+
+  // API_PUBLIC_URL must be https (http://localhost allowed when SSC_TEST=1)
+  const apiPublicUrl = process.env.API_PUBLIC_URL ?? "";
+  (() => {
+    let parsed: URL;
+    try { parsed = new URL(apiPublicUrl); } catch {
+      console.error("[startup] FATAL: API_PUBLIC_URL is not a valid URL.");
+      process.exit(1);
+    }
+    const isLocalhost = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    if (parsed.protocol !== "https:" && !(process.env.SSC_TEST === "1" && isLocalhost)) {
+      console.error("[startup] FATAL: API_PUBLIC_URL must be an https URL (http://localhost is allowed when SSC_TEST=1).");
+      process.exit(1);
+    }
+  })();
+
+  // WEB_URL must be https outside SSC_TEST
+  const webUrlCheck = process.env.WEB_URL ?? "";
+  (() => {
+    let parsed: URL;
+    try { parsed = new URL(webUrlCheck); } catch {
+      console.error("[startup] FATAL: WEB_URL is not a valid URL.");
+      process.exit(1);
+    }
+    if (parsed.protocol !== "https:" && process.env.SSC_TEST !== "1") {
+      console.error("[startup] FATAL: WEB_URL must be an https URL.");
+      process.exit(1);
+    }
+  })();
 })();
 
 import { healthRouter } from "./routes/health";

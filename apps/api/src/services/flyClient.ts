@@ -114,3 +114,47 @@ export async function checkFlyAppExists(appName: string): Promise<boolean> {
     throw err;
   }
 }
+
+/**
+ * Creates an egress network policy for a Fly app that allows DNS and HTTP/S
+ * traffic while blocking everything else by default.
+ */
+export const EGRESS_POLICY_BODY = {
+  name: "ssc-default-egress",
+  selector: { all: true },
+  rules: [
+    {
+      action: "allow",
+      direction: "egress",
+      ports: [
+        { protocol: "udp", port: 53 },
+        { protocol: "tcp", port: 53 },
+        { protocol: "tcp", port: 80 },
+        { protocol: "tcp", port: 443 },
+      ],
+    },
+  ],
+} as const;
+
+export async function createEgressPolicy(appName: string): Promise<void> {
+  const client = makeClient();
+  await client.post(`/apps/${appName}/network_policies`, EGRESS_POLICY_BODY);
+}
+
+export interface FlyMachine {
+  id: string;
+  state?: string;
+}
+
+/** Returns the list of machines for a Fly app. */
+export async function listMachines(appName: string): Promise<FlyMachine[]> {
+  const client = makeClient();
+  const { data } = await client.get<FlyMachine[]>(`/apps/${appName}/machines`);
+  return Array.isArray(data) ? data : [];
+}
+
+/** Sends a stop signal to a specific machine. */
+export async function stopMachine(appName: string, machineId: string): Promise<void> {
+  const client = makeClient();
+  await client.post(`/apps/${appName}/machines/${machineId}/stop`);
+}

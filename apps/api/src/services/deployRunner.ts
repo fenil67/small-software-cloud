@@ -1,18 +1,21 @@
 import path from "path";
 import os from "os";
 import fs from "fs";
+import http from "http";
+import https from "https";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
-import { createFlyApp, destroyFlyApp, checkFlyAppExists } from "./flyClient";
+import { createFlyApp, destroyFlyApp, checkFlyAppExists, createEgressPolicy, listMachines, stopMachine } from "./flyClient";
 import { networkForOrg } from "../lib/flyNetwork";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { gitEnv, flyctlEnv } from "../lib/childEnv";
 import { parseGithubUrl, buildCloneArgs, checkDirSize, GithubUrlError } from "../lib/githubUrl";
 import { detectAppType } from "./appDetector";
-import { generateDeployFiles } from "./dockerfileGen";
+import { generateDeployFiles, sniffExposePort } from "./dockerfileGen";
+import { issueProxyToken } from "../lib/proxyCredentials";
 
 const execFileP = promisify(execFile);
 
@@ -103,6 +106,102 @@ async function destroyWithRetry(flyAppName: string, orgId: string | null): Promi
 
 function generateFlyAppName(): string {
   return `ssc-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// ─── Proxy secret via stdin ───────────────────────────────────────────────────
+// Writes "SSC_PROXY_TOKEN=<token>\n" to flyctl stdin; never passes the token
+// as an argv argument so it never appears in process listings or log lines.
+
+async function setProxySecret(appName: string, token: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const proc = require("child_process").spawn(
+      "flyctl",
+      ["secrets", "import", "--app", appName, "--stage"],
+      { env: flyctlEnv(), stdio: ["pipe", "ignore", "ignore"] },
+    );
+    proc.stdin.write(`SSC_PROXY_TOKEN=${token}\n`);
+    proc.stdin.end();
+    proc.on("error", reject);
+    proc.on("close", (code: number) => {
+      if (code !== 0) {
+        reject(new DeployError("provision", "Failed to set proxy credentials. Please try again."));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+// ─── Post-deploy proxy verification ──────────────────────────────────────────
+// Polls the app until the access proxy is confirmed running, or the deadline
+// expires.  Uses raw http/https to avoid automatic redirect-following.
+
+const VERIFY_TIMEOUT_MS =
+  process.env.SSC_TEST === "1" && process.env.SSC_VERIFY_TIMEOUT_MS
+    ? parseInt(process.env.SSC_VERIFY_TIMEOUT_MS, 10)
+    : 90_000;
+const VERIFY_POLL_MS = process.env.SSC_TEST === "1" ? 100 : 3_000;
+
+function fetchNoFollow(
+  url: string,
+  extraHeaders: Record<string, string> = {},
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined> }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === "https:" ? https : http;
+    const req = mod.get(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || undefined,
+        path: parsed.pathname + parsed.search,
+        headers: extraHeaders,
+      },
+      (res) => {
+        res.resume(); // drain body — we only care about status + headers
+        resolve({ status: res.statusCode ?? 0, headers: res.headers });
+      },
+    );
+    req.setTimeout(10_000, () => req.destroy(new Error("timeout")));
+    req.on("error", reject);
+  });
+}
+
+async function verifyProxy(appName: string, appId: string): Promise<void> {
+  const baseUrl =
+    process.env.SSC_TEST === "1" && process.env.SSC_VERIFY_BASE_URL
+      ? process.env.SSC_VERIFY_BASE_URL
+      : `https://${appName}.fly.dev`;
+  const webUrl = process.env.WEB_URL ?? "";
+  // In test mode we only check the prefix without the specific UUID, since the
+  // fake endpoint doesn't have access to the per-deploy appId.
+  const expectedLocationPrefix =
+    process.env.SSC_TEST === "1"
+      ? `${webUrl}/access?app=`
+      : `${webUrl}/access?app=${appId}`;
+
+  const deadline = Date.now() + VERIFY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      const health = await fetchNoFollow(`${baseUrl}/__ssc/health`);
+      if (health.status === 200 && health.headers["x-ssc-proxy"] === "1") {
+        const root = await fetchNoFollow(`${baseUrl}/`, { Accept: "text/html" });
+        const loc = (root.headers["location"] as string | undefined) ?? "";
+        if (
+          root.status === 302 &&
+          root.headers["x-ssc-proxy"] === "1" &&
+          loc.startsWith(expectedLocationPrefix)
+        ) {
+          return; // proxy confirmed running
+        }
+      }
+    } catch {
+      // connection refused / timeout — keep polling
+    }
+    await new Promise<void>((r) => setTimeout(r, VERIFY_POLL_MS));
+  }
+  throw new Error("proxy_check_failed");
 }
 
 async function extractZip(zipBuffer: Buffer, deploymentId: string): Promise<string> {
@@ -322,6 +421,18 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       );
     }
 
+    // Step 2b: for user-supplied Dockerfiles, sniff the EXPOSE port and reject 8787
+    // before any Fly API calls are made.
+    if (appType.kind === "dockerfile") {
+      const exposedPort = await sniffExposePort(workDir);
+      if (exposedPort === 8787) {
+        throw new DeployError(
+          "detect",
+          "Port 8787 is reserved by the platform. Make your app listen on another port (8080 is the default).",
+        );
+      }
+    }
+
     // Step 3: ensure Fly app exists
     const app = await getApp(appId);
     orgId = app.org_id; // needed by destroyWithRetry inside fail()
@@ -356,6 +467,40 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
         flyAppCreatedThisRun = true;
         flyAppName = appName;
         await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
+
+        // Egress policy (recreate path)
+        log(deploymentId, "Setting egress network policy…");
+        try {
+          await createEgressPolicy(appName);
+        } catch (err) {
+          throw new DeployError("provision", "Failed to configure network policy. Please try again.");
+        }
+
+        // Proxy token — always reissue on recreate
+        log(deploymentId, "Setting proxy credentials…");
+        const recreateToken = await issueProxyToken(appId);
+        try {
+          await setProxySecret(appName, recreateToken);
+        } catch (err) {
+          if (err instanceof DeployError) throw err;
+          throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
+        }
+      } else {
+        // Existing redeploy — ensure proxy credentials exist (issue if missing)
+        const { rows: credRows } = await pool.query<{ app_id: string }>(
+          "SELECT app_id FROM proxy_credentials WHERE app_id = $1",
+          [appId],
+        );
+        if (credRows.length === 0) {
+          log(deploymentId, "Setting proxy credentials…");
+          const redeployToken = await issueProxyToken(appId);
+          try {
+            await setProxySecret(appName, redeployToken);
+          } catch (err) {
+            if (err instanceof DeployError) throw err;
+            throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
+          }
+        }
       }
     } else {
       appName = generateFlyAppName();
@@ -374,13 +519,31 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       flyAppCreatedThisRun = true;
       flyAppName = appName;
       await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
+
+      // Egress policy (first deploy path)
+      log(deploymentId, "Setting egress network policy…");
+      try {
+        await createEgressPolicy(appName);
+      } catch (err) {
+        throw new DeployError("provision", "Failed to configure network policy. Please try again.");
+      }
+
+      // Proxy token — always issue on first deploy
+      log(deploymentId, "Setting proxy credentials…");
+      const firstToken = await issueProxyToken(appId);
+      try {
+        await setProxySecret(appName, firstToken);
+      } catch (err) {
+        if (err instanceof DeployError) throw err;
+        throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
+      }
     }
     flyAppName = appName;
 
     // Step 3b: generate Dockerfile + fly.toml (lockfile-aware for Node)
     log(deploymentId, "Generating deploy files…");
     try {
-      await generateDeployFiles(workDir, appName, appType);
+      await generateDeployFiles(workDir, appName, appType, appId);
     } catch (err) {
       throw new DeployError(
         "provision",
@@ -393,6 +556,25 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     eventBus.emit(deploymentId, { type: "status", status: "deploying" });
 
     await runFlyctlDeploy(workDir, appName, deploymentId);
+
+    // Step 4b: verify the access proxy is up
+    log(deploymentId, "Verifying access proxy…");
+    try {
+      await verifyProxy(appName, appId);
+    } catch {
+      // Proxy failed to come up — stop all machines so the app is not reachable
+      // in a half-deployed state, then mark the deployment failed.
+      try {
+        const machines = await listMachines(appName);
+        await Promise.all(machines.map((m) => stopMachine(appName, m.id).catch(() => {})));
+      } catch {
+        // best-effort — do not mask the real error
+      }
+      throw new DeployError(
+        "verify",
+        "The app did not come up behind the access proxy, so it was stopped. Please redeploy.",
+      );
+    }
 
     // Step 5: success
     // The live URL follows Fly's deterministic pattern; no JSON parsing needed.

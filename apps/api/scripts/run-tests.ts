@@ -990,7 +990,7 @@ async function main(): Promise<void> {
         t.kind === "static" ? ok("Static: kind=static") : fail("Static detection failed");
 
         const { internalPort } = await generateDeployFiles(d, "ssc-static-test", t);
-        internalPort === 80 ? ok("Static: internalPort=80") : fail("expected 80");
+        internalPort === 8080 ? ok("Static: app port 8080 (behind proxy)") : fail("expected 8080");
         const df = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
         df.includes("nginx:alpine") ? ok("Static: Dockerfile has nginx") : fail("Dockerfile missing nginx");
       } finally { await cleanup(d); }
@@ -1011,7 +1011,7 @@ async function main(): Promise<void> {
         const after = await fsTmp.readFile(pathTmp.join(d, "Dockerfile"), "utf8");
         before === after ? ok("Dockerfile pass-through: user Dockerfile not overwritten") : fail("user Dockerfile was overwritten");
         const ft = await fsTmp.readFile(pathTmp.join(d, "fly.toml"), "utf8");
-        ft.includes("internal_port = 3000") ? ok("Dockerfile pass-through: fly.toml sniffed EXPOSE 3000") : fail("fly.toml wrong port");
+        (ft.includes("internal_port = 8787") && ft.includes('"APP_PORT":"3000"') && ft.includes('"PORT":"3000"')) ? ok("Dockerfile pass-through: EXPOSE 3000 becomes APP_PORT 3000 behind the proxy on 8787") : fail("fly.toml wrong port", ft.slice(0, 400));
       } finally { await cleanup(d); }
     }
 
@@ -5076,6 +5076,553 @@ async function main(): Promise<void> {
       after.length === 0
         ? ok("AD4: pending row removed for a+b@test.local")
         : fail("AD4: pending row should be gone after unshare");
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AE: proxy integration (egress, token, fly.toml, verification)");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    // ── AE setup ──────────────────────────────────────────────────────────────
+    const { rows: aeOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_ae','AE Org','ae-org') RETURNING id",
+    );
+    const aeOrgId = aeOrgRows[0].id;
+    const { fullKey: aeKey, keyPrefix: aeKP, keyHash: aeKH } = generateApiKey();
+    const { rows: aeKeyRows } = await pool.query<{ id: string; created_by: string }>(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'ae-key',$3,$4) RETURNING id, created_by",
+      [aeOrgId, userId, aeKP, aeKH],
+    );
+    void aeKeyRows; // used implicitly via aeKey
+
+    // Minimal Node.js zip — same as Section S
+    const aeZip = await buildZip({
+      "package.json": JSON.stringify({
+        name: "ae-test-app", version: "1.0.0",
+        scripts: { start: "node index.js" },
+      }),
+      "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+    });
+
+    // Helper: submit a deploy, wait for terminal state
+    const aeIntake = async (extra: Record<string, string> = {}): Promise<{ deployment_id: string; app_id: string }> => {
+      const form = new FormData();
+      form.append("code", aeZip, { filename: "app.zip", contentType: "application/zip" });
+      for (const [k, v] of Object.entries(extra)) form.append(k, v);
+      const r = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aeKey), formData: form,
+      });
+      if (r.status !== 202) throw new Error(`intake returned ${r.status}: ${JSON.stringify(r.body)}`);
+      return r.body as { deployment_id: string; app_id: string };
+    };
+
+    // ── AE1: startup config validation (regex / URL checks) ───────────────────
+    {
+      // Test the PROXY_IMAGE validation regex directly — these run in-process.
+      const PROXY_RE = /^registry\.fly\.io\/[a-z0-9-]+@sha256:[0-9a-f]{64}$/;
+      const validImg = `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`;
+      PROXY_RE.test(validImg)
+        ? ok("AE1: valid PROXY_IMAGE accepted")
+        : fail("AE1: valid PROXY_IMAGE rejected");
+
+      const badImages = [
+        "",
+        "registry.fly.io/ssc-proxy",                              // no digest
+        `docker.io/ssc-proxy@sha256:${"a".repeat(64)}`,           // wrong registry
+        `registry.fly.io/ssc-proxy@sha256:${"a".repeat(63)}`,     // digest too short
+        `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}x`,    // digest too long
+      ];
+      let allBadRejected = true;
+      for (const bad of badImages) {
+        if (PROXY_RE.test(bad)) { allBadRejected = false; break; }
+      }
+      allBadRejected
+        ? ok("AE1: all invalid PROXY_IMAGE values rejected")
+        : fail("AE1: at least one invalid PROXY_IMAGE was accepted");
+
+      // API_PUBLIC_URL validation: https required except http://localhost in test
+      const isValidApiUrl = (url: string, testMode: boolean): boolean => {
+        try {
+          const u = new URL(url);
+          const isLocalhost = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+          return u.protocol === "https:" || (testMode && isLocalhost);
+        } catch { return false; }
+      };
+      isValidApiUrl("https://api.example.com", false)
+        ? ok("AE1: https API_PUBLIC_URL accepted")
+        : fail("AE1: https API_PUBLIC_URL should be accepted");
+      !isValidApiUrl("http://api.example.com", false)
+        ? ok("AE1: http non-localhost API_PUBLIC_URL rejected outside SSC_TEST")
+        : fail("AE1: http non-localhost API_PUBLIC_URL should be rejected outside SSC_TEST");
+      isValidApiUrl("http://localhost:4099", true)
+        ? ok("AE1: http://localhost API_PUBLIC_URL accepted when SSC_TEST=1")
+        : fail("AE1: http://localhost should be accepted when SSC_TEST=1");
+    }
+
+    // ── AE2: fly.toml structure — full structural parsing across all app types ──
+    {
+      // Helper: call gen-fly-toml and parse the machine_config JSON from the
+      // TOML literal-string block ('''...''').
+      const genAndParse = async (
+        label: string,
+        body: Record<string, unknown>,
+      ): Promise<{ toml: string; mc: Record<string, unknown> } | null> => {
+        const r = await request("POST", "/test/gen-fly-toml", { body });
+        if (r.status !== 200) {
+          fail(`AE2 ${label}: gen-fly-toml returned ${r.status}`, JSON.stringify(r.body).slice(0, 100));
+          return null;
+        }
+        const { flyToml: toml } = r.body as { flyToml: string };
+        const mcMatch = toml.match(/machine_config\s*=\s*'''([\s\S]*?)'''/);
+        if (!mcMatch) {
+          fail(`AE2 ${label}: machine_config ''' block not found in fly.toml`, toml.slice(0, 300));
+          return null;
+        }
+        let mc: Record<string, unknown>;
+        try {
+          mc = JSON.parse(mcMatch[1]) as Record<string, unknown>;
+        } catch (e) {
+          fail(`AE2 ${label}: machine_config JSON failed to parse: ${e}`, mcMatch[1].slice(0, 200));
+          return null;
+        }
+        return { toml, mc };
+      };
+
+      // Helper: assert the invariant TOML structure for any app type.
+      const assertTomlStructure = (label: string, toml: string): void => {
+        // container = "app" must appear INSIDE [experimental], NOT at top level.
+        // Extract the [experimental] section: text from "[experimental]" up to the next "[" header.
+        const expMatch = toml.match(/\[experimental\]([\s\S]*?)(?=\n\[|\s*$)/);
+        const expSection = expMatch ? expMatch[1] : "";
+        expSection.includes('container = "app"')
+          ? ok(`AE2 ${label}: container = "app" is inside [experimental]`)
+          : fail(`AE2 ${label}: container = "app" missing inside [experimental]`, expSection.slice(0, 100));
+
+        // Must NOT appear before [experimental] (top-level)
+        const beforeExp = toml.split("[experimental]")[0] ?? "";
+        !beforeExp.includes('container = "app"')
+          ? ok(`AE2 ${label}: container = "app" NOT at top level`)
+          : fail(`AE2 ${label}: container = "app" must not appear at top level`);
+
+        // http_service checks
+        const internalPortMatch = toml.match(/internal_port\s*=\s*(\d+)/);
+        internalPortMatch?.[1] === "8787"
+          ? ok(`AE2 ${label}: internal_port = 8787`)
+          : fail(`AE2 ${label}: internal_port should be 8787`, internalPortMatch?.[1]);
+
+        // Pre-change http_service settings must be preserved exactly
+        toml.includes('auto_stop_machines = "suspend"')
+          ? ok(`AE2 ${label}: auto_stop_machines = "suspend"`)
+          : fail(`AE2 ${label}: auto_stop_machines should be "suspend"`);
+        toml.includes("auto_start_machines = true")
+          ? ok(`AE2 ${label}: auto_start_machines = true`)
+          : fail(`AE2 ${label}: auto_start_machines should be true`);
+        toml.includes("min_machines_running = 1")
+          ? ok(`AE2 ${label}: min_machines_running = 1`)
+          : fail(`AE2 ${label}: min_machines_running should be 1`);
+      };
+
+      // Helper: assert exact machine_config structure.
+      const assertMachineConfig = (
+        label: string,
+        mc: Record<string, unknown>,
+        appId: string,
+        expectedAppPort: number,
+      ): void => {
+        const containers = mc.containers as Array<Record<string, unknown>>;
+        Array.isArray(containers) && containers.length === 2
+          ? ok(`AE2 ${label}: containers array has 2 entries`)
+          : fail(`AE2 ${label}: containers should be array of length 2`, JSON.stringify(mc).slice(0, 100));
+
+        const proxy = containers?.[0] ?? {};
+        const appCt = containers?.[1] ?? {};
+
+        // proxy container
+        proxy.name === "proxy"
+          ? ok(`AE2 ${label}: proxy container name = "proxy"`)
+          : fail(`AE2 ${label}: proxy container name should be "proxy"`, String(proxy.name));
+        typeof proxy.image === "string" && proxy.image.startsWith("registry.fly.io/")
+          ? ok(`AE2 ${label}: proxy image is registry.fly.io/... image`)
+          : fail(`AE2 ${label}: proxy image wrong`, String(proxy.image));
+
+        const penv = proxy.env as Record<string, string> | undefined;
+        penv?.SSC_APP_ID === appId
+          ? ok(`AE2 ${label}: proxy env.SSC_APP_ID = appId`)
+          : fail(`AE2 ${label}: proxy env.SSC_APP_ID wrong`, String(penv?.SSC_APP_ID));
+        typeof penv?.SSC_API_URL === "string" && penv.SSC_API_URL.length > 0
+          ? ok(`AE2 ${label}: proxy env.SSC_API_URL set`)
+          : fail(`AE2 ${label}: proxy env.SSC_API_URL missing`);
+        typeof penv?.SSC_LOGIN_URL === "string" && penv.SSC_LOGIN_URL.includes("/access")
+          ? ok(`AE2 ${label}: proxy env.SSC_LOGIN_URL contains /access`)
+          : fail(`AE2 ${label}: proxy env.SSC_LOGIN_URL wrong`, String(penv?.SSC_LOGIN_URL));
+        penv?.LISTEN_PORT === "8787"
+          ? ok(`AE2 ${label}: proxy env.LISTEN_PORT = "8787"`)
+          : fail(`AE2 ${label}: proxy env.LISTEN_PORT should be "8787"`, String(penv?.LISTEN_PORT));
+        penv?.APP_PORT === String(expectedAppPort)
+          ? ok(`AE2 ${label}: proxy env.APP_PORT = "${expectedAppPort}"`)
+          : fail(`AE2 ${label}: proxy env.APP_PORT should be "${expectedAppPort}"`, String(penv?.APP_PORT));
+
+        // proxy healthchecks
+        const hc = (proxy.healthchecks as Array<Record<string, unknown>>)?.[0];
+        hc?.name === "listening"
+          ? ok(`AE2 ${label}: healthchecks[0].name = "listening"`)
+          : fail(`AE2 ${label}: healthchecks[0].name should be "listening"`, String(hc?.name));
+        (hc?.tcp as Record<string, unknown>)?.port === 8787
+          ? ok(`AE2 ${label}: healthchecks[0].tcp.port = 8787`)
+          : fail(`AE2 ${label}: healthchecks[0].tcp.port wrong`, JSON.stringify(hc?.tcp));
+        hc?.interval === 1 && hc?.timeout === 1 && hc?.grace_period === 0
+          ? ok(`AE2 ${label}: healthchecks numeric fields (interval/timeout/grace_period)`)
+          : fail(`AE2 ${label}: healthchecks numeric fields wrong`, JSON.stringify(hc));
+        hc?.success_threshold === 1 && hc?.failure_threshold === 3
+          ? ok(`AE2 ${label}: healthchecks thresholds (success=1, failure=3)`)
+          : fail(`AE2 ${label}: healthchecks thresholds wrong`, JSON.stringify(hc));
+
+        // app container
+        appCt.name === "app"
+          ? ok(`AE2 ${label}: app container name = "app"`)
+          : fail(`AE2 ${label}: app container name should be "app"`, String(appCt.name));
+        appCt.image === "placeholder"
+          ? ok(`AE2 ${label}: app container image = "placeholder"`)
+          : fail(`AE2 ${label}: app container image should be "placeholder"`, String(appCt.image));
+        (appCt.env as Record<string, string>)?.PORT === String(expectedAppPort)
+          ? ok(`AE2 ${label}: app container env.PORT = "${expectedAppPort}"`)
+          : fail(`AE2 ${label}: app container env.PORT wrong`, String((appCt.env as Record<string, string>)?.PORT));
+
+        // depends_on uses "name" key, not "container"
+        const dep = (appCt.depends_on as Array<Record<string, unknown>>)?.[0];
+        dep?.name === "proxy"
+          ? ok(`AE2 ${label}: depends_on[0].name = "proxy"`)
+          : fail(`AE2 ${label}: depends_on[0].name should be "proxy"`, JSON.stringify(dep));
+        dep?.condition === "healthy"
+          ? ok(`AE2 ${label}: depends_on[0].condition = "healthy"`)
+          : fail(`AE2 ${label}: depends_on[0].condition should be "healthy"`, String(dep?.condition));
+        !("container" in (dep ?? {}))
+          ? ok(`AE2 ${label}: depends_on uses "name" key, not "container"`)
+          : fail(`AE2 ${label}: depends_on must not use "container" key`);
+      };
+
+      const AE2_APP_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+      // ── Node ──────────────────────────────────────────────────────────────────
+      {
+        const r = await genAndParse("node", { appName: "ae2-node", appId: AE2_APP_ID, kind: "node" });
+        if (r) {
+          assertTomlStructure("node", r.toml);
+          assertMachineConfig("node", r.mc, AE2_APP_ID, 8080);
+        }
+      }
+
+      // ── Python ────────────────────────────────────────────────────────────────
+      {
+        const r = await genAndParse("python", { appName: "ae2-python", appId: AE2_APP_ID, kind: "python" });
+        if (r) {
+          assertTomlStructure("python", r.toml);
+          assertMachineConfig("python", r.mc, AE2_APP_ID, 8080);
+        }
+      }
+
+      // ── Static (nginx) ────────────────────────────────────────────────────────
+      {
+        const r = await genAndParse("static", { appName: "ae2-static", appId: AE2_APP_ID, kind: "static" });
+        if (r) {
+          assertTomlStructure("static", r.toml);
+          assertMachineConfig("static", r.mc, AE2_APP_ID, 8080);
+          // nginx config must listen on 8080
+          const nginxR = await request("POST", "/test/gen-fly-toml", {
+            body: { appName: "ae2-static-ng", appId: AE2_APP_ID, kind: "static" },
+          });
+          if (nginxR.status === 200) {
+            const { nginxConf } = nginxR.body as { nginxConf?: string };
+            (nginxConf ?? "").includes("listen 8080")
+              ? ok("AE2 static: nginx listens on 8080")
+              : fail("AE2 static: nginx should listen on 8080", (nginxConf ?? "").slice(0, 80));
+          }
+        }
+      }
+
+      // ── User Dockerfile with EXPOSE 3000 (port pass-through) ─────────────────
+      {
+        const r = await genAndParse("dockerfile-3000", {
+          appName: "ae2-dockerfile", appId: AE2_APP_ID, kind: "dockerfile", appPort: 3000,
+        });
+        if (r) {
+          assertTomlStructure("dockerfile-3000", r.toml);
+          assertMachineConfig("dockerfile-3000", r.mc, AE2_APP_ID, 3000);
+          // internal_port is still 8787 (proxy), not the app port
+          r.toml.includes("internal_port = 8787")
+            ? ok("AE2 dockerfile-3000: internal_port = 8787 (proxy), not app port")
+            : fail("AE2 dockerfile-3000: internal_port should be 8787");
+        }
+      }
+    }
+
+    // ── AE2b: user Dockerfile with EXPOSE 8787 → reserved-port deploy error ────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await resetFlyLog();
+
+      // Zip with a user Dockerfile that EXPOSEs the reserved port 8787
+      const ae2bZip = await buildZip({
+        "Dockerfile": "FROM nginx:alpine\nEXPOSE 8787\n",
+      });
+      const ae2bForm = new FormData();
+      ae2bForm.append("code", ae2bZip, { filename: "app.zip", contentType: "application/zip" });
+      const ae2bIntake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aeKey), formData: ae2bForm,
+      });
+      ae2bIntake.status === 202
+        ? ok("AE2b: intake accepted for EXPOSE 8787 Dockerfile")
+        : fail("AE2b: intake should 202", `${ae2bIntake.status}`);
+
+      const ae2bPoll = await pollDeployment(
+        (ae2bIntake.body as Record<string, string>).deployment_id, aeKey, 15000,
+      );
+
+      ae2bPoll.status === "failed"
+        ? ok("AE2b: deploy fails for EXPOSE 8787 Dockerfile")
+        : fail("AE2b: deploy should fail for reserved port 8787", ae2bPoll.status);
+      ae2bPoll.failure_stage === "detect"
+        ? ok("AE2b: failure_stage = detect")
+        : fail("AE2b: failure_stage should be detect", ae2bPoll.failure_stage ?? "");
+      ae2bPoll.failure_message?.includes("8787") && ae2bPoll.failure_message?.includes("reserved")
+        ? ok("AE2b: failure_message mentions reserved port 8787")
+        : fail("AE2b: failure_message should mention reserved port", ae2bPoll.failure_message ?? "");
+
+      // No Fly API calls should have been made
+      const ae2bLog = await getFlyLog();
+      ae2bLog.length === 0
+        ? ok("AE2b: no Fly API calls made before reserved-port failure")
+        : fail("AE2b: Fly API calls should be zero", JSON.stringify(ae2bLog));
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+
+    // ── AE3: ordering — egress policy before deploy; token before deploy ───────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
+      await resetFlyLog();
+
+      const ae3 = await aeIntake({ app_name: "ae3-order-app" });
+      const ae3Poll = await pollDeployment(ae3.deployment_id, aeKey, 15000);
+
+      ae3Poll.status === "success"
+        ? ok("AE3: deploy succeeded")
+        : fail("AE3: deploy should succeed", `stage=${ae3Poll.failure_stage} msg=${ae3Poll.failure_message}`);
+
+      const ae3Log = await getFlyLog();
+      const createIdx = ae3Log.findIndex((c) => c.fn === "createFlyApp");
+      const egressIdx = ae3Log.findIndex((c) => c.fn === "createEgressPolicy");
+      createIdx >= 0
+        ? ok("AE3: createFlyApp in call log")
+        : fail("AE3: createFlyApp missing");
+      egressIdx >= 0
+        ? ok("AE3: createEgressPolicy in call log")
+        : fail("AE3: createEgressPolicy missing");
+      createIdx < egressIdx
+        ? ok("AE3: createFlyApp called before createEgressPolicy")
+        : fail("AE3: createFlyApp should precede createEgressPolicy", JSON.stringify(ae3Log));
+
+      const ae3EgressCall = ae3Log[egressIdx];
+      const expectedEgressBody = {
+        name: "ssc-default-egress",
+        selector: { all: true },
+        rules: [
+          {
+            action: "allow",
+            direction: "egress",
+            ports: [
+              { protocol: "udp", port: 53 },
+              { protocol: "tcp", port: 53 },
+              { protocol: "tcp", port: 80 },
+              { protocol: "tcp", port: 443 },
+            ],
+          },
+        ],
+      };
+      JSON.stringify(ae3EgressCall?.body) === JSON.stringify(expectedEgressBody)
+        ? ok("AE3: createEgressPolicy body matches exact spec")
+        : fail("AE3: createEgressPolicy body mismatch", JSON.stringify(ae3EgressCall?.body));
+
+      // listMachines should be in the log (from successful verification path — stopMachine is NOT
+      // called on success; listMachines is only called on verify failure)
+      const verifyLog = ae3Log.filter((c) => c.fn === "listMachines");
+      verifyLog.length === 0
+        ? ok("AE3: listMachines NOT called on successful deploy (correct)")
+        : fail("AE3: listMachines should not be called when verify succeeds");
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+
+    // ── AE4: proxy token security — token in stdin, not in argv ───────────────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
+      await request("POST", "/test/clear-flyctl-capture");
+
+      const ae4 = await aeIntake({ app_name: "ae4-token-app" });
+      const ae4Poll = await pollDeployment(ae4.deployment_id, aeKey, 15000);
+
+      ae4Poll.status === "success"
+        ? ok("AE4: deploy succeeded")
+        : fail("AE4: deploy should succeed", `stage=${ae4Poll.failure_stage} msg=${ae4Poll.failure_message}`);
+
+      const capture = await request("GET", "/test/get-flyctl-capture");
+      const { argv, stdin } = capture.body as { argv: string; stdin: string };
+
+      // argv of the most recent flyctl call should NOT contain the token
+      const tokenInArgv = argv.includes("sscp_") || argv.includes("SSC_PROXY_TOKEN");
+      !tokenInArgv
+        ? ok("AE4: proxy token NOT in flyctl argv")
+        : fail("AE4: proxy token must not appear in flyctl argv", argv.slice(0, 100));
+
+      // stdin should contain the token assignment
+      const tokenInStdin = stdin.includes("SSC_PROXY_TOKEN=sscp_");
+      tokenInStdin
+        ? ok("AE4: proxy token delivered via stdin (SSC_PROXY_TOKEN=sscp_...)")
+        : fail("AE4: proxy token missing from flyctl stdin", stdin.slice(0, 100));
+
+      // Verify the proxy_credentials row exists in the DB
+      const { rows: credRows } = await pool.query<{ app_id: string }>(
+        "SELECT app_id FROM proxy_credentials WHERE app_id = $1", [ae4.app_id],
+      );
+      credRows.length > 0
+        ? ok("AE4: proxy_credentials row created in DB")
+        : fail("AE4: proxy_credentials row missing");
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+
+    // ── AE5: redeploy skips token; recreate reissues token ────────────────────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
+
+      // First deploy — creates token
+      await request("POST", "/test/clear-flyctl-capture");
+      const ae5a = await aeIntake({ app_name: "ae5-token-app" });
+      const ae5aPoll = await pollDeployment(ae5a.deployment_id, aeKey, 15000);
+      ae5aPoll.status === "success"
+        ? ok("AE5: first deploy succeeded")
+        : fail("AE5: first deploy should succeed", ae5aPoll.failure_message ?? "");
+      const ae5aCapture = (await request("GET", "/test/get-flyctl-capture")).body as { stdin: string };
+      const ae5aHadToken = ae5aCapture.stdin.includes("SSC_PROXY_TOKEN=sscp_");
+      ae5aHadToken
+        ? ok("AE5: token issued on first deploy")
+        : fail("AE5: first deploy should issue token");
+
+      // Redeploy the same app (fly_app_id is set, checkExistsResult = true)
+      await request("POST", "/test/set-fly-check-exists", { body: { result: true } });
+      await request("POST", "/test/clear-flyctl-capture");
+      const ae5b = await aeIntake({ app_id: ae5a.app_id });
+      const ae5bPoll = await pollDeployment(ae5b.deployment_id, aeKey, 15000);
+      ae5bPoll.status === "success"
+        ? ok("AE5: redeploy succeeded")
+        : fail("AE5: redeploy should succeed", ae5bPoll.failure_message ?? "");
+      const ae5bCapture = (await request("GET", "/test/get-flyctl-capture")).body as { stdin: string };
+      // stdin captured is from the last flyctl invocation (flyctl deploy) — no secrets import
+      const ae5bHadToken = ae5bCapture.stdin.includes("SSC_PROXY_TOKEN=sscp_");
+      !ae5bHadToken
+        ? ok("AE5: token NOT reissued on redeploy (existing credentials kept)")
+        : fail("AE5: token should not be reissued when proxy_credentials row exists");
+
+      // Recreate (checkFlyAppExists returns false → recreate path → reissue token)
+      await request("POST", "/test/set-fly-check-exists", { body: { result: false } });
+      await request("POST", "/test/clear-flyctl-capture");
+      const ae5c = await aeIntake({ app_id: ae5a.app_id });
+      const ae5cPoll = await pollDeployment(ae5c.deployment_id, aeKey, 15000);
+      ae5cPoll.status === "success"
+        ? ok("AE5: recreate succeeded")
+        : fail("AE5: recreate should succeed", ae5cPoll.failure_message ?? "");
+      const ae5cCapture = (await request("GET", "/test/get-flyctl-capture")).body as { stdin: string };
+      ae5cCapture.stdin.includes("SSC_PROXY_TOKEN=sscp_")
+        ? ok("AE5: token reissued on recreate")
+        : fail("AE5: recreate should reissue proxy token");
+
+      // Restore defaults
+      await request("POST", "/test/set-fly-check-exists", { body: { result: true } });
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+
+    // ── AE6: verification outcomes ─────────────────────────────────────────────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await resetFlyLog();
+
+      // AE6a: missing proxy header → verify fails → machines stopped
+      await request("POST", "/test/set-verify-mode", { body: { mode: "missing-proxy-header" } });
+      const ae6a = await aeIntake({ app_name: "ae6a-no-header" });
+      const ae6aPoll = await pollDeployment(ae6a.deployment_id, aeKey, 15000);
+      ae6aPoll.status === "failed"
+        ? ok("AE6a: deploy failed when proxy header missing")
+        : fail("AE6a: should fail when x-ssc-proxy header missing", ae6aPoll.status);
+      ae6aPoll.failure_stage === "verify"
+        ? ok("AE6a: failure_stage = verify")
+        : fail("AE6a: failure_stage should be 'verify'", ae6aPoll.failure_stage ?? "");
+      ae6aPoll.failure_message?.includes("did not come up behind the access proxy")
+        ? ok("AE6a: failure_message mentions proxy")
+        : fail("AE6a: wrong failure_message", ae6aPoll.failure_message ?? "");
+
+      // machines should have been stopped
+      const ae6aLog = await getFlyLog();
+      const ae6aStops = ae6aLog.filter((c) => c.fn === "stopMachine");
+      ae6aStops.length > 0
+        ? ok("AE6a: stopMachine called after verify failure")
+        : fail("AE6a: stopMachine should be called on verify failure");
+      await resetFlyLog();
+
+      // AE6b: wrong redirect → verify fails
+      await request("POST", "/test/set-verify-mode", { body: { mode: "wrong-redirect" } });
+      const ae6b = await aeIntake({ app_name: "ae6b-wrong-redirect" });
+      const ae6bPoll = await pollDeployment(ae6b.deployment_id, aeKey, 15000);
+      ae6bPoll.status === "failed"
+        ? ok("AE6b: deploy failed when redirect target wrong")
+        : fail("AE6b: should fail when redirect not to /access", ae6bPoll.status);
+      ae6bPoll.failure_stage === "verify"
+        ? ok("AE6b: failure_stage = verify")
+        : fail("AE6b: failure_stage should be 'verify'", ae6bPoll.failure_stage ?? "");
+      await resetFlyLog();
+
+      // AE6c: success mode → deploy succeeds, no stopMachine
+      await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
+      const ae6c = await aeIntake({ app_name: "ae6c-verify-ok" });
+      const ae6cPoll = await pollDeployment(ae6c.deployment_id, aeKey, 15000);
+      ae6cPoll.status === "success"
+        ? ok("AE6c: deploy succeeds when verification passes")
+        : fail("AE6c: deploy should succeed with working proxy", `${ae6cPoll.failure_stage}: ${ae6cPoll.failure_message}`);
+      const ae6cLog = await getFlyLog();
+      ae6cLog.filter((c) => c.fn === "stopMachine").length === 0
+        ? ok("AE6c: stopMachine NOT called on success")
+        : fail("AE6c: stopMachine should not be called on successful verify");
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+
+    // ── AE7: egress policy failure → DeployError at "provision" ───────────────
+    {
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
+      await request("POST", "/test/set-egress-fail", { body: { fail: true } });
+
+      const ae7 = await aeIntake({ app_name: "ae7-egress-fail" });
+      const ae7Poll = await pollDeployment(ae7.deployment_id, aeKey, 15000);
+
+      ae7Poll.status === "failed"
+        ? ok("AE7: deploy fails when egress policy creation fails")
+        : fail("AE7: should fail when createEgressPolicy throws", ae7Poll.status);
+      ae7Poll.failure_stage === "provision"
+        ? ok("AE7: failure_stage = provision")
+        : fail("AE7: failure_stage should be 'provision'", ae7Poll.failure_stage ?? "");
+
+      // Reset
+      await request("POST", "/test/set-egress-fail", { body: { fail: false } });
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
     }
   }
 

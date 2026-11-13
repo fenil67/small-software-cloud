@@ -24,6 +24,15 @@ process.env.FLY_API_TOKEN = "test-token";
 process.env.FLY_ORG_SLUG = "test-org";
 process.env.CLERK_SECRET_KEY = "sk_test_fake";
 process.env.SSC_TEST = "1";
+// Proxy integration env — fake digest-pinned image and local URLs satisfy
+// the startup validation in index.ts (not used here, but deployRunner reads them).
+process.env.PROXY_IMAGE = `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`;
+const _testPort = process.env.TEST_PORT ?? "4099";
+process.env.API_PUBLIC_URL = `http://localhost:${_testPort}`;
+process.env.WEB_URL = `http://localhost:${_testPort}`;
+process.env.SSC_VERIFY_BASE_URL = `http://localhost:${_testPort}`;
+// Keep verification fast in tests (1 s timeout, 100 ms poll)
+process.env.SSC_VERIFY_TIMEOUT_MS = "1000";
 
 // ── Log capture (intercept console.error BEFORE any module imports) ───────────
 // Section N drains these to verify no secret leaks in error logs.
@@ -56,9 +65,28 @@ import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/e
 // ── Fake flyctl binary ────────────────────────────────────────────────────────
 // Prepended to PATH so runFlyctlDeploy in the real deployRunner finds it.
 // Default: exit 0 (success). Sections S and T toggle via POST /test/set-flyctl-mode.
+// When called with "secrets" as the first arg, stdin is captured to a file so
+// AE tests can verify the proxy token is delivered via stdin, not argv.
 const _fakeFlyctlDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-test-flyctl-"));
 const _fakeFlyctlBin = path.join(_fakeFlyctlDir, "flyctl");
-fs.writeFileSync(_fakeFlyctlBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+const _flyctlArgvFile = path.join(_fakeFlyctlDir, "flyctl-argv");
+const _flyctlStdinFile = path.join(_fakeFlyctlDir, "flyctl-stdin");
+
+function writeFlyctlScript(exitCode: number, stdoutCmd?: string): void {
+  // The "secrets" branch always exits 0 — failure modes only apply to other
+  // subcommands (e.g. "deploy").  This matches real flyctl behaviour where
+  // secrets import is a separate, independent call.
+  const script = `#!/bin/sh
+echo "$@" > ${_flyctlArgvFile}
+if [ "$1" = "secrets" ]; then
+  cat > ${_flyctlStdinFile}
+  exit 0
+fi
+${stdoutCmd ? stdoutCmd + "\n" : ""}exit ${exitCode}
+`;
+  fs.writeFileSync(_fakeFlyctlBin, script, { mode: 0o755 });
+}
+writeFlyctlScript(0);
 process.env.PATH = _fakeFlyctlDir + ":" + (process.env.PATH ?? "");
 
 // ── Stub deployRunner ─────────────────────────────────────────────────────────
@@ -167,6 +195,8 @@ const _flyCallLog: FlyCall[] = [];
 let _checkExistsResult = true;
 let _destroyFailuresRemaining = 0;
 let _flyErrorMode = false;
+let _egressFailMode = false;
+let _listMachinesResult: Array<{ id: string; state?: string }> = [{ id: "test-machine-1" }];
 
 flyModule.createFlyApp = async (name: string, orgSlug: string, network: string) => {
   _flyCallLog.push({ fn: "createFlyApp", arg: name, body: { app_name: name, org_slug: orgSlug, network } });
@@ -175,6 +205,17 @@ flyModule.allocateFlyIp = async () => "1.2.3.4";
 flyModule.checkFlyAppExists = async (name: string): Promise<boolean> => {
   _flyCallLog.push({ fn: "checkFlyAppExists", arg: name });
   return _checkExistsResult;
+};
+flyModule.createEgressPolicy = async (appName: string) => {
+  _flyCallLog.push({ fn: "createEgressPolicy", arg: appName, body: flyModule.EGRESS_POLICY_BODY });
+  if (_egressFailMode) throw new Error("network policy creation failed (test)");
+};
+flyModule.listMachines = async (appName: string) => {
+  _flyCallLog.push({ fn: "listMachines", arg: appName });
+  return [..._listMachinesResult];
+};
+flyModule.stopMachine = async (appName: string, machineId: string) => {
+  _flyCallLog.push({ fn: "stopMachine", arg: appName, body: { machineId } });
 };
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
@@ -280,16 +321,14 @@ app.post("/test/set-real-deploy", (req, res) => {
 // it reaches the stored failure_message or SSE error event.
 app.post("/test/set-flyctl-mode", (req, res) => {
   const { mode } = req.body as { mode?: string };
-  let script: string;
   if (mode === "failure") {
-    script = "#!/bin/sh\nexit 1\n";
+    writeFlyctlScript(1);
   } else if (mode === "failure-with-token") {
     // flyctlEnv() passes FLY_API_TOKEN; fake flyctl echoes it then fails
-    script = '#!/bin/sh\necho "unauthorized token=$FLY_API_TOKEN"\nexit 1\n';
+    writeFlyctlScript(1, 'echo "unauthorized token=$FLY_API_TOKEN"');
   } else {
-    script = "#!/bin/sh\nexit 0\n";
+    writeFlyctlScript(0);
   }
-  fs.writeFileSync(_fakeFlyctlBin, script, { mode: 0o755 });
   res.json({ ok: true, mode: mode ?? "success" });
 });
 
@@ -326,6 +365,79 @@ app.post("/test/set-fly-check-exists", (req, res) => {
 app.post("/test/set-fly-error", (req, res) => {
   _flyErrorMode = !!(req.body as { enabled?: boolean }).enabled;
   res.json({ ok: true, flyErrorMode: _flyErrorMode });
+});
+
+// POST /test/set-egress-fail { fail: bool }
+// When enabled, createEgressPolicy throws — used by AE7 to verify DeployError at "provision".
+app.post("/test/set-egress-fail", (req, res) => {
+  _egressFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, egressFailMode: _egressFailMode });
+});
+
+// POST /test/set-machines { machines: [{ id: string }] }
+// Controls the list returned by listMachines (default: [{ id: "test-machine-1" }]).
+app.post("/test/set-machines", (req, res) => {
+  const { machines } = req.body as { machines?: Array<{ id: string }> };
+  _listMachinesResult = machines ?? [];
+  res.json({ ok: true });
+});
+
+// GET /test/get-flyctl-capture — returns last argv and stdin captured by fake flyctl
+app.get("/test/get-flyctl-capture", (_req, res) => {
+  const argv = fs.existsSync(_flyctlArgvFile) ? fs.readFileSync(_flyctlArgvFile, "utf8").trim() : "";
+  const stdin = fs.existsSync(_flyctlStdinFile) ? fs.readFileSync(_flyctlStdinFile, "utf8") : "";
+  res.json({ argv, stdin });
+});
+
+// POST /test/clear-flyctl-capture — clears capture files
+app.post("/test/clear-flyctl-capture", (_req, res) => {
+  try { fs.unlinkSync(_flyctlArgvFile); } catch { /* ok */ }
+  try { fs.unlinkSync(_flyctlStdinFile); } catch { /* ok */ }
+  res.json({ ok: true });
+});
+
+// POST /test/gen-fly-toml { appName, appId, kind?, appPort? }
+// Calls generateDeployFiles in-process and returns generated fly.toml (and nginx conf
+// for static).  kind: "node"|"python"|"static"|"dockerfile" (default "node").
+// appPort is passed through for the "dockerfile" kind to test port pass-through.
+app.post("/test/gen-fly-toml", async (req, res) => {
+  const { appName, appId, kind, appPort } = req.body as {
+    appName?: string; appId?: string; kind?: string; appPort?: number;
+  };
+  if (!appName || !appId) { res.status(400).json({ error: "appName and appId required" }); return; }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-gen-toml-"));
+  try {
+    const { generateDeployFiles } = require("../src/services/dockerfileGen") as typeof import("../src/services/dockerfileGen");
+    type AppType = Parameters<typeof generateDeployFiles>[2];
+    const appType: AppType =
+      kind === "static"
+        ? { kind: "static" }
+        : kind === "python"
+        ? { kind: "python", server: "gunicorn", entrypoint: "app:app" }
+        : kind === "dockerfile"
+        ? { kind: "dockerfile" }
+        : { kind: "node", packageManager: "npm", startCommand: "node index.js" };
+
+    if (kind === "static") {
+      fs.writeFileSync(path.join(tmpDir, "index.html"), "<h1>test</h1>");
+    }
+    if (kind === "python") {
+      fs.writeFileSync(path.join(tmpDir, "requirements.txt"), "flask\n");
+    }
+    // For "dockerfile", generateDeployFiles only writes fly.toml — no Dockerfile needed.
+
+    await generateDeployFiles(tmpDir, appName, appType, appId, typeof appPort === "number" ? appPort : undefined);
+
+    const flyToml = fs.readFileSync(path.join(tmpDir, "fly.toml"), "utf8");
+    const nginxConf = kind === "static" && fs.existsSync(path.join(tmpDir, "ssc-nginx.conf"))
+      ? fs.readFileSync(path.join(tmpDir, "ssc-nginx.conf"), "utf8")
+      : undefined;
+    res.json({ flyToml, ...(nginxConf ? { nginxConf } : {}) });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  } finally {
+    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+  }
 });
 
 // POST /test/run-reaper
@@ -366,6 +478,46 @@ app.get("/test/db-error", async (_req: Request, _res: Response, next: NextFuncti
     next(err);
     return;
   }
+});
+
+// ── Fake proxy verification endpoints (AE tests) ──────────────────────────────
+// When real deployRunner runs, verifyProxy polls /__ssc/health and GET / on
+// SSC_VERIFY_BASE_URL (= this test server).  These routes simulate the proxy
+// sidecar's responses; mode is controlled via POST /test/set-verify-mode.
+
+let _verifyMode: "success" | "missing-proxy-header" | "wrong-redirect" | "down" = "success";
+
+app.post("/test/set-verify-mode", (req, res) => {
+  const { mode } = req.body as { mode?: string };
+  if (mode === "success" || mode === "missing-proxy-header" || mode === "wrong-redirect" || mode === "down") {
+    _verifyMode = mode;
+  }
+  res.json({ ok: true, verifyMode: _verifyMode });
+});
+
+app.get("/__ssc/health", (_req, res) => {
+  if (_verifyMode === "down") { res.status(503).json({}); return; }
+  if (_verifyMode === "missing-proxy-header") { res.status(200).json({ ok: true }); return; }
+  // success and wrong-redirect both pass the health check
+  res.set("x-ssc-proxy", "1").status(200).json({ ok: true });
+});
+
+// GET / — fake proxy root redirect for verification
+// In test mode verifyProxy checks only that Location starts with WEB_URL+"/access?app=",
+// so a fixed placeholder UUID is fine.
+const _FAKE_APP_UUID = "00000000-0000-0000-0000-000000000000";
+app.get("/", (req, res, next) => {
+  // Only intercept requests that look like the proxy verification check
+  if (!req.headers["accept"]?.includes("text/html") || _verifyMode === "down") {
+    next(); return;
+  }
+  const webUrl = process.env.WEB_URL ?? "";
+  if (_verifyMode === "wrong-redirect") {
+    res.set("x-ssc-proxy", "1").redirect(302, `${webUrl}/wrong-path?app=${_FAKE_APP_UUID}`);
+    return;
+  }
+  // success
+  res.set("x-ssc-proxy", "1").redirect(302, `${webUrl}/access?app=${_FAKE_APP_UUID}`);
 });
 
 // NOTE: no clerkMiddleware() — we only test API-key auth paths
