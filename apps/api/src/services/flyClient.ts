@@ -153,8 +153,8 @@ export async function listMachines(appName: string): Promise<FlyMachine[]> {
   return Array.isArray(data) ? data : [];
 }
 
-/** Sends a stop signal to a specific machine. */
-export async function stopMachine(appName: string, machineId: string): Promise<void> {
+/** Force-destroys a specific machine so auto_start_machines cannot restart it. */
+export async function destroyMachine(appName: string, machineId: string): Promise<void> {
   const client = makeClient();
-  await client.post(`/apps/${appName}/machines/${machineId}/stop`);
+  await client.delete(`/apps/${appName}/machines/${machineId}?force=true`);
 }

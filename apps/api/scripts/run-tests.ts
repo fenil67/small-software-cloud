@@ -5278,6 +5278,13 @@ async function main(): Promise<void> {
           ? ok(`AE2 ${label}: healthchecks thresholds (success=1, failure=3)`)
           : fail(`AE2 ${label}: healthchecks thresholds wrong`, JSON.stringify(hc));
 
+        // proxy container secrets mapping
+        const proxySecrets = proxy.secrets as Array<Record<string, string>> | undefined;
+        Array.isArray(proxySecrets) && proxySecrets.length === 1 &&
+        proxySecrets[0].env_var === "SSC_PROXY_TOKEN" && proxySecrets[0].name === "SSC_PROXY_TOKEN"
+          ? ok(`AE2 ${label}: proxy secrets maps SSC_PROXY_TOKEN`)
+          : fail(`AE2 ${label}: proxy secrets mapping wrong`, JSON.stringify(proxySecrets));
+
         // app container
         appCt.name === "app"
           ? ok(`AE2 ${label}: app container name = "app"`)
@@ -5300,6 +5307,11 @@ async function main(): Promise<void> {
         !("container" in (dep ?? {}))
           ? ok(`AE2 ${label}: depends_on uses "name" key, not "container"`)
           : fail(`AE2 ${label}: depends_on must not use "container" key`);
+
+        // app container must have no secrets field
+        !("secrets" in appCt)
+          ? ok(`AE2 ${label}: app container has no secrets field`)
+          : fail(`AE2 ${label}: app container must not have a secrets field`, JSON.stringify((appCt as Record<string, unknown>).secrets));
       };
 
       const AE2_APP_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -5571,7 +5583,7 @@ async function main(): Promise<void> {
       await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
       await resetFlyLog();
 
-      // AE6a: missing proxy header → verify fails → machines stopped
+      // AE6a: missing proxy header → verify fails → every machine force-destroyed
       await request("POST", "/test/set-verify-mode", { body: { mode: "missing-proxy-header" } });
       const ae6a = await aeIntake({ app_name: "ae6a-no-header" });
       const ae6aPoll = await pollDeployment(ae6a.deployment_id, aeKey, 15000);
@@ -5581,19 +5593,27 @@ async function main(): Promise<void> {
       ae6aPoll.failure_stage === "verify"
         ? ok("AE6a: failure_stage = verify")
         : fail("AE6a: failure_stage should be 'verify'", ae6aPoll.failure_stage ?? "");
-      ae6aPoll.failure_message?.includes("did not come up behind the access proxy")
-        ? ok("AE6a: failure_message mentions proxy")
+      ae6aPoll.failure_message === "The app did not come up behind the access proxy, so it was taken offline. Please redeploy."
+        ? ok("AE6a: failure_message is exact offline message")
         : fail("AE6a: wrong failure_message", ae6aPoll.failure_message ?? "");
 
-      // machines should have been stopped
+      // every machine must be force-destroyed; no stop calls
       const ae6aLog = await getFlyLog();
+      const ae6aDestroys = ae6aLog.filter((c) => c.fn === "destroyMachine");
       const ae6aStops = ae6aLog.filter((c) => c.fn === "stopMachine");
-      ae6aStops.length > 0
-        ? ok("AE6a: stopMachine called after verify failure")
-        : fail("AE6a: stopMachine should be called on verify failure");
+      ae6aDestroys.length > 0
+        ? ok(`AE6a: destroyMachine called ${ae6aDestroys.length} time(s) after verify failure`)
+        : fail("AE6a: destroyMachine should be called on verify failure");
+      // default stub returns 1 machine (test-machine-1)
+      ae6aDestroys.length === 1
+        ? ok("AE6a: destroyMachine called once per machine")
+        : fail("AE6a: destroyMachine call count should equal machine count", `got ${ae6aDestroys.length}, expected 1`);
+      ae6aStops.length === 0
+        ? ok("AE6a: stopMachine NOT called (machines destroyed, not stopped)")
+        : fail("AE6a: stopMachine must not be called — use destroyMachine");
       await resetFlyLog();
 
-      // AE6b: wrong redirect → verify fails
+      // AE6b: wrong redirect → verify fails → machines destroyed
       await request("POST", "/test/set-verify-mode", { body: { mode: "wrong-redirect" } });
       const ae6b = await aeIntake({ app_name: "ae6b-wrong-redirect" });
       const ae6bPoll = await pollDeployment(ae6b.deployment_id, aeKey, 15000);
@@ -5603,9 +5623,13 @@ async function main(): Promise<void> {
       ae6bPoll.failure_stage === "verify"
         ? ok("AE6b: failure_stage = verify")
         : fail("AE6b: failure_stage should be 'verify'", ae6bPoll.failure_stage ?? "");
+      const ae6bLog = await getFlyLog();
+      ae6bLog.filter((c) => c.fn === "destroyMachine").length > 0
+        ? ok("AE6b: destroyMachine called after wrong-redirect verify failure")
+        : fail("AE6b: destroyMachine should be called on verify failure");
       await resetFlyLog();
 
-      // AE6c: success mode → deploy succeeds, no stopMachine
+      // AE6c: success mode → deploy succeeds, no destroyMachine, no stopMachine
       await request("POST", "/test/set-verify-mode", { body: { mode: "success" } });
       const ae6c = await aeIntake({ app_name: "ae6c-verify-ok" });
       const ae6cPoll = await pollDeployment(ae6c.deployment_id, aeKey, 15000);
@@ -5613,6 +5637,9 @@ async function main(): Promise<void> {
         ? ok("AE6c: deploy succeeds when verification passes")
         : fail("AE6c: deploy should succeed with working proxy", `${ae6cPoll.failure_stage}: ${ae6cPoll.failure_message}`);
       const ae6cLog = await getFlyLog();
+      ae6cLog.filter((c) => c.fn === "destroyMachine").length === 0
+        ? ok("AE6c: destroyMachine NOT called on success")
+        : fail("AE6c: destroyMachine should not be called on successful verify");
       ae6cLog.filter((c) => c.fn === "stopMachine").length === 0
         ? ok("AE6c: stopMachine NOT called on success")
         : fail("AE6c: stopMachine should not be called on successful verify");

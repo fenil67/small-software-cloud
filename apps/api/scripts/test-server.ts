@@ -218,8 +218,8 @@ flyModule.listMachines = async (appName: string) => {
   _flyCallLog.push({ fn: "listMachines", arg: appName });
   return [..._listMachinesResult];
 };
-flyModule.stopMachine = async (appName: string, machineId: string) => {
-  _flyCallLog.push({ fn: "stopMachine", arg: appName, body: { machineId } });
+flyModule.destroyMachine = async (appName: string, machineId: string) => {
+  _flyCallLog.push({ fn: "destroyMachine", arg: appName, body: { machineId } });
 };
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });

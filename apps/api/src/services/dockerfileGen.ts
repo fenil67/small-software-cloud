@@ -32,6 +32,7 @@ function flyToml(appName: string, appId: string, appPort: number): string {
           LISTEN_PORT: String(PROXY_PORT),
           APP_PORT: String(appPort),
         },
+        secrets: [{ env_var: "SSC_PROXY_TOKEN", name: "SSC_PROXY_TOKEN" }],
         healthchecks: [
           {
             name: "listening",

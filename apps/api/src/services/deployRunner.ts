@@ -8,7 +8,7 @@ import { promisify } from "util";
 import unzipper from "unzipper";
 import { pool } from "../db";
 import { eventBus } from "../lib/eventBus";
-import { createFlyApp, destroyFlyApp, checkFlyAppExists, createEgressPolicy, listMachines, stopMachine } from "./flyClient";
+import { createFlyApp, destroyFlyApp, checkFlyAppExists, createEgressPolicy, listMachines, destroyMachine } from "./flyClient";
 import { networkForOrg } from "../lib/flyNetwork";
 import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { gitEnv, flyctlEnv } from "../lib/childEnv";
@@ -562,17 +562,13 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     try {
       await verifyProxy(appName, appId);
     } catch {
-      // Proxy failed to come up — stop all machines so the app is not reachable
-      // in a half-deployed state, then mark the deployment failed.
-      try {
-        const machines = await listMachines(appName);
-        await Promise.all(machines.map((m) => stopMachine(appName, m.id).catch(() => {})));
-      } catch {
-        // best-effort — do not mask the real error
-      }
+      // Proxy failed to come up — destroy every machine so auto_start_machines
+      // cannot bring the app back up in a half-deployed state.
+      const machines = await listMachines(appName);
+      await Promise.all(machines.map((m) => destroyMachine(appName, m.id).catch(() => {})));
       throw new DeployError(
         "verify",
-        "The app did not come up behind the access proxy, so it was stopped. Please redeploy.",
+        "The app did not come up behind the access proxy, so it was taken offline. Please redeploy.",
       );
     }
 
