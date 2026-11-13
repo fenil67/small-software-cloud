@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 TAG="${1:?usage: publish.sh <tag>}"
 REPO=registry.fly.io/ssc-proxy-image
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
