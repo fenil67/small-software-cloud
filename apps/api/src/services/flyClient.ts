@@ -15,6 +15,15 @@ export class FlyApiError extends Error {
 const FLY_API_DEFAULT = "https://api.machines.dev/v1";
 
 /**
+ * Returns the Authorization header value for a Fly API token.
+ * Tokens that start with "FlyV1 " are sent as-is (org tokens issued by Fly).
+ * All other tokens are prefixed with "Bearer ".
+ */
+export function flyAuthHeader(token: string): string {
+  return token.startsWith("FlyV1 ") ? token : `Bearer ${token}`;
+}
+
+/**
  * Resolves the base URL for Fly API calls.
  *
  * FLY_API_BASE is only honoured when the parsed hostname is exactly
@@ -48,7 +57,7 @@ export function resolveBaseUrl(): string {
 function makeClient() {
   const client = axios.create({
     baseURL: resolveBaseUrl(),
-    headers: { Authorization: `Bearer ${process.env.FLY_API_TOKEN}` },
+    headers: { Authorization: flyAuthHeader(process.env.FLY_API_TOKEN ?? "") },
     timeout: 30_000,
   });
 

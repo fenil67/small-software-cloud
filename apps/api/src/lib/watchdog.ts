@@ -17,7 +17,7 @@ import { pool } from "../db";
 import { safeErr } from "./safeErr";
 import { recordAlert } from "./alerts";
 import { queryCpuMetrics, queryEgressMetrics, type MetricSample } from "./flyMetrics";
-import { listMachines, destroyMachine } from "../services/flyClient";
+import { listMachines, destroyMachine, checkFlyAppExists } from "../services/flyClient";
 
 // ── Startup validation ────────────────────────────────────────────────────────
 
@@ -331,6 +331,33 @@ async function probeOneApp(
   }
 
   if (verdict.verdict === "unreachable") {
+    // Check whether the Fly app still exists before counting as unreachable.
+    // If Fly returns 404, the app was deleted externally: clear fly_app_id,
+    // fire a one-time alert, and do not count this round as an unreachable hit.
+    // If the existence check itself fails (network/5xx), treat as plain unreachable.
+    let appExists: boolean;
+    try {
+      appExists = await checkFlyAppExists(app.fly_app_id);
+    } catch {
+      appExists = true; // cannot determine — treat as plain unreachable
+    }
+
+    if (!appExists) {
+      await pool.query(
+        "UPDATE apps SET fly_app_id = NULL WHERE id = $1",
+        [app.id],
+      ).catch(() => {});
+      await pool.query(
+        "DELETE FROM watchdog_probe_state WHERE app_id = $1",
+        [app.id],
+      ).catch(() => {});
+      await recordAlert("fly_app_missing", app.id, {
+        message: `Fly app ${app.fly_app_id} no longer exists`,
+        fly_app_id: app.fly_app_id,
+      });
+      return;
+    }
+
     const newCount = app.consecutive_unreachable + 1;
     // Alert only at exactly 3 consecutive unreachable
     if (newCount === 3) {

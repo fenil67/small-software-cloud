@@ -7069,6 +7069,7 @@ async function main(): Promise<void> {
         : fail("AG5: unknown apps should not produce alerts", ignoredAlerts.rows[0].n);
 
       // Failing metrics endpoint → metrics_unavailable alert, no crash
+      await request("GET", "/test/drain-discord"); // clear prior messages before this check
       await request("POST", "/test/set-prometheus-fail", { body: { fail: true } });
       await request("POST", "/test/run-metrics-round");
       await request("POST", "/test/set-prometheus-fail", { body: { fail: false } });
@@ -7078,6 +7079,20 @@ async function main(): Promise<void> {
       parseInt(metricsUnavail.rows[0].n) >= 1
         ? ok("AG5: failing metrics endpoint → metrics_unavailable alert stored")
         : fail("AG5: should store metrics_unavailable alert on endpoint failure");
+
+      // Discord content for a null-app alert must say "platform", not "unknown"
+      const discordMsgs5 = await request("GET", "/test/drain-discord");
+      const msgs5 = (discordMsgs5.body as any).messages as Array<{ content: string }>;
+      msgs5.length >= 1
+        ? ok("AG5: metrics_unavailable → Discord message sent")
+        : fail("AG5: expected Discord message for metrics_unavailable");
+      const content5 = msgs5.map((m) => m.content).join("\n");
+      content5.includes("platform")
+        ? ok("AG5: metrics_unavailable Discord content says 'platform'")
+        : fail("AG5: Discord content should say 'platform' for null-app alert", content5.slice(0, 200));
+      !content5.includes("unknown")
+        ? ok("AG5: metrics_unavailable Discord content does not say 'unknown'")
+        : fail("AG5: Discord content must not say 'unknown'", content5.slice(0, 200));
     }
 
     // ── AG6: Discord failure — alert stored with delivered=false ──────────────
@@ -7176,6 +7191,125 @@ async function main(): Promise<void> {
       parseInt(auditCount.rows[0].n) === 0
         ? ok("AG7: suspended app → no watchdog audit row added")
         : fail("AG7: watchdog should not audit-suspend an already-suspended app");
+    }
+
+    // ── AG9: missing Fly app — fly_app_id cleared, alert fired, not unreachable ─
+    {
+      // AG9a: unreachable + Fly 404 → clear fly_app_id, fire fly_app_missing, skip counter
+      await agReset();
+      const { appId: ag9AppId } = await makeDeployedApp("ag9-fly", "ag9-app");
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag9-fly", mode: "unreachable", appId: ag9AppId },
+      });
+      await request("POST", "/test/set-fly-app-missing", {
+        body: { flyAppId: "ag9-fly", missing: true },
+      });
+      await request("POST", "/test/reset-fly-call-log");
+
+      await request("POST", "/test/run-probe-round");
+
+      // fly_app_id cleared
+      const app9 = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id = $1",
+        [ag9AppId],
+      );
+      app9.rows[0]?.fly_app_id === null
+        ? ok("AG9a: missing fly app → fly_app_id cleared to NULL")
+        : fail("AG9a: fly_app_id should be NULL", String(app9.rows[0]?.fly_app_id));
+
+      // exactly 1 fly_app_missing alert
+      const missing9 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'fly_app_missing'",
+        [ag9AppId],
+      );
+      parseInt(missing9.rows[0].n) === 1
+        ? ok("AG9a: exactly 1 fly_app_missing alert")
+        : fail("AG9a: should fire exactly 1 fly_app_missing alert", missing9.rows[0].n);
+
+      // no app_unreachable alert
+      const unreach9 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_unreachable'",
+        [ag9AppId],
+      );
+      parseInt(unreach9.rows[0].n) === 0
+        ? ok("AG9a: no app_unreachable alert for missing fly app")
+        : fail("AG9a: should not fire app_unreachable for missing fly app", unreach9.rows[0].n);
+
+      // watchdog_probe_state row deleted
+      const state9 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_probe_state WHERE app_id = $1",
+        [ag9AppId],
+      );
+      parseInt(state9.rows[0].n) === 0
+        ? ok("AG9a: probe state row deleted for missing fly app")
+        : fail("AG9a: probe state row should be deleted");
+
+      // next probe round skips the app (fly_app_id IS NULL)
+      await request("POST", "/test/reset-fly-call-log");
+      await request("POST", "/test/run-probe-round");
+      const alertsAfter = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1",
+        [ag9AppId],
+      );
+      parseInt(alertsAfter.rows[0].n) === 1
+        ? ok("AG9a: app not probed in next round after fly_app_id cleared")
+        : fail("AG9a: app should not accumulate more alerts after fly_app_id cleared", alertsAfter.rows[0].n);
+
+      // AG9b: unreachable + app exists → plain unreachable, no fly_app_missing
+      await agReset();
+      const { appId: ag9bAppId } = await makeDeployedApp("ag9b-fly", "ag9b-app");
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag9b-fly", mode: "unreachable", appId: ag9bAppId },
+      });
+      // _checkExistsResult defaults to true; _missingFlyAppIds cleared by agReset
+
+      await request("POST", "/test/run-probe-round");
+
+      const missing9b = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'fly_app_missing'",
+        [ag9bAppId],
+      );
+      parseInt(missing9b.rows[0].n) === 0
+        ? ok("AG9b: unreachable but app exists → no fly_app_missing alert")
+        : fail("AG9b: should not fire fly_app_missing when app exists", missing9b.rows[0].n);
+
+      const app9b = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id = $1",
+        [ag9bAppId],
+      );
+      app9b.rows[0]?.fly_app_id !== null
+        ? ok("AG9b: fly_app_id preserved when app exists but unreachable")
+        : fail("AG9b: fly_app_id must not be cleared when app exists");
+    }
+
+    // ── AG10: metrics auth — both Fly token shapes accepted by Prometheus ──────
+    {
+      // AG10a: plain token ("test-token") → Authorization: Bearer test-token
+      await agReset();
+      await request("POST", "/test/set-prometheus-data", { body: { cpu: [], egress: [] } });
+      await request("POST", "/test/run-metrics-round");
+      const noAuthErr = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE kind = 'metrics_unavailable'",
+      );
+      parseInt(noAuthErr.rows[0].n) === 0
+        ? ok("AG10a: plain token → Prometheus accepts 'Bearer <token>' header")
+        : fail("AG10a: metrics_unavailable must not fire with correct Bearer token", noAuthErr.rows[0].n);
+
+      // AG10b: FlyV1 token → Authorization: FlyV1 fm2_test_xyz (sent as-is)
+      await agReset();
+      await request("POST", "/test/set-fly-token", { body: { token: "FlyV1 fm2_test_xyz" } });
+      try {
+        await request("POST", "/test/set-prometheus-data", { body: { cpu: [], egress: [] } });
+        await request("POST", "/test/run-metrics-round");
+        const noAuthErr2 = await pool.query<{ n: string }>(
+          "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE kind = 'metrics_unavailable'",
+        );
+        parseInt(noAuthErr2.rows[0].n) === 0
+          ? ok("AG10b: FlyV1 token → Prometheus accepts 'FlyV1 ...' header sent as-is")
+          : fail("AG10b: metrics_unavailable must not fire with FlyV1 token", noAuthErr2.rows[0].n);
+      } finally {
+        await request("POST", "/test/set-fly-token", { body: { token: "test-token" } });
+      }
     }
 
     // ── AG8: GET /v1/admin/alerts ─────────────────────────────────────────────

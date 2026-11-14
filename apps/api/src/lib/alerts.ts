@@ -124,7 +124,7 @@ export async function recordAlert(
     if (!webhookUrl) return;
 
     // Build message text — look up app name + fly_app_id if we have an appId
-    let appName = "unknown";
+    let appName = appId ? "unknown" : "platform";
     let flyAppId = "";
     if (appId) {
       try {

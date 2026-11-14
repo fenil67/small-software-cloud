@@ -233,11 +233,14 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
 // _flyErrorMode (Section N) takes precedence and throws an Axios-shaped error.
 
 const flyModule = require("../src/services/flyClient");
+const flyAuthHeader = (flyModule as typeof import("../src/services/flyClient")).flyAuthHeader;
 
 interface FlyCall { fn: string; arg: string; body?: Record<string, unknown> }
 const _flyCallLog: FlyCall[] = [];
 
 let _checkExistsResult = true;
+// Per-app missing set: fly_app_ids that checkFlyAppExists should return false for.
+const _missingFlyAppIds = new Set<string>();
 let _destroyFailuresRemaining = 0;
 let _flyErrorMode = false;
 let _egressFailMode = false;
@@ -251,6 +254,7 @@ flyModule.createFlyApp = async (name: string, orgSlug: string, network: string) 
 flyModule.allocateFlyIp = async () => "1.2.3.4";
 flyModule.checkFlyAppExists = async (name: string): Promise<boolean> => {
   _flyCallLog.push({ fn: "checkFlyAppExists", arg: name });
+  if (_missingFlyAppIds.has(name)) return false;
   return _checkExistsResult;
 };
 flyModule.createEgressPolicy = async (appName: string) => {
@@ -451,6 +455,29 @@ app.post("/test/set-fly-check-exists", (req, res) => {
   const { result } = req.body as { result?: boolean };
   _checkExistsResult = result !== false;
   res.json({ ok: true, checkExistsResult: _checkExistsResult });
+});
+
+// POST /test/set-fly-app-missing { flyAppId, missing: bool }
+// Makes checkFlyAppExists return false for a specific fly_app_id.
+app.post("/test/set-fly-app-missing", (req, res) => {
+  const { flyAppId, missing } = req.body as { flyAppId?: string; missing?: boolean };
+  if (!flyAppId) { res.status(400).json({ error: "flyAppId required" }); return; }
+  if (missing) {
+    _missingFlyAppIds.add(flyAppId);
+  } else {
+    _missingFlyAppIds.delete(flyAppId);
+  }
+  res.json({ ok: true, flyAppId, missing: missing ?? false });
+});
+
+// POST /test/set-fly-token { token: string }
+// Changes FLY_API_TOKEN in this process (affects both flyClient and flyMetrics auth).
+// Tests MUST restore to "test-token" after use.
+app.post("/test/set-fly-token", (req, res) => {
+  const { token } = req.body as { token?: string };
+  if (typeof token !== "string") { res.status(400).json({ error: "token required" }); return; }
+  process.env.FLY_API_TOKEN = token;
+  res.json({ ok: true });
 });
 
 // POST /test/set-fly-error { enabled: true|false }
@@ -770,6 +797,7 @@ app.post("/test/set-app-probe-mode", (req, res) => {
 app.post("/test/clear-probe-state", async (_req, res) => {
   _appProbeModes.clear();
   _probeAppIds.clear();
+  _missingFlyAppIds.clear();
   watchdogModule._clearTestProbeBaseUrls();
   try {
     await pool.query("DELETE FROM watchdog_probe_state");
@@ -811,6 +839,11 @@ app.post("/test/set-discord-fail", (req, res) => {
 // Full path: GET /fake-prometheus/prometheus/:org/api/v1/query?query=...
 
 app.get("/fake-prometheus/prometheus/:org/api/v1/query", (req, res) => {
+  // Reject requests with the wrong Authorization header — mirrors Fly's auth behaviour.
+  const expectedAuth = flyAuthHeader(process.env.FLY_API_TOKEN ?? "");
+  if (req.headers.authorization !== expectedAuth) {
+    res.status(401).json({ error: "unauthorized" }); return;
+  }
   if (_promFailMode) {
     res.status(500).json({ error: "prometheus simulated failure" }); return;
   }

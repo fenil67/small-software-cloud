@@ -12,6 +12,7 @@
 import http from "http";
 import https from "https";
 import { safeErr } from "./safeErr";
+import { flyAuthHeader } from "../services/flyClient";
 
 const FLY_METRICS_DEFAULT = "https://api.fly.io";
 
@@ -42,7 +43,7 @@ export interface MetricSample {
   value: number;
 }
 
-/** GETs a URL with Bearer auth and returns the parsed JSON body. Never throws. */
+/** GETs a URL with the correct Fly auth header and returns the parsed JSON body. Never throws. */
 function httpGetJson(url: string, token: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
@@ -60,7 +61,7 @@ function httpGetJson(url: string, token: string): Promise<unknown> {
         port,
         path: parsed.pathname + (parsed.search ?? ""),
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: flyAuthHeader(token),
           Accept: "application/json",
         },
       },
