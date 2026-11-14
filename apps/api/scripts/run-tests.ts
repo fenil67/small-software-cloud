@@ -8615,6 +8615,65 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM orgs WHERE id=$1", [aj4cOrgId]);
     }
 
+    // ── AJ4d: app with fly_app_id set + only failed deployments → 409 ────────
+    // Covers the case where destroying the Fly app after a failed deploy itself
+    // fails: the app record keeps a non-null fly_app_id but all deployments are
+    // 'failed'.  findReuseableApp must NOT match it (fly_app_id IS NULL guard).
+    {
+      const { rows: aj4dOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aj4d','AJ4d Org','aj4d-org') RETURNING id",
+      );
+      const aj4dOrgId = aj4dOrgRows[0].id;
+      const { fullKey: aj4dKey, keyPrefix: aj4dKP, keyHash: aj4dKH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aj4d-key',$3,$4,'{read,deploy,manage}')",
+        [aj4dOrgId, userId, aj4dKP, aj4dKH],
+      );
+
+      // Insert an app that has a fly_app_id but only failed deployments
+      const { rows: aj4dAppRows } = await pool.query<{ id: string }>(
+        "INSERT INTO apps (org_id, owner_id, name, slug, fly_app_id) VALUES ($1,$2,'aj4d-stuck','aj4d-stuck','ssc-orphaned-xyz') RETURNING id",
+        [aj4dOrgId, userId],
+      );
+      const aj4dAppId = aj4dAppRows[0].id;
+      await pool.query(
+        "INSERT INTO deployments (app_id, triggered_by, version, status, failure_stage, failure_message, finished_at) VALUES ($1,$2,1,'failed','deploy','flyctl failed',now())",
+        [aj4dAppId, userId],
+      );
+
+      const aj4dZip = await buildZip({
+        "package.json": JSON.stringify({ name: "aj4d-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+      const aj4dForm = new FormData();
+      aj4dForm.append("code", aj4dZip, { filename: "app.zip", contentType: "application/zip" });
+      aj4dForm.append("app_name", "aj4d-stuck");
+      const aj4dIntake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4dKey), formData: aj4dForm,
+      });
+      aj4dIntake.status === 409 && (aj4dIntake.body as any)?.error === "name_taken"
+        ? ok("AJ4d: fly_app_id set + all-failed deploys → 409 name_taken (not reused)")
+        : fail("AJ4d: should 409 when fly_app_id is non-null", `got ${aj4dIntake.status} ${JSON.stringify(aj4dIntake.body)}`);
+
+      // No new deployment row created for the stuck app
+      const { rows: aj4dDepRows } = await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM deployments WHERE app_id=$1", [aj4dAppId],
+      );
+      parseInt(aj4dDepRows[0].count) === 1
+        ? ok("AJ4d: no second deployment created for stuck app")
+        : fail("AJ4d: deployment count should still be 1", `count=${aj4dDepRows[0].count}`);
+
+      // fly_app_id unchanged
+      const { rows: aj4dAppRows2 } = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [aj4dAppId],
+      );
+      aj4dAppRows2[0]?.fly_app_id === "ssc-orphaned-xyz"
+        ? ok("AJ4d: fly_app_id unchanged after rejected deploy")
+        : fail("AJ4d: fly_app_id should be unchanged", String(aj4dAppRows2[0]?.fly_app_id));
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [aj4dOrgId]);
+    }
+
     // ── AJ5: WATCHDOG_PROBE_SECONDS startup validation ────────────────────────
     // Spawns dist/index.js with invalid/valid values; validates startup behaviour.
     {
