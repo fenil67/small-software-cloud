@@ -185,6 +185,13 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
     }
   }
 
+  // Record whether the app already had a fly_app_id (for failure cleanup below)
+  const { rows: _appBefore } = await pool.query<{ fly_app_id: string | null }>(
+    "SELECT fly_app_id FROM apps WHERE id=$1",
+    [appId],
+  );
+  const hadFlyAppId = !!_appBefore[0]?.fly_app_id;
+
   // Set fly_app_id on the app so subdomain works
   await pool.query("UPDATE apps SET fly_app_id=$1 WHERE id=$2", [flyAppName, appId]);
 
@@ -192,6 +199,10 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
   await new Promise((r) => setTimeout(r, 80));
 
   if (mode === "failure") {
+    // Clear fly_app_id for new apps (mirrors real deployRunner fail() behaviour)
+    if (!hadFlyAppId) {
+      await pool.query("UPDATE apps SET fly_app_id=NULL WHERE id=$1", [appId]);
+    }
     await pool.query(
       `UPDATE deployments SET status='failed',
          failure_stage='build',
@@ -441,6 +452,20 @@ app.post("/test/set-flyctl-mode", (req, res) => {
   res.json({ ok: true, mode: mode ?? "success" });
 });
 
+// POST /test/set-flyctl-output { exitCode, outputLines }
+// Rewrites the fake flyctl binary to print each line in outputLines then exit
+// with the given code.  Used by AJ2 to test extractBuildFailureLine in the real
+// deploy path.  Lines are written to a temp file to avoid shell escaping issues.
+app.post("/test/set-flyctl-output", (req, res) => {
+  const { exitCode, outputLines } = req.body as { exitCode?: number; outputLines?: string[] };
+  const code = typeof exitCode === "number" ? exitCode : 1;
+  const lines = Array.isArray(outputLines) ? outputLines : [];
+  const outputFile = path.join(_fakeFlyctlDir, "flyctl-output.txt");
+  fs.writeFileSync(outputFile, lines.join("\n") + (lines.length ? "\n" : ""), "utf8");
+  writeFlyctlScript(code, `cat ${outputFile}`);
+  res.json({ ok: true });
+});
+
 // GET /test/fly-call-log — returns all recorded Fly API calls
 app.get("/test/fly-call-log", (_req, res) => {
   res.json({ calls: [..._flyCallLog] });
@@ -550,13 +575,15 @@ app.get("/test/get-flyctl-calls", (_req, res) => {
   res.json({ calls, stdin });
 });
 
-// POST /test/gen-fly-toml { appName, appId, kind?, appPort? }
+// POST /test/gen-fly-toml { appName, appId, kind?, appPort?, packageJson? }
 // Calls generateDeployFiles in-process and returns generated fly.toml (and nginx conf
-// for static).  kind: "node"|"python"|"static"|"dockerfile" (default "node").
+// for static, Dockerfile and nodeVersionLog for node).
+// kind: "node"|"python"|"static"|"dockerfile" (default "node").
 // appPort is passed through for the "dockerfile" kind to test port pass-through.
+// packageJson: written as package.json to the tmpDir before calling generateDeployFiles.
 app.post("/test/gen-fly-toml", async (req, res) => {
-  const { appName, appId, kind, appPort } = req.body as {
-    appName?: string; appId?: string; kind?: string; appPort?: number;
+  const { appName, appId, kind, appPort, packageJson } = req.body as {
+    appName?: string; appId?: string; kind?: string; appPort?: number; packageJson?: unknown;
   };
   if (!appName || !appId) { res.status(400).json({ error: "appName and appId required" }); return; }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-gen-toml-"));
@@ -579,14 +606,26 @@ app.post("/test/gen-fly-toml", async (req, res) => {
       fs.writeFileSync(path.join(tmpDir, "requirements.txt"), "flask\n");
     }
     // For "dockerfile", generateDeployFiles only writes fly.toml — no Dockerfile needed.
+    if (packageJson !== undefined) {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify(packageJson), "utf8");
+    }
 
-    await generateDeployFiles(tmpDir, appName, appType, appId, typeof appPort === "number" ? appPort : undefined);
+    const { nodeVersionLog } = await generateDeployFiles(tmpDir, appName, appType, appId, typeof appPort === "number" ? appPort : undefined);
 
     const flyToml = fs.readFileSync(path.join(tmpDir, "fly.toml"), "utf8");
     const nginxConf = kind === "static" && fs.existsSync(path.join(tmpDir, "ssc-nginx.conf"))
       ? fs.readFileSync(path.join(tmpDir, "ssc-nginx.conf"), "utf8")
       : undefined;
-    res.json({ flyToml, ...(nginxConf ? { nginxConf } : {}) });
+    const dockerfile = (!kind || kind === "node" || kind === "python" || kind === "static")
+      && fs.existsSync(path.join(tmpDir, "Dockerfile"))
+      ? fs.readFileSync(path.join(tmpDir, "Dockerfile"), "utf8")
+      : undefined;
+    res.json({
+      flyToml,
+      ...(nginxConf ? { nginxConf } : {}),
+      ...(dockerfile ? { dockerfile } : {}),
+      ...(nodeVersionLog ? { nodeVersionLog } : {}),
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   } finally {

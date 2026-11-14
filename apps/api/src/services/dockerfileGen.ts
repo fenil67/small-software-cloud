@@ -81,9 +81,73 @@ primary_region = "ord"
 `;
 }
 
+// ─── Node.js version selection ────────────────────────────────────────────────
+
+const SUPPORTED_NODE_MAJORS = [24, 22, 20, 18] as const;
+type NodeMajor = typeof SUPPORTED_NODE_MAJORS[number];
+
+/**
+ * Picks the highest supported Node.js major that satisfies the given
+ * engines.node semver-lite range (e.g. ">=18", "^20", "18.x").
+ * Returns { major: 20, isDefault: true } when no range is given or nothing matches.
+ */
+export function pickNodeMajor(enginesNode?: string): { major: NodeMajor; isDefault: boolean } {
+  if (!enginesNode) return { major: 20, isDefault: true };
+
+  for (const major of SUPPORTED_NODE_MAJORS) {
+    if (_satisfiesRange(major, enginesNode)) {
+      return { major, isDefault: false };
+    }
+  }
+  return { major: 20, isDefault: true };
+}
+
+function _satisfiesRange(major: number, range: string): boolean {
+  // Handle OR (||) — any part matching is enough
+  return range.split("||").map(s => s.trim()).filter(Boolean)
+    .some(part => _satisfiesAndRange(major, part));
+}
+
+function _satisfiesAndRange(major: number, range: string): boolean {
+  // Split whitespace into individual conditions; ALL must hold (AND)
+  return range.trim().split(/\s+/).filter(Boolean)
+    .every(cond => _satisfiesCondition(major, cond));
+}
+
+function _satisfiesCondition(major: number, cond: string): boolean {
+  if (cond === "*" || cond.toLowerCase() === "x") return true;
+  const m = cond.match(/^(>=|<=|>|<|\^|~|=)?(\d+)(?:[.x*].*)?$/i);
+  if (!m) return true; // unparseable — allow
+  const op = m[1] || "=";
+  const condMajor = parseInt(m[2], 10);
+  switch (op) {
+    case ">=": return major >= condMajor;
+    case "<=": return major <= condMajor;
+    case ">":  return major > condMajor;
+    case "<":  return major < condMajor;
+    case "^":  return major === condMajor; // caret: compatible, so same major
+    case "~":  return major === condMajor; // tilde: approximately same major
+    default:   return major === condMajor;
+  }
+}
+
+/**
+ * Reads engines.node from package.json in `dir`.  Returns undefined if the
+ * file doesn't exist, can't be parsed, or the field isn't set.
+ */
+export async function readEnginesNode(dir: string): Promise<string | undefined> {
+  try {
+    const raw = await fs.readFile(path.join(dir, "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { engines?: { node?: string } };
+    return pkg.engines?.node;
+  } catch {
+    return undefined;
+  }
+}
+
 // ─── Node.js ──────────────────────────────────────────────────────────────────
 
-function nodeDockerfile(pm: "npm" | "pnpm" | "yarn", startCmd: string): string {
+function nodeDockerfile(pm: "npm" | "pnpm" | "yarn", startCmd: string, nodeMajor: number = 20): string {
   const installCmd =
     pm === "pnpm"
       ? "RUN npm install -g pnpm && pnpm install --frozen-lockfile"
@@ -94,7 +158,7 @@ function nodeDockerfile(pm: "npm" | "pnpm" | "yarn", startCmd: string): string {
       // detection, so check at build time by testing for package-lock.json.
       : "RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi";
 
-  return `FROM node:20-alpine
+  return `FROM node:${nodeMajor}-alpine
 WORKDIR /app
 
 COPY package*.json ${pm === "pnpm" ? "pnpm-lock.yaml* " : pm === "yarn" ? "yarn.lock* " : ""}./
@@ -209,8 +273,9 @@ export async function generateDeployFiles(
   appType: AppType,
   appId?: string,
   appPort?: number,
-): Promise<{ internalPort: number }> {
+): Promise<{ internalPort: number; nodeVersionLog?: string }> {
   let dockerfile: string;
+  let nodeVersionLog: string | undefined;
 
   switch (appType.kind) {
     case "dockerfile": {
@@ -221,10 +286,16 @@ export async function generateDeployFiles(
       return { internalPort: effectiveAppPort };
     }
 
-    case "node":
-      dockerfile = nodeDockerfile(appType.packageManager, appType.startCommand);
+    case "node": {
+      const enginesNode = await readEnginesNode(dir);
+      const { major, isDefault } = pickNodeMajor(enginesNode);
+      nodeVersionLog = isDefault
+        ? `Node.js: defaulting to node:${major}-alpine`
+        : `Node.js: using node:${major}-alpine (from engines.node "${enginesNode}")`;
+      dockerfile = nodeDockerfile(appType.packageManager, appType.startCommand, major);
       await fs.writeFile(path.join(dir, ".dockerignore"), NODE_PYTHON_DOCKERIGNORE);
       break;
+    }
 
     case "python":
       dockerfile = pythonDockerfile(appType.server, appType.entrypoint);
@@ -238,8 +309,8 @@ export async function generateDeployFiles(
       break;
   }
 
-  await fs.writeFile(path.join(dir, "Dockerfile"), dockerfile);
+  await fs.writeFile(path.join(dir, "Dockerfile"), dockerfile!);
   await fs.writeFile(path.join(dir, "fly.toml"), flyToml(appName, appId ?? "", APP_PORT));
 
-  return { internalPort: APP_PORT };
+  return { internalPort: APP_PORT, nodeVersionLog };
 }

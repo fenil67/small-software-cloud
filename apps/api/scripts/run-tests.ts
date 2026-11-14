@@ -8246,6 +8246,490 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section AJ — Backlog fixes: Node version, build failure summary, UUID 404,
+  //              reuse failed first deploy, WATCHDOG_PROBE_SECONDS
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("AJ: backlog fixes (node version, build summary, UUID, reuse, probe seconds)");
+
+    // ── AJ1: engines.node parsing ─────────────────────────────────────────────
+    // Calls /test/gen-fly-toml with packageJson and checks nodeVersionLog + Dockerfile
+
+    // AJ1a: ^18.17.0 → picks node:18-alpine
+    {
+      const r = await request("POST", "/test/gen-fly-toml", {
+        body: { appName: "aj1-app", appId: "00000000-0000-0000-0000-000000000001", kind: "node",
+          packageJson: { name: "aj1a", version: "1.0.0", engines: { node: "^18.17.0" } } },
+      });
+      const b = r.body as { dockerfile?: string; nodeVersionLog?: string };
+      r.status === 200 && b.dockerfile?.includes("FROM node:18-alpine")
+        ? ok("AJ1a: ^18.17.0 → Dockerfile uses node:18-alpine")
+        : fail("AJ1a: wrong node version for ^18.17.0", `status=${r.status} dockerfile=${b.dockerfile?.slice(0, 60)}`);
+      b.nodeVersionLog?.includes("node:18-alpine") && b.nodeVersionLog.includes("18.17.0")
+        ? ok("AJ1a: nodeVersionLog mentions node:18-alpine and engines value")
+        : fail("AJ1a: wrong nodeVersionLog for ^18.17.0", String(b.nodeVersionLog));
+    }
+
+    // AJ1b: 20.x → picks node:20-alpine
+    {
+      const r = await request("POST", "/test/gen-fly-toml", {
+        body: { appName: "aj1-app", appId: "00000000-0000-0000-0000-000000000001", kind: "node",
+          packageJson: { name: "aj1b", version: "1.0.0", engines: { node: "20.x" } } },
+      });
+      const b = r.body as { dockerfile?: string; nodeVersionLog?: string };
+      r.status === 200 && b.dockerfile?.includes("FROM node:20-alpine")
+        ? ok("AJ1b: 20.x → Dockerfile uses node:20-alpine")
+        : fail("AJ1b: wrong node version for 20.x", `dockerfile=${b.dockerfile?.slice(0, 60)}`);
+      b.nodeVersionLog?.includes("node:20-alpine")
+        ? ok("AJ1b: nodeVersionLog mentions node:20-alpine")
+        : fail("AJ1b: wrong nodeVersionLog for 20.x", String(b.nodeVersionLog));
+    }
+
+    // AJ1c: no packageJson → defaults to node:20-alpine with "defaulting" message
+    {
+      const r = await request("POST", "/test/gen-fly-toml", {
+        body: { appName: "aj1-app", appId: "00000000-0000-0000-0000-000000000001", kind: "node" },
+      });
+      const b = r.body as { dockerfile?: string; nodeVersionLog?: string };
+      r.status === 200 && b.dockerfile?.includes("FROM node:20-alpine")
+        ? ok("AJ1c: no packageJson → Dockerfile defaults to node:20-alpine")
+        : fail("AJ1c: wrong default node version", `dockerfile=${b.dockerfile?.slice(0, 60)}`);
+      b.nodeVersionLog?.includes("defaulting")
+        ? ok("AJ1c: nodeVersionLog contains 'defaulting' for missing engines.node")
+        : fail("AJ1c: nodeVersionLog should say defaulting", String(b.nodeVersionLog));
+    }
+
+    // AJ1d: >=20 <23 → picks node:22-alpine (highest ≤22 that is ≥20)
+    {
+      const r = await request("POST", "/test/gen-fly-toml", {
+        body: { appName: "aj1-app", appId: "00000000-0000-0000-0000-000000000001", kind: "node",
+          packageJson: { name: "aj1d", version: "1.0.0", engines: { node: ">=20 <23" } } },
+      });
+      const b = r.body as { dockerfile?: string; nodeVersionLog?: string };
+      r.status === 200 && b.dockerfile?.includes("FROM node:22-alpine")
+        ? ok("AJ1d: >=20 <23 → Dockerfile uses node:22-alpine")
+        : fail("AJ1d: wrong node version for >=20 <23", `dockerfile=${b.dockerfile?.slice(0, 60)}`);
+    }
+
+    // ── AJ2: build failure summary ────────────────────────────────────────────
+    // Real deploy path; flyctl outputs specific lines → failure_message contains
+    // the highest-priority line extracted by extractBuildFailureLine.
+    {
+      // Fresh org + key for AJ2 isolation
+      const { rows: aj2OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aj2','AJ2 Org','aj2-org') RETURNING id",
+      );
+      const aj2OrgId = aj2OrgRows[0].id;
+      const { fullKey: aj2Key, keyPrefix: aj2KP, keyHash: aj2KH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aj2-key',$3,$4,'{read,deploy,manage}')",
+        [aj2OrgId, userId, aj2KP, aj2KH],
+      );
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      // Set flyctl to output lines that include an npm error and exit 1
+      await request("POST", "/test/set-flyctl-output", {
+        body: {
+          exitCode: 1,
+          outputLines: [
+            "Step 1/5 : FROM node:20-alpine",
+            "Step 2/5 : WORKDIR /app",
+            "npm ERR! code E404",
+            "npm ERR! 404 Not Found: missing-pkg@1.0.0",
+          ],
+        },
+      });
+
+      const aj2Zip = await buildZip({
+        "package.json": JSON.stringify({ name: "aj2-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+      const aj2Form = new FormData();
+      aj2Form.append("code", aj2Zip, { filename: "app.zip", contentType: "application/zip" });
+      aj2Form.append("app_name", "aj2-build-fail");
+
+      const aj2Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj2Key), formData: aj2Form,
+      });
+      aj2Intake.status === 202
+        ? ok("AJ2: intake accepted (202)")
+        : fail("AJ2: intake should 202", `got ${aj2Intake.status} ${JSON.stringify(aj2Intake.body)}`);
+
+      if (aj2Intake.status === 202) {
+        const { deployment_id: aj2DepId } = aj2Intake.body as Record<string, string>;
+        const aj2Poll = await pollDeployment(aj2DepId, aj2Key, 15000);
+        await new Promise<void>((r) => setTimeout(r, 400)); // wait for cleanup
+
+        aj2Poll.status === "failed"
+          ? ok("AJ2: deploy failed as expected")
+          : fail("AJ2: expected failed status", aj2Poll.status);
+
+        aj2Poll.failure_message?.includes("npm ERR!")
+          ? ok("AJ2: failure_message contains npm ERR! (extractBuildFailureLine priority)")
+          : fail("AJ2: failure_message should contain npm ERR!", String(aj2Poll.failure_message));
+      }
+
+      // AJ2-nomatch: when no line matches any priority pattern, failure_message
+      // falls back to "Last output:" (not the extracted line) — extractor returns null.
+      {
+        await request("POST", "/test/set-flyctl-output", {
+          body: {
+            exitCode: 1,
+            outputLines: ["step 1/3 building", "step 2/3 running", "step 3/3 done"],
+          },
+        });
+        const aj2nmForm = new FormData();
+        const aj2nmZip = await buildZip({
+          "package.json": JSON.stringify({ name: "aj2nm-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+          "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+        });
+        aj2nmForm.append("code", aj2nmZip, { filename: "app.zip", contentType: "application/zip" });
+        aj2nmForm.append("app_name", "aj2-nomatch-fail");
+        const aj2nmIntake = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(aj2Key), formData: aj2nmForm,
+        });
+        if (aj2nmIntake.status === 202) {
+          const { deployment_id: aj2nmDepId } = aj2nmIntake.body as Record<string, string>;
+          const aj2nmPoll = await pollDeployment(aj2nmDepId, aj2Key, 15000);
+          await new Promise<void>((r) => setTimeout(r, 400));
+          aj2nmPoll.failure_message?.includes("Last output:")
+            ? ok("AJ2-nomatch: no-match output → failure_message uses Last output: fallback")
+            : fail("AJ2-nomatch: should use Last output: fallback", String(aj2nmPoll.failure_message?.slice(0, 100)));
+        } else {
+          fail("AJ2-nomatch: intake should 202", `got ${aj2nmIntake.status}`);
+        }
+      }
+
+      // Restore
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [aj2OrgId]);
+    }
+
+    // ── AJ3: DELETE /v1/api-keys/:id with non-UUID → 404 ─────────────────────
+    {
+      // Use Clerk org-admin headers (requireClerkOrgAdmin check runs before DB hit)
+      const aj3Headers = {
+        "x-test-clerk-user-id": "clerk_user_test_seed",
+        "x-test-clerk-org-id": "clerk_org_aaa",
+        "x-test-clerk-org-role": "org:admin",
+      };
+
+      const rNotUuid = await request("DELETE", "/v1/api-keys/not-a-uuid", { headers: aj3Headers });
+      rNotUuid.status === 404 && (rNotUuid.body as any).error === "not_found"
+        ? ok("AJ3: DELETE /v1/api-keys/not-a-uuid → 404 not_found")
+        : fail("AJ3: non-UUID id should 404", `got ${rNotUuid.status} ${JSON.stringify(rNotUuid.body)}`);
+
+      const rShort = await request("DELETE", "/v1/api-keys/12345", { headers: aj3Headers });
+      rShort.status === 404 && (rShort.body as any).error === "not_found"
+        ? ok("AJ3: DELETE /v1/api-keys/12345 → 404 not_found")
+        : fail("AJ3: short id should 404", `got ${rShort.status} ${JSON.stringify(rShort.body)}`);
+
+      // Valid UUID format but not in DB → still 404 from rowCount check
+      const rMissing = await request("DELETE", "/v1/api-keys/00000000-0000-0000-0000-000000000099", { headers: aj3Headers });
+      rMissing.status === 404
+        ? ok("AJ3: valid UUID not in DB → 404")
+        : fail("AJ3: missing UUID key should 404", `got ${rMissing.status}`);
+    }
+
+    // ── AJ4: reuse failed-first-deploy app ────────────────────────────────────
+    // Stub mode: first deploy fails (fly_app_id cleared), retry with same name
+    // → findReuseableApp finds it, reuses same app record, succeeds.
+    {
+      // Fresh org + key
+      const { rows: aj4OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aj4','AJ4 Org','aj4-org') RETURNING id",
+      );
+      const aj4OrgId = aj4OrgRows[0].id;
+      const { fullKey: aj4Key, keyPrefix: aj4KP, keyHash: aj4KH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aj4-key',$3,$4,'{read,deploy,manage}')",
+        [aj4OrgId, userId, aj4KP, aj4KH],
+      );
+
+      const aj4Zip = await buildZip({
+        "package.json": JSON.stringify({ name: "aj4-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+
+      // First deploy — set to failure
+      await request("POST", "/test/set-deploy-mode", { body: { mode: "failure" } });
+
+      const aj4Form1 = new FormData();
+      aj4Form1.append("code", aj4Zip, { filename: "app.zip", contentType: "application/zip" });
+      aj4Form1.append("app_name", "aj4-reuse-test");
+
+      const aj4Intake1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4Key), formData: aj4Form1,
+      });
+      aj4Intake1.status === 202
+        ? ok("AJ4a: first deploy intake accepted (202)")
+        : fail("AJ4a: first deploy intake should 202", `got ${aj4Intake1.status} ${JSON.stringify(aj4Intake1.body)}`);
+
+      const { deployment_id: aj4DepId1, app_id: aj4AppId1 } = aj4Intake1.body as Record<string, string>;
+      const aj4Poll1 = await pollDeployment(aj4DepId1, aj4Key);
+      await new Promise<void>((r) => setTimeout(r, 200)); // let fly_app_id clear
+
+      aj4Poll1.status === "failed"
+        ? ok("AJ4a: first deploy status = failed")
+        : fail("AJ4a: first deploy should fail", aj4Poll1.status);
+
+      // Verify fly_app_id was cleared
+      const { rows: aj4AppBefore } = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [aj4AppId1],
+      );
+      aj4AppBefore[0]?.fly_app_id === null
+        ? ok("AJ4a: fly_app_id cleared after failed first deploy (stub)")
+        : fail("AJ4a: fly_app_id should be NULL", String(aj4AppBefore[0]?.fly_app_id));
+
+      // Retry with same name (no app_id) — should reuse via findReuseableApp
+      await request("POST", "/test/set-deploy-mode", { body: { mode: "success" } });
+
+      const aj4Form2 = new FormData();
+      aj4Form2.append("code", aj4Zip, { filename: "app.zip", contentType: "application/zip" });
+      aj4Form2.append("app_name", "aj4-reuse-test"); // same name, no app_id
+
+      const aj4Intake2 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4Key), formData: aj4Form2,
+      });
+      aj4Intake2.status === 202
+        ? ok("AJ4b: retry with same name → 202 (not 409)")
+        : fail("AJ4b: retry should 202, not 409", `got ${aj4Intake2.status} ${JSON.stringify(aj4Intake2.body)}`);
+
+      if (aj4Intake2.status === 202) {
+        const { deployment_id: aj4DepId2, app_id: aj4AppId2 } = aj4Intake2.body as Record<string, string>;
+
+        aj4AppId2 === aj4AppId1
+          ? ok("AJ4b: retry reused same app_id")
+          : fail("AJ4b: retry should reuse same app_id", `expected ${aj4AppId1} got ${aj4AppId2}`);
+
+        const aj4Poll2 = await pollDeployment(aj4DepId2, aj4Key);
+        aj4Poll2.status === "success"
+          ? ok("AJ4b: retry succeeded")
+          : fail("AJ4b: retry should succeed", `${aj4Poll2.status} stage=${aj4Poll2.failure_stage}`);
+
+        // Verify only 1 app was created
+        const { rows: aj4AppCount } = await pool.query<{ count: string }>(
+          "SELECT COUNT(*) AS count FROM apps WHERE org_id=$1 AND name='aj4-reuse-test'",
+          [aj4OrgId],
+        );
+        parseInt(aj4AppCount[0].count) === 1
+          ? ok("AJ4b: only 1 app record created across both deploys")
+          : fail("AJ4b: should be exactly 1 app", `count=${aj4AppCount[0].count}`);
+      }
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [aj4OrgId]);
+    }
+
+    // ── AJ4b: in-progress deploy → same name → 409 (no reuse while building) ──
+    // An app whose only deployment is still queued/building must NOT be reused;
+    // a second deploy with the same explicit name should return 409 name_taken.
+    {
+      const { rows: aj4bOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aj4b','AJ4b Org','aj4b-org') RETURNING id",
+      );
+      const aj4bOrgId = aj4bOrgRows[0].id;
+      const { fullKey: aj4bKey, keyPrefix: aj4bKP, keyHash: aj4bKH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aj4b-key',$3,$4,'{read,deploy,manage}')",
+        [aj4bOrgId, userId, aj4bKP, aj4bKH],
+      );
+
+      const aj4bZip = await buildZip({
+        "package.json": JSON.stringify({ name: "aj4b-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+
+      // First deploy — leaves deployment in 'queued' (stub runs asynchronously via setImmediate)
+      const aj4bForm1 = new FormData();
+      aj4bForm1.append("code", aj4bZip, { filename: "app.zip", contentType: "application/zip" });
+      aj4bForm1.append("app_name", "aj4b-in-progress");
+      const aj4bIntake1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4bKey), formData: aj4bForm1,
+      });
+      aj4bIntake1.status === 202
+        ? ok("AJ4b-setup: first deploy accepted (202)")
+        : fail("AJ4b-setup: first deploy should 202", `got ${aj4bIntake1.status}`);
+
+      // Immediately send second deploy with same name — deployment still queued
+      const aj4bForm2 = new FormData();
+      aj4bForm2.append("code", aj4bZip, { filename: "app.zip", contentType: "application/zip" });
+      aj4bForm2.append("app_name", "aj4b-in-progress");
+      const aj4bIntake2 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4bKey), formData: aj4bForm2,
+      });
+      aj4bIntake2.status === 409 && (aj4bIntake2.body as any)?.error === "name_taken"
+        ? ok("AJ4b: in-progress deploy + same name → 409 name_taken")
+        : fail("AJ4b: should 409 while deploy in progress", `got ${aj4bIntake2.status} ${JSON.stringify(aj4bIntake2.body)}`);
+
+      // Verify no second deployment was created for the same app
+      if (aj4bIntake1.status === 202) {
+        const { app_id: aj4bAppId } = aj4bIntake1.body as Record<string, string>;
+        await new Promise<void>((r) => setTimeout(r, 300)); // let stub finish
+        const { rows: aj4bDepRows } = await pool.query<{ count: string }>(
+          "SELECT COUNT(*) AS count FROM deployments WHERE app_id=$1", [aj4bAppId],
+        );
+        parseInt(aj4bDepRows[0].count) === 1
+          ? ok("AJ4b: only 1 deployment created (second was rejected)")
+          : fail("AJ4b: should be exactly 1 deployment", `count=${aj4bDepRows[0].count}`);
+      }
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [aj4bOrgId]);
+    }
+
+    // ── AJ4c: app with no deployments → same name → 409 ─────────────────────
+    // An app that exists in the DB with no deployments must NOT be reused
+    // (EXISTS check fails); a deploy with the same slug must return 409.
+    {
+      const { rows: aj4cOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aj4c','AJ4c Org','aj4c-org') RETURNING id",
+      );
+      const aj4cOrgId = aj4cOrgRows[0].id;
+      const { fullKey: aj4cKey, keyPrefix: aj4cKP, keyHash: aj4cKH } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aj4c-key',$3,$4,'{read,deploy,manage}')",
+        [aj4cOrgId, userId, aj4cKP, aj4cKH],
+      );
+
+      // Insert an app with no deployments directly
+      await pool.query(
+        "INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1,$2,'aj4c-no-dep','aj4c-no-dep')",
+        [aj4cOrgId, userId],
+      );
+
+      const aj4cZip = await buildZip({
+        "package.json": JSON.stringify({ name: "aj4c-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+        "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+      });
+      const aj4cForm = new FormData();
+      aj4cForm.append("code", aj4cZip, { filename: "app.zip", contentType: "application/zip" });
+      aj4cForm.append("app_name", "aj4c-no-dep");
+      const aj4cIntake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(aj4cKey), formData: aj4cForm,
+      });
+      aj4cIntake.status === 409 && (aj4cIntake.body as any)?.error === "name_taken"
+        ? ok("AJ4c: app with no deployments → 409 name_taken (not reused)")
+        : fail("AJ4c: no-deployment app should 409", `got ${aj4cIntake.status} ${JSON.stringify(aj4cIntake.body)}`);
+
+      await pool.query("DELETE FROM orgs WHERE id=$1", [aj4cOrgId]);
+    }
+
+    // ── AJ5: WATCHDOG_PROBE_SECONDS startup validation ────────────────────────
+    // Spawns dist/index.js with invalid/valid values; validates startup behaviour.
+    {
+      const distEntry = path.join(__dirname, "../dist/index.js");
+      if (!fs.existsSync(distEntry)) {
+        fail("AJ5: dist/index.js not found — run `npm run build` first");
+      } else {
+        // Helper to spawn and wait for process exit (not health poll — we expect exit 1)
+        const spawnAndWaitExit = (port: number, env: NodeJS.ProcessEnv) =>
+          new Promise<{ code: number | null; stderr: string }>((resolve) => {
+            let stderr = "";
+            const child = require("child_process").spawn(process.execPath, [distEntry], {
+              cwd: path.join(__dirname, ".."),
+              env,
+              stdio: ["ignore", "ignore", "pipe"],
+            });
+            child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+            child.on("close", (code: number | null) => resolve({ code, stderr }));
+            setTimeout(() => { child.kill("SIGTERM"); resolve({ code: null, stderr }); }, 15000);
+          });
+
+        // Reuse makeProdEnv logic inline (same pattern as AF section)
+        const makeAjEnv = (port: number, extra: Record<string, string> = {}): {
+          env: NodeJS.ProcessEnv; cleanup: () => void;
+        } => {
+          const flyDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-aj5-fly-"));
+          fs.writeFileSync(path.join(flyDir, "flyctl"), "#!/bin/sh\necho 'flyctl v0.5.1'\nexit 0\n", { mode: 0o755 });
+          const env: NodeJS.ProcessEnv = {
+            ...process.env,
+            PATH: flyDir + ":" + (process.env.PATH ?? ""),
+            PORT: String(port),
+            SSC_TEST: "1",
+            FLY_API_TOKEN: "test-token",
+            FLY_ORG_SLUG: "test-org",
+            CLERK_SECRET_KEY: "sk_test_fake",
+            PROXY_IMAGE: `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`,
+            API_PUBLIC_URL: `http://localhost:${port}`,
+            WEB_URL: `http://localhost:${port}`,
+            PLATFORM_ADMIN_CLERK_IDS: "user_admintest1",
+            ...extra,
+          };
+          const cleanup = () => { try { fs.rmSync(flyDir, { recursive: true }); } catch {} };
+          return { env, cleanup };
+        };
+
+        // AJ5a: WATCHDOG_PROBE_SECONDS=5 (< 30) → exit 1
+        {
+          const { env: aj5aEnv, cleanup: aj5aCleanup } = makeAjEnv(14110, { WATCHDOG_PROBE_SECONDS: "5" });
+          try {
+            const aj5a = await spawnAndWaitExit(14110, aj5aEnv);
+            aj5a.code === 1
+              ? ok("AJ5a: WATCHDOG_PROBE_SECONDS=5 → exit 1")
+              : fail("AJ5a: should exit 1 for probe seconds < 30", `exit=${aj5a.code} stderr=${aj5a.stderr.slice(0, 200)}`);
+            aj5a.stderr.includes("[startup] FATAL: WATCHDOG_PROBE_SECONDS")
+              ? ok("AJ5a: stderr contains [startup] FATAL: WATCHDOG_PROBE_SECONDS")
+              : fail("AJ5a: missing FATAL message for WATCHDOG_PROBE_SECONDS=5", aj5a.stderr.slice(0, 300));
+          } finally {
+            aj5aCleanup();
+          }
+        }
+
+        // AJ5b: WATCHDOG_PROBE_SECONDS=99999 (> 3600) → exit 1
+        {
+          const { env: aj5bEnv, cleanup: aj5bCleanup } = makeAjEnv(14111, { WATCHDOG_PROBE_SECONDS: "99999" });
+          try {
+            const aj5b = await spawnAndWaitExit(14111, aj5bEnv);
+            aj5b.code === 1
+              ? ok("AJ5b: WATCHDOG_PROBE_SECONDS=99999 → exit 1")
+              : fail("AJ5b: should exit 1 for probe seconds > 3600", `exit=${aj5b.code}`);
+          } finally {
+            aj5bCleanup();
+          }
+        }
+
+        // AJ5c: WATCHDOG_PROBE_SECONDS=60 (valid) → server starts, health 200
+        {
+          const { env: aj5cEnv, cleanup: aj5cCleanup } = makeAjEnv(14112, { WATCHDOG_PROBE_SECONDS: "60" });
+          try {
+            const aj5c = await new Promise<{ healthy: boolean; stderr: string; exitCode: number | null }>((resolve) => {
+              let resolved = false;
+              let stderr = "";
+              const done = (healthy: boolean, exitCode: number | null) => {
+                if (!resolved) { resolved = true; resolve({ healthy, stderr, exitCode }); }
+              };
+              const child = require("child_process").spawn(process.execPath, [distEntry], {
+                cwd: path.join(__dirname, ".."),
+                env: aj5cEnv,
+                stdio: ["ignore", "ignore", "pipe"],
+              });
+              child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+              child.on("close", (code: number | null) => done(false, code));
+              let attempts = 0;
+              const poll = () => {
+                if (resolved) return;
+                if (attempts++ > 20000 / 300) { child.kill("SIGTERM"); done(false, null); return; }
+                http.get(`http://localhost:14112/health`, (res) => {
+                  if (res.statusCode === 200) { child.kill("SIGTERM"); done(true, null); }
+                  else { res.resume(); setTimeout(poll, 300); }
+                }).on("error", () => setTimeout(poll, 300));
+              };
+              setTimeout(poll, 300);
+            });
+            aj5c.healthy
+              ? ok("AJ5c: WATCHDOG_PROBE_SECONDS=60 → dist/index.js starts and serves health 200")
+              : fail("AJ5c: dist/index.js should start with valid WATCHDOG_PROBE_SECONDS=60",
+                  aj5c.exitCode !== null ? `exited with code ${aj5c.exitCode}` : "timed out");
+          } finally {
+            aj5cCleanup();
+          }
+        }
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

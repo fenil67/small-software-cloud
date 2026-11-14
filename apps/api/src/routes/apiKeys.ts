@@ -88,7 +88,14 @@ apiKeysRouter.get("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, r
   res.json(rows);
 }));
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 apiKeysRouter.delete("/:id", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
+  if (!UUID_RE.test(req.params.id)) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+
   const sscAuth = req.sscAuth!;
   const orgId = await ensureOrg(sscAuth.clerkOrgId!);
 

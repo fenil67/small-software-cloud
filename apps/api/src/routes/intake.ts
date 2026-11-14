@@ -86,6 +86,32 @@ function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 6); // 4 chars, e.g. "k3x9"
 }
 
+/**
+ * Finds an app eligible for retry: same slug, not deleted/suspended, no Fly app,
+ * and EVERY deployment has status='failed' (at least one must exist).
+ * This excludes apps still in progress (queued/building/deploying).
+ */
+async function findReuseableApp(orgId: string, slug: string): Promise<string | null> {
+  const { rows } = await pool.query<{ id: string }>(
+    `SELECT id FROM apps
+     WHERE org_id = $1
+       AND slug = $2
+       AND deleted_at IS NULL
+       AND suspended_at IS NULL
+       AND fly_app_id IS NULL
+       AND EXISTS (
+         SELECT 1 FROM deployments WHERE app_id = apps.id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM deployments
+         WHERE app_id = apps.id
+           AND status != 'failed'
+       )`,
+    [orgId, slug],
+  );
+  return rows[0]?.id ?? null;
+}
+
 interface CreateDeployResult {
   deploymentId: string;
   appId: string;
@@ -187,15 +213,26 @@ intakeRouter.post(
       return;
     }
 
+    // Compute name early — needed for reuse check before limit check
+    const rawName = ((req.body as { app_name?: string }).app_name ?? "").trim();
+    const appName = rawName || "app";
+    const explicitName = rawName.length > 0;
+
     const orgId = await resolveOrgId(req);
     if (!orgId) {
       res.status(400).json({ error: "no_active_org" });
       return;
     }
 
-    // Check limits (skip app limit if we're redeploying)
     const existingAppId = (req.body as { app_id?: string }).app_id;
-    const violation = await checkDeployLimits(orgId, { skipAppLimit: !!existingAppId });
+    // Check for a failed-first-deploy app that can be reused (before limit check)
+    const reuseAppId = existingAppId
+      ? null
+      : await findReuseableApp(orgId, slugify(appName));
+    const effectiveAppId = existingAppId ?? reuseAppId ?? undefined;
+
+    // Check limits (skip app limit if redeploying or reusing a failed app)
+    const violation = await checkDeployLimits(orgId, { skipAppLimit: !!effectiveAppId });
     if (violation) {
       res.status(429).json({ error: violation.limit, message: violation.message });
       return;
@@ -213,6 +250,7 @@ intakeRouter.post(
     }
 
     // Refuse redeployment of a suspended app before any Fly call
+    // (reuseAppId is already filtered to suspended_at IS NULL by findReuseableApp)
     if (existingAppId) {
       const { rows: suspRows } = await pool.query<{ suspended_at: Date | null }>(
         "SELECT suspended_at FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
@@ -228,16 +266,13 @@ intakeRouter.post(
     }
 
     const userId = await resolveUserId(req);
-    const rawName = ((req.body as { app_name?: string }).app_name ?? "").trim();
-    const appName = rawName || "app";
-    const explicitName = rawName.length > 0;
 
     let deploymentId: string;
     let appId: string;
 
     try {
       ({ deploymentId, appId } = await createAppAndDeployment(
-        orgId, userId, appName, explicitName, "zip", null, existingAppId,
+        orgId, userId, appName, explicitName, "zip", null, effectiveAppId,
       ));
     } catch (err) {
       if (err instanceof NameTakenError) {
@@ -254,8 +289,8 @@ intakeRouter.post(
       throw err;
     }
 
-    // Grant creator access on new-app creation (not on redeployment)
-    if (!existingAppId && userId) {
+    // Grant creator access on new-app creation (not on redeployment or reuse)
+    if (!effectiveAppId && userId) {
       await pool.query(
         `INSERT INTO app_access (app_id, user_id, granted_by)
          VALUES ($1, $2, NULL)
@@ -306,20 +341,32 @@ intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Re
     throw err;
   }
 
+  // Compute name early — needed for reuse check before limit check
+  const rawName = (app_name ?? "").trim();
+  const appName = rawName || parsedGithub.repo;
+  const explicitName = rawName.length > 0;
+
   const orgId = await resolveOrgId(req);
   if (!orgId) {
     res.status(400).json({ error: "no_active_org" });
     return;
   }
 
-  // Check limits
-  const violation = await checkDeployLimits(orgId, { skipAppLimit: !!existingAppId });
+  // Check for a failed-first-deploy app that can be reused (before limit check)
+  const reuseAppId = existingAppId
+    ? null
+    : await findReuseableApp(orgId, slugify(appName));
+  const effectiveAppId = existingAppId ?? reuseAppId ?? undefined;
+
+  // Check limits (skip app limit if redeploying or reusing a failed app)
+  const violation = await checkDeployLimits(orgId, { skipAppLimit: !!effectiveAppId });
   if (violation) {
     res.status(429).json({ error: violation.limit, message: violation.message });
     return;
   }
 
   // Refuse redeployment of a suspended app before any Fly call
+  // (reuseAppId is already filtered to suspended_at IS NULL by findReuseableApp)
   if (existingAppId) {
     const { rows: suspRows } = await pool.query<{ suspended_at: Date | null }>(
       "SELECT suspended_at FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
@@ -335,16 +382,13 @@ intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Re
   }
 
   const userId = await resolveUserId(req);
-  const rawName = (app_name ?? "").trim();
-  const appName = rawName || parsedGithub.repo;
-  const explicitName = rawName.length > 0;
 
   let deploymentId: string;
   let appId: string;
 
   try {
     ({ deploymentId, appId } = await createAppAndDeployment(
-      orgId, userId, appName, explicitName, "github", parsedGithub.cloneUrl, existingAppId,
+      orgId, userId, appName, explicitName, "github", parsedGithub.cloneUrl, effectiveAppId,
     ));
   } catch (err) {
     if (err instanceof NameTakenError) {
@@ -361,8 +405,8 @@ intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Re
     throw err;
   }
 
-  // Grant creator access on new-app creation (not on redeployment)
-  if (!existingAppId && userId) {
+  // Grant creator access on new-app creation (not on redeployment or reuse)
+  if (!effectiveAppId && userId) {
     await pool.query(
       `INSERT INTO app_access (app_id, user_id, granted_by)
        VALUES ($1, $2, NULL)

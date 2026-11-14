@@ -293,6 +293,28 @@ async function cloneRepo(githubUrl: string, deploymentId: string): Promise<strin
 }
 
 
+/**
+ * Scans already-scrubbed outputLines for the most actionable build-failure line.
+ * Priority: "npm ERR!" > TypeScript error > "Error:" > "ERR_" > "failed to solve" > "ERROR".
+ * Returns the first matching line trimmed to 200 chars, or null if no pattern matches
+ * (caller falls back to its own message).
+ */
+export function extractBuildFailureLine(lines: string[]): string | null {
+  const patterns: RegExp[] = [
+    /npm ERR!/,
+    /error TS\d+/,
+    /Error:/,
+    /ERR_/,
+    /failed to solve/i,
+    /ERROR/,
+  ];
+  for (const pat of patterns) {
+    const hit = lines.find((l) => pat.test(l));
+    if (hit) return hit.trim().slice(0, 200);
+  }
+  return null;
+}
+
 // Exported for unit testing (fake flyctl binary on PATH).
 export async function runFlyctlDeploy(
   dir: string,
@@ -346,20 +368,10 @@ export async function runFlyctlDeploy(
         // When flyctl gets an unrecognised flag it prints ~20 lines of usage
         // text instead of a useful error.  Detect that case and surface only
         // the single "Error:" line so the failure message stays actionable.
-        const isUsageOutput = outputLines.some(
-          (l) => l.includes("Usage:") || l.includes("Global Flags:"),
-        );
-        let detail: string;
-        if (isUsageOutput) {
-          const errorLine =
-            outputLines.find((l) => l.startsWith("Error:")) ??
-            outputLines.slice(-1)[0] ??
-            "Unknown error";
-          detail = errorLine;
-        } else {
-          detail = `Last output:\n${outputLines.slice(-20).join("\n")}`;
-        }
-        reject(new DeployError("deploy", `Build or deploy failed. ${scrubSecrets(detail)}`));
+        const failureLine = extractBuildFailureLine(outputLines);
+        // outputLines is already scrubbed; fall back to last 20 lines when no pattern matches.
+        const detail = failureLine ?? `Last output:\n${outputLines.slice(-20).join("\n")}`;
+        reject(new DeployError("deploy", `Build or deploy failed. ${detail}`));
         return;
       }
       resolve();
@@ -559,7 +571,8 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     // Step 3b: generate Dockerfile + fly.toml (lockfile-aware for Node)
     log(deploymentId, "Generating deploy files…");
     try {
-      await generateDeployFiles(workDir, appName, appType, appId);
+      const { nodeVersionLog } = await generateDeployFiles(workDir, appName, appType, appId);
+      if (nodeVersionLog) log(deploymentId, nodeVersionLog);
     } catch (err) {
       throw new DeployError(
         "provision",

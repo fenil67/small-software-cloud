@@ -80,6 +80,18 @@ export function validateWatchdogConfig(): void {
     );
     process.exit(1);
   }
+
+  // WATCHDOG_PROBE_SECONDS — optional integer, 30–3600
+  const probeSecRaw = process.env.WATCHDOG_PROBE_SECONDS;
+  if (probeSecRaw !== undefined) {
+    const probeVal = parseInt(probeSecRaw, 10);
+    if (!Number.isInteger(probeVal) || String(probeVal) !== probeSecRaw.trim() || probeVal < 30 || probeVal > 3600) {
+      console.error(
+        "[startup] FATAL: WATCHDOG_PROBE_SECONDS must be an integer between 30 and 3600.",
+      );
+      process.exit(1);
+    }
+  }
 }
 
 // ── Test-only probe base URL overrides ────────────────────────────────────────

@@ -139,7 +139,14 @@ export async function reapKeysByMembership(): Promise<number> {
   return revoked;
 }
 
-const PROBE_INTERVAL_MS    = 5  * 60 * 1000; //  5 minutes
+const PROBE_INTERVAL_MS = (() => {
+  const raw = process.env.WATCHDOG_PROBE_SECONDS;
+  if (raw !== undefined) {
+    const v = parseInt(raw, 10);
+    if (Number.isInteger(v) && v >= 30 && v <= 3600) return v * 1000;
+  }
+  return 120 * 1000; // default 120 s
+})();
 const METRICS_INTERVAL_MS  = 15 * 60 * 1000; // 15 minutes
 const MEMBERSHIP_REAP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
