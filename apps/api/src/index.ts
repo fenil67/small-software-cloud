@@ -82,11 +82,6 @@ installProcessHandlers();
     }
   })();
 
-  // PLATFORM_ADMIN_CLERK_IDS — optional; each entry must match ^user_[A-Za-z0-9]+$
-  // validateAdminConfig() parses the env var, populates the admin ID set, and exits 1
-  // on invalid entries.  No parsing happens at import time; this call is the only
-  // place that initialises the set, so it must run before the server accepts requests.
-  validateAdminConfig();
 })();
 
 import { healthRouter } from "./routes/health";
@@ -101,6 +96,14 @@ import { deploymentsRouter } from "./routes/deployments";
 import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
 import { startReaper } from "./lib/reaper";
+
+// PLATFORM_ADMIN_CLERK_IDS — optional; each entry must match ^user_[A-Za-z0-9]+$
+// Called here, directly after the ./routes/admin import, so the compiled require()
+// for that module has already run and validateAdminConfig is defined.
+// (Calling it inside the earlier startupChecks IIFE caused a TDZ ReferenceError
+// because TypeScript's CommonJS output places the require() in source order, not
+// hoisted, so admin_1 was not yet initialised when the IIFE executed.)
+validateAdminConfig();
 
 const app = express();
 // Railway injects PORT; API_PORT is the local-dev fallback

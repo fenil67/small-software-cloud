@@ -5993,81 +5993,134 @@ async function main(): Promise<void> {
     const afAdminHeaders = { "x-test-clerk-user-id": afAdminClerkId };
     const afNonAdminHeaders = { "x-test-clerk-user-id": afNonAdminClerkId };
 
-    // ── AF1: startup validation ───────────────────────────────────────────────
-    {
-      const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
-      const apiDir = path.join(__dirname, "..");
+    // Helper: build env + fake-flyctl path for spawning the production dist/index.js
+    const distEntry = path.join(__dirname, "../dist/index.js");
+    function makeProdEnv(port: number, extra: Record<string, string> = {}): {
+      env: NodeJS.ProcessEnv; cleanup: () => void;
+    } {
+      const flyDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-af-fly-"));
+      fs.writeFileSync(
+        path.join(flyDir, "flyctl"),
+        "#!/bin/sh\necho 'flyctl v0.5.1'\nexit 0\n",
+        { mode: 0o755 },
+      );
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: flyDir + ":" + (process.env.PATH ?? ""),
+        PORT: String(port),
+        SSC_TEST: "1",
+        FLY_API_TOKEN: "test-token",
+        FLY_ORG_SLUG: "test-org",
+        CLERK_SECRET_KEY: "sk_test_fake",
+        PROXY_IMAGE: `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`,
+        API_PUBLIC_URL: `http://localhost:${port}`,
+        WEB_URL: `http://localhost:${port}`,
+        PLATFORM_ADMIN_CLERK_IDS: "user_admintest1",
+        ...extra,
+      };
+      const cleanup = () => { try { fs.rmSync(flyDir, { recursive: true }); } catch {} };
+      return { env, cleanup };
+    }
 
-      // AF1a: invalid entry → exit 1 AND stderr contains the FATAL message
-      {
-        const af1aScript = path.join(__dirname, "_af1a_admin_tmp.ts");
+    // Helper: spawn dist/index.js and poll /health until 200 (or timeout/exit)
+    async function spawnAndPollHealth(
+      port: number,
+      env: NodeJS.ProcessEnv,
+      timeoutMs: number,
+    ): Promise<{ healthy: boolean; stderr: string; exitCode: number | null }> {
+      return new Promise((resolve) => {
+        let resolved = false;
+        let stderr = "";
+        const done = (healthy: boolean, exitCode: number | null) => {
+          if (!resolved) { resolved = true; resolve({ healthy, stderr, exitCode }); }
+        };
+        const child = require("child_process").spawn(process.execPath, [distEntry], {
+          cwd: path.join(__dirname, ".."),
+          env,
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+        child.on("close", (code: number | null) => done(false, code));
+        // Poll health every 300 ms
+        let attempts = 0;
+        const poll = () => {
+          if (resolved) return;
+          if (attempts++ > timeoutMs / 300) { child.kill("SIGTERM"); done(false, null); return; }
+          http.get(`http://localhost:${port}/health`, (res) => {
+            if (res.statusCode === 200) { child.kill("SIGTERM"); done(true, null); }
+            else { res.resume(); setTimeout(poll, 300); }
+          }).on("error", () => setTimeout(poll, 300));
+        };
+        setTimeout(poll, 300);
+      });
+    }
+
+    // ── AF0: production entry boots ───────────────────────────────────────────
+    // Spawns the SAME compiled file Railway runs; validates that the fix to
+    // index.ts (moving validateAdminConfig after imports) is in the build.
+    {
+      if (!fs.existsSync(distEntry)) {
+        fail("AF0: dist/index.js not found — run `npm run build` first");
+      } else {
+        const { env: af0Env, cleanup: af0Cleanup } = makeProdEnv(14100);
         try {
-          fs.writeFileSync(
-            af1aScript,
-            `import { validateAdminConfig } from "../src/routes/admin";\nvalidateAdminConfig();\n`,
-          );
-          const r1a = await new Promise<{ code: number; stderr: string }>((resolve) => {
-            const child = require("child_process").spawn(tsx, [af1aScript], {
-              cwd: apiDir,
-              env: { ...process.env, PLATFORM_ADMIN_CLERK_IDS: "not-valid!@#" },
-              stdio: ["ignore", "pipe", "pipe"],
-            });
-            let stderr = "";
-            child.stdout.on("data", () => {});
-            child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-            child.on("close", (code: number | null) => resolve({ code: code ?? 1, stderr }));
-          });
-          r1a.code === 1
-            ? ok("AF1a: invalid PLATFORM_ADMIN_CLERK_IDS → exit 1")
-            : fail("AF1a: invalid admin ID should exit 1", `exit=${r1a.code} stderr=${r1a.stderr.slice(0, 200)}`);
-          r1a.stderr.includes("[startup] FATAL: PLATFORM_ADMIN_CLERK_IDS")
-            ? ok("AF1a: stderr contains [startup] FATAL: PLATFORM_ADMIN_CLERK_IDS message")
-            : fail("AF1a: stderr missing PLATFORM_ADMIN_CLERK_IDS fatal message", r1a.stderr.slice(0, 300));
+          const af0 = await spawnAndPollHealth(14100, af0Env, 20000);
+          af0.healthy
+            ? ok("AF0: dist/index.js boots and serves GET /health 200")
+            : fail("AF0: dist/index.js did not reach health 200 within 20 s",
+                af0.exitCode !== null ? `exited with code ${af0.exitCode}` : "timed out");
+          !af0.stderr.includes("uncaughtException")
+            ? ok("AF0: stderr contains no uncaughtException")
+            : fail("AF0: dist/index.js stderr contains uncaughtException", af0.stderr.slice(0, 300));
         } finally {
-          try { fs.unlinkSync(af1aScript); } catch {}
+          af0Cleanup();
+        }
+      }
+    }
+
+    // ── AF1: startup validation (spawns dist/index.js, same as AF0) ───────────
+    {
+      // AF1a: invalid PLATFORM_ADMIN_CLERK_IDS → exit 1 with specific FATAL message
+      {
+        const { env: af1aEnv, cleanup: af1aCleanup } = makeProdEnv(14101, {
+          PLATFORM_ADMIN_CLERK_IDS: "not-valid!@#",
+        });
+        try {
+          const af1a = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+            let stderr = "";
+            const child = require("child_process").spawn(process.execPath, [distEntry], {
+              cwd: path.join(__dirname, ".."),
+              env: af1aEnv,
+              stdio: ["ignore", "ignore", "pipe"],
+            });
+            child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+            child.on("close", (code: number | null) => resolve({ code, stderr }));
+            setTimeout(() => { child.kill("SIGTERM"); resolve({ code: null, stderr }); }, 15000);
+          });
+          af1a.code === 1
+            ? ok("AF1a: invalid PLATFORM_ADMIN_CLERK_IDS → exit 1")
+            : fail("AF1a: invalid admin ID should exit 1", `exit=${af1a.code} stderr=${af1a.stderr.slice(0, 200)}`);
+          af1a.stderr.includes("[startup] FATAL: PLATFORM_ADMIN_CLERK_IDS")
+            ? ok("AF1a: stderr contains [startup] FATAL: PLATFORM_ADMIN_CLERK_IDS message")
+            : fail("AF1a: stderr missing PLATFORM_ADMIN_CLERK_IDS fatal message", af1a.stderr.slice(0, 300));
+        } finally {
+          af1aCleanup();
         }
       }
 
       // AF1b: empty PLATFORM_ADMIN_CLERK_IDS → server starts (health 200), then stop
       {
-        const AF1B_PORT = 14099;
-        const af1bScript = path.join(__dirname, "_af1b_admin_tmp.ts");
+        const { env: af1bEnv, cleanup: af1bCleanup } = makeProdEnv(14102, {
+          PLATFORM_ADMIN_CLERK_IDS: "",
+        });
         try {
-          fs.writeFileSync(
-            af1bScript,
-            [
-              `import express from "express";`,
-              `import { validateAdminConfig } from "../src/routes/admin";`,
-              `validateAdminConfig();`,
-              `const app = express();`,
-              `app.get("/health", (_req: import("express").Request, res: import("express").Response) => res.json({ ok: true }));`,
-              `app.listen(${AF1B_PORT}, () => { process.stdout.write("ready:\\n"); });`,
-            ].join("\n") + "\n",
-          );
-          const r1b = await new Promise<{ healthy: boolean }>((resolve) => {
-            let resolved = false;
-            const done = (healthy: boolean) => { if (!resolved) { resolved = true; resolve({ healthy }); } };
-            const child = require("child_process").spawn(tsx, [af1bScript], {
-              cwd: apiDir,
-              env: { ...process.env, PLATFORM_ADMIN_CLERK_IDS: "" },
-              stdio: ["ignore", "pipe", "pipe"],
-            });
-            child.stdout.on("data", (d: Buffer) => {
-              if (d.toString().includes("ready")) {
-                http.get(`http://localhost:${AF1B_PORT}/health`, (res) => {
-                  child.kill();
-                  done(res.statusCode === 200);
-                }).on("error", () => { child.kill(); done(false); });
-              }
-            });
-            child.on("close", () => done(false));
-            setTimeout(() => { child.kill(); done(false); }, 15000);
-          });
-          r1b.healthy
-            ? ok("AF1b: empty PLATFORM_ADMIN_CLERK_IDS → server starts, health 200")
-            : fail("AF1b: server should start with empty PLATFORM_ADMIN_CLERK_IDS");
+          const af1b = await spawnAndPollHealth(14102, af1bEnv, 20000);
+          af1b.healthy
+            ? ok("AF1b: empty PLATFORM_ADMIN_CLERK_IDS → dist/index.js starts, health 200")
+            : fail("AF1b: dist/index.js should start with empty PLATFORM_ADMIN_CLERK_IDS",
+                af1b.exitCode !== null ? `exited with code ${af1b.exitCode}` : "timed out");
         } finally {
-          try { fs.unlinkSync(af1bScript); } catch {}
+          af1bCleanup();
         }
       }
 
