@@ -259,6 +259,76 @@ FILES NEVER UPLOADED: .env, .env.*, *.key, *.pem, node_modules/, .git/ — alway
     },
   );
 
+  // ── delete_app ───────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "delete_app",
+    {
+      description: `Permanently deletes an app and its Fly.io resources. This cannot be undone.
+
+Only call this when the user has explicitly asked to delete this specific app.
+Pass the app's exact current name as confirm_name; the call is refused if it does not match.`,
+      inputSchema: z.object({
+        app_id: z.string().describe("The ID of the app to delete"),
+        confirm_name: z
+          .string()
+          .describe(
+            "The app's exact current name — must match exactly (case-sensitive) or the deletion is refused",
+          ),
+      }),
+    },
+    async (input) => {
+      const { app_id, confirm_name } = input;
+      const client = new SscClient();
+
+      let app: Awaited<ReturnType<typeof client.getApp>>;
+      try {
+        app = await client.getApp(app_id);
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: err instanceof Error ? err.message : String(err),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      if (confirm_name !== app.name) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Confirmation name does not match the app's name; nothing was deleted.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      try {
+        await client.deleteApp(app_id);
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: err instanceof Error ? err.message : String(err),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Deleted ${app.name}.` }],
+        isError: false,
+      };
+    },
+  );
+
   // ── get_deployment_status ────────────────────────────────────────────────────
 
   server.registerTool(

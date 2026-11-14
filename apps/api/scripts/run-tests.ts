@@ -7354,6 +7354,368 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AH: App Destroy — CLI + MCP");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
+    const cliPath = path.join(__dirname, "../../../packages/cli/src/index.ts");
+    const mcpPath = path.join(__dirname, "../../../packages/mcp/src/index.ts");
+
+    // ── AH setup ──────────────────────────────────────────────────────────────
+    // Owner user for all AH apps
+    const ahOwnerRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      ["clerk_ah_owner", "ahowner@test.local", "AH Owner"],
+    );
+    const ahOwnerId = ahOwnerRow.rows[0].id;
+
+    // Helper: insert a fresh app and return its id and name
+    let ahSeq = 0;
+    async function makeAhApp(flyAppId?: string, suspended?: boolean): Promise<{ id: string; name: string }> {
+      ahSeq++;
+      const name = `ah-app-${ahSeq}`;
+      const { rows: [app] } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, $3, $4, 'zip') RETURNING id`,
+        [orgAId, ahOwnerId, name, name],
+      );
+      if (flyAppId) {
+        await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [flyAppId, app.id]);
+      }
+      if (suspended) {
+        await pool.query("UPDATE apps SET suspended_at = now() WHERE id = $1", [app.id]);
+      }
+      return { id: app.id, name };
+    }
+
+    // Helper: run CLI destroy with orgA key
+    type CliResult = { code: number; stdout: string; stderr: string };
+    const runCli = (...args: string[]): Promise<CliResult> =>
+      new Promise((resolve) => {
+        const child = require("child_process").spawn(tsx, [cliPath, ...args], {
+          env: {
+            ...process.env,
+            SSC_API_URL: BASE_URL,
+            SSC_API_KEY: keyA,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+        child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+        child.on("close", (code: number) => resolve({ code: code ?? 1, stdout, stderr }));
+      });
+
+    // Helper: call MCP tool over stdio JSON-RPC
+    type McpResult = { text: string; isError: boolean };
+    async function callMcpTool(
+      toolName: string,
+      toolArgs: Record<string, string>,
+    ): Promise<McpResult> {
+      return new Promise((resolve, reject) => {
+        const child = require("child_process").spawn(tsx, [mcpPath], {
+          env: {
+            ...process.env,
+            SSC_API_URL: BASE_URL,
+            SSC_API_KEY: keyA,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+
+        let stdout = "";
+        let resolved = false;
+
+        child.stdout.on("data", (d: Buffer) => {
+          stdout += d.toString();
+          // Try to parse each newline-delimited JSON message
+          const lines = stdout.split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const msg = JSON.parse(trimmed) as {
+                id?: number;
+                result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
+                error?: { message?: string };
+              };
+              // Response to tools/call has id=3
+              if (msg.id === 3 && !resolved) {
+                resolved = true;
+                child.kill("SIGTERM");
+                if (msg.error) {
+                  resolve({ text: msg.error.message ?? "unknown error", isError: true });
+                } else {
+                  const content = msg.result?.content ?? [];
+                  const text = content.map((c) => c.text).join("\n");
+                  resolve({ text, isError: msg.result?.isError ?? false });
+                }
+              }
+            } catch {}
+          }
+        });
+
+        child.stderr.on("data", () => {});
+        child.on("close", () => {
+          if (!resolved) reject(new Error("MCP process closed without response"));
+        });
+        child.on("error", reject);
+
+        // JSON-RPC handshake
+        const send = (msg: unknown) => {
+          child.stdin.write(JSON.stringify(msg) + "\n");
+        };
+
+        send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "test", version: "0.0.1" },
+          },
+        });
+
+        // Wait for initialize response then send initialized + tools/call
+        let initDone = false;
+        const checkInit = setInterval(() => {
+          const lines = stdout.split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const msg = JSON.parse(trimmed) as { id?: number };
+              if (msg.id === 1 && !initDone) {
+                initDone = true;
+                clearInterval(checkInit);
+                send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+                send({
+                  jsonrpc: "2.0",
+                  id: 3,
+                  method: "tools/call",
+                  params: { name: toolName, arguments: toolArgs },
+                });
+              }
+            } catch {}
+          }
+        }, 20);
+
+        setTimeout(() => {
+          clearInterval(checkInit);
+          if (!resolved) {
+            resolved = true;
+            child.kill("SIGTERM");
+            reject(new Error("MCP tool call timed out"));
+          }
+        }, 15000);
+      });
+    }
+
+    // Reset fly call log before each sub-test
+    async function ahResetFly() {
+      await request("POST", "/test/reset-fly-call-log");
+    }
+
+    // ── AH1: CLI --confirm with exact name deletes the app ────────────────────
+    {
+      await ahResetFly();
+      const { id, name } = await makeAhApp("fly-ah1-app");
+
+      const r = await runCli("destroy", id, "--confirm", name);
+      r.code === 0
+        ? ok("AH1: destroy --confirm <exact name> → exit 0")
+        : fail("AH1: destroy should exit 0", `code=${r.code} ${r.stderr}`);
+      r.stdout.includes(`Deleted ${name}.`)
+        ? ok(`AH1: stdout contains "Deleted ${name}."`)
+        : fail("AH1: missing 'Deleted' message", r.stdout.trim());
+
+      // Verify soft-delete in DB
+      const { rows } = await pool.query(
+        "SELECT deleted_at FROM apps WHERE id = $1",
+        [id],
+      );
+      rows[0]?.deleted_at != null
+        ? ok("AH1: app.deleted_at is set in DB")
+        : fail("AH1: deleted_at should be set after destroy");
+
+      // Verify Fly destroy was called
+      const flyLog1 = await request("GET", "/test/fly-call-log");
+      const flyLog1Calls = ((flyLog1.body as { calls?: Array<{ fn: string; arg: string }> }).calls) ?? [];
+      Array.isArray(flyLog1Calls)
+        ? (flyLog1Calls.find((c) => c.fn === "destroyFlyApp" && c.arg === "fly-ah1-app")
+            ? ok("AH1: destroyFlyApp called with correct fly app id")
+            : fail("AH1: destroyFlyApp should have been called", JSON.stringify(flyLog1.body)))
+        : fail("AH1: fly call log malformed", JSON.stringify(flyLog1.body));
+    }
+
+    // ── AH2: CLI --confirm with wrong name → exit 1, app NOT deleted ─────────
+    {
+      await ahResetFly();
+      const { id, name } = await makeAhApp();
+
+      const r = await runCli("destroy", id, "--confirm", name + "-WRONG");
+      r.code === 1
+        ? ok("AH2: wrong --confirm → exit 1")
+        : fail("AH2: wrong confirm should exit 1", `code=${r.code}`);
+      (r.stdout + r.stderr).includes("Confirmation does not match")
+        ? ok("AH2: mismatch message printed")
+        : fail("AH2: missing mismatch message", (r.stdout + r.stderr).trim());
+
+      // App must NOT be deleted
+      const { rows } = await pool.query(
+        "SELECT deleted_at FROM apps WHERE id = $1",
+        [id],
+      );
+      rows[0]?.deleted_at == null
+        ? ok("AH2: app NOT deleted after wrong confirm")
+        : fail("AH2: app should not be deleted with wrong confirm");
+
+      // No Fly call
+      const flyLog2 = await request("GET", "/test/fly-call-log");
+      const flyLog2Calls = ((flyLog2.body as { calls?: Array<{ fn: string }> }).calls) ?? [];
+      Array.isArray(flyLog2Calls)
+        ? (flyLog2Calls.filter((c) => c.fn === "destroyFlyApp").length === 0
+            ? ok("AH2: no destroyFlyApp call with wrong confirm")
+            : fail("AH2: destroyFlyApp should NOT have been called"))
+        : fail("AH2: fly call log malformed", JSON.stringify(flyLog2.body));
+    }
+
+    // ── AH3: CLI without --confirm on non-TTY stdin → exit 1 ─────────────────
+    {
+      await ahResetFly();
+      const { id } = await makeAhApp();
+
+      // stdio: ["ignore",...] ensures non-TTY stdin
+      const r = await runCli("destroy", id);
+      r.code === 1
+        ? ok("AH3: non-TTY without --confirm → exit 1")
+        : fail("AH3: should exit 1 on non-TTY without --confirm", `code=${r.code}`);
+      (r.stdout + r.stderr).includes("Refusing to delete without confirmation")
+        ? ok("AH3: refusal message printed")
+        : fail("AH3: missing refusal message", (r.stdout + r.stderr).trim());
+
+      // App must NOT be deleted
+      const { rows } = await pool.query(
+        "SELECT deleted_at FROM apps WHERE id = $1",
+        [id],
+      );
+      rows[0]?.deleted_at == null
+        ? ok("AH3: app NOT deleted without confirmation")
+        : fail("AH3: app should not be deleted without confirmation");
+    }
+
+    // ── AH4: CLI unknown id and cross-org app → exit 1 "App not found" ───────
+    {
+      // Unknown id
+      const rUnknown = await runCli("destroy", "00000000-0000-0000-0000-000000000000", "--confirm", "whatever");
+      rUnknown.code === 1
+        ? ok("AH4: unknown app id → exit 1")
+        : fail("AH4: unknown id should exit 1", `code=${rUnknown.code}`);
+      (rUnknown.stdout + rUnknown.stderr).includes("App not found")
+        ? ok("AH4: unknown id → 'App not found'")
+        : fail("AH4: should print 'App not found' for unknown id", (rUnknown.stdout + rUnknown.stderr).trim());
+
+      // Cross-org app (orgB, keyA)
+      const { rows: [crossApp] } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, 'ah-cross-app', 'ah-cross-app', 'zip') RETURNING id`,
+        [orgBId, ahOwnerId],
+      );
+      const rCross = await runCli("destroy", crossApp.id, "--confirm", "ah-cross-app");
+      rCross.code === 1
+        ? ok("AH4: cross-org app → exit 1")
+        : fail("AH4: cross-org should exit 1", `code=${rCross.code}`);
+      (rCross.stdout + rCross.stderr).includes("App not found")
+        ? ok("AH4: cross-org → 'App not found'")
+        : fail("AH4: cross-org should print 'App not found'", (rCross.stdout + rCross.stderr).trim());
+    }
+
+    // ── AH5: MCP delete_app ───────────────────────────────────────────────────
+    {
+      // AH5a: exact name → deletes
+      {
+        await ahResetFly();
+        const { id, name } = await makeAhApp("fly-ah5a-app");
+
+        const result = await callMcpTool("delete_app", { app_id: id, confirm_name: name });
+        !result.isError
+          ? ok("AH5a: MCP delete_app exact name → isError false")
+          : fail("AH5a: MCP delete_app should succeed", result.text);
+        result.text.includes(`Deleted ${name}.`)
+          ? ok(`AH5a: MCP result contains "Deleted ${name}."`)
+          : fail("AH5a: MCP result missing 'Deleted' message", result.text);
+
+        const { rows } = await pool.query(
+          "SELECT deleted_at FROM apps WHERE id = $1",
+          [id],
+        );
+        rows[0]?.deleted_at != null
+          ? ok("AH5a: app.deleted_at set after MCP delete_app")
+          : fail("AH5a: deleted_at should be set");
+      }
+
+      // AH5b: wrong name → error result, app NOT deleted
+      {
+        const { id, name } = await makeAhApp();
+
+        const result = await callMcpTool("delete_app", { app_id: id, confirm_name: "wrong-name" });
+        result.isError
+          ? ok("AH5b: MCP wrong name → isError true")
+          : fail("AH5b: wrong name should return isError");
+        result.text.includes("Confirmation name does not match")
+          ? ok("AH5b: MCP mismatch message returned")
+          : fail("AH5b: missing mismatch message", result.text);
+
+        const { rows } = await pool.query(
+          "SELECT deleted_at FROM apps WHERE id = $1",
+          [id],
+        );
+        rows[0]?.deleted_at == null
+          ? ok("AH5b: app NOT deleted after MCP wrong name")
+          : fail("AH5b: app should not be deleted with wrong name");
+      }
+
+      // AH5c: unknown id → "App not found"
+      {
+        const result = await callMcpTool("delete_app", {
+          app_id: "00000000-0000-0000-0000-000000000099",
+          confirm_name: "whatever",
+        });
+        result.isError
+          ? ok("AH5c: MCP unknown id → isError true")
+          : fail("AH5c: unknown id should be isError");
+        result.text.includes("App not found")
+          ? ok("AH5c: MCP unknown id → 'App not found'")
+          : fail("AH5c: should return 'App not found'", result.text);
+      }
+    }
+
+    // ── AH6: suspended app can still be deleted ───────────────────────────────
+    {
+      await ahResetFly();
+      const { id, name } = await makeAhApp("fly-ah6-app", true /* suspended */);
+
+      const r = await runCli("destroy", id, "--confirm", name);
+      r.code === 0
+        ? ok("AH6: suspended app destroy → exit 0")
+        : fail("AH6: suspended app should be destroyable", `code=${r.code} ${r.stderr}`);
+      r.stdout.includes(`Deleted ${name}.`)
+        ? ok(`AH6: suspended app destroy → "Deleted ${name}."`)
+        : fail("AH6: missing 'Deleted' message", r.stdout.trim());
+
+      const { rows } = await pool.query(
+        "SELECT deleted_at FROM apps WHERE id = $1",
+        [id],
+      );
+      rows[0]?.deleted_at != null
+        ? ok("AH6: suspended app deleted_at set")
+        : fail("AH6: deleted_at should be set for suspended app");
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

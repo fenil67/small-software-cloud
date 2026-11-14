@@ -10,10 +10,11 @@
 import fs from "fs";
 import path from "path";
 import FormData from "form-data";
-import { makeAxios, extractErrorMessage, extractSharingError } from "./http";
+import { makeAxios, extractErrorMessage, extractSharingError, extractAppError } from "./http";
 import { resolveConfig, SscConfig } from "./config";
 import { zipDirectory } from "./zip";
 import type {
+  App,
   Deployment,
   IntakeResponse,
   DeployOptions,
@@ -37,6 +38,27 @@ export class SscClient {
   constructor(config?: Partial<SscConfig>) {
     const resolved = resolveConfig();
     this.config = { ...resolved, ...config };
+  }
+
+  // ─── Apps ─────────────────────────────────────────────────────────────────
+
+  async getApp(appId: string): Promise<App> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<App>(`/v1/apps/${appId}`);
+      return data;
+    } catch (err) {
+      throw new Error(extractAppError(err));
+    }
+  }
+
+  async deleteApp(appId: string): Promise<void> {
+    const ax = makeAxios(this.config);
+    try {
+      await ax.delete(`/v1/apps/${appId}`);
+    } catch (err) {
+      throw new Error(extractAppError(err));
+    }
   }
 
   // ─── Auth ──────────────────────────────────────────────────────────────────

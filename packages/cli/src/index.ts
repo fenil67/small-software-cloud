@@ -6,6 +6,7 @@ import { status } from "./commands/status";
 import { share } from "./commands/share";
 import { unshare } from "./commands/unshare";
 import { listAppAccess } from "./commands/access";
+import { destroy } from "./commands/destroy";
 
 const program = new Command();
 
@@ -63,6 +64,15 @@ program
   .description("List who has access to an app")
   .action(async (appId: string) => {
     await listAppAccess(appId);
+  });
+
+// ─── destroy ──────────────────────────────────────────────────────────────────
+program
+  .command("destroy <app-id>")
+  .description("Permanently delete an app (requires name confirmation)")
+  .option("--confirm <name>", "App name to confirm deletion (skips interactive prompt)")
+  .action(async (appId: string, flags: { confirm?: string }) => {
+    await destroy(appId, flags);
   });
 
 program.parseAsync(process.argv).catch((err) => {

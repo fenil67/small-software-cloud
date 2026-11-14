@@ -1,3 +1,17 @@
+// ─── App types ───────────────────────────────────────────────────────────────
+
+export interface App {
+  id: string;
+  name: string;
+  slug: string;
+  source_type: string;
+  source_ref: string | null;
+  fly_app_id: string | null;
+  subdomain: string | null;
+  created_at: string;
+  suspended: boolean;
+}
+
 export type DeployStatus =
   | "queued"
   | "building"
