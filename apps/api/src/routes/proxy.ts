@@ -82,12 +82,22 @@ proxyRouter.post(
     }
 
     // Fetch the app (must exist and not be deleted)
-    const { rows: appRows } = await pool.query<{ id: string; subdomain: string | null }>(
-      "SELECT id, subdomain FROM apps WHERE id = $1 AND deleted_at IS NULL",
+    const { rows: appRows } = await pool.query<{
+      id: string;
+      subdomain: string | null;
+      suspended_at: Date | null;
+    }>(
+      "SELECT id, subdomain, suspended_at FROM apps WHERE id = $1 AND deleted_at IS NULL",
       [body.app_id],
     );
     if (!appRows[0]) {
       res.status(404).json({ error: "app_not_found" });
+      return;
+    }
+
+    // Suspension check — before access check so a suspended app never issues codes
+    if (appRows[0].suspended_at !== null) {
+      res.status(403).json({ error: "app_suspended" });
       return;
     }
 
@@ -232,12 +242,16 @@ proxyRouter.post(
       const stateMatch = a.length === b.length && crypto.timingSafeEqual(aPad, bPad);
       if (!stateMatch) { await rollbackAndDeny(); return; }
 
-      // App must still exist and not be deleted
-      const { rows: appRows } = await client.query<{ id: string }>(
-        "SELECT id FROM apps WHERE id = $1 AND deleted_at IS NULL",
+      // App must still exist, not be deleted, and not be suspended
+      const { rows: appRows } = await client.query<{
+        id: string;
+        suspended_at: Date | null;
+      }>(
+        "SELECT id, suspended_at FROM apps WHERE id = $1 AND deleted_at IS NULL",
         [appId],
       );
       if (!appRows[0]) { await rollbackAndDeny(); return; }
+      if (appRows[0].suspended_at !== null) { await rollbackAndDeny(); return; }
 
       // User must still have access
       const { rows: accessRows } = await client.query(
@@ -301,6 +315,7 @@ proxyRouter.get(
          WHERE aa.app_id = $1
            AND aa.user_id = $2
            AND a.deleted_at IS NULL
+           AND a.suspended_at IS NULL
        ) AS allowed`,
       [appId, userId],
     );

@@ -56,9 +56,19 @@ async function updateDeploymentStatus(
   await pool.query(`UPDATE deployments SET ${sets.join(", ")} WHERE id = $1`, vals);
 }
 
-async function getApp(appId: string): Promise<{ fly_app_id: string | null; name: string; org_id: string }> {
-  const { rows } = await pool.query<{ fly_app_id: string | null; name: string; org_id: string }>(
-    "SELECT fly_app_id, name, org_id FROM apps WHERE id = $1",
+async function getApp(appId: string): Promise<{
+  fly_app_id: string | null;
+  name: string;
+  org_id: string;
+  suspended_at: Date | null;
+}> {
+  const { rows } = await pool.query<{
+    fly_app_id: string | null;
+    name: string;
+    org_id: string;
+    suspended_at: Date | null;
+  }>(
+    "SELECT fly_app_id, name, org_id, suspended_at FROM apps WHERE id = $1",
     [appId],
   );
   if (!rows[0]) throw new DeployError("internal", "App record not found.");
@@ -436,6 +446,12 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     // Step 3: ensure Fly app exists
     const app = await getApp(appId);
     orgId = app.org_id; // needed by destroyWithRetry inside fail()
+
+    // Suspension check — catches the race where the app was suspended after
+    // intake accepted the request but before the Fly provisioning step.
+    if (app.suspended_at !== null) {
+      throw new DeployError("provision", "This app is suspended. Contact the platform admin.");
+    }
     let appName: string;
     if (app.fly_app_id) {
       appName = app.fly_app_id;

@@ -210,6 +210,21 @@ intakeRouter.post(
       throw err;
     }
 
+    // Refuse redeployment of a suspended app before any Fly call
+    if (existingAppId) {
+      const { rows: suspRows } = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+        [existingAppId, orgId],
+      );
+      if (suspRows[0] && suspRows[0].suspended_at !== null) {
+        res.status(423).json({
+          error: "app_suspended",
+          message: "This app is suspended. Contact the platform admin.",
+        });
+        return;
+      }
+    }
+
     const userId = await resolveUserId(req);
     const rawName = ((req.body as { app_name?: string }).app_name ?? "").trim();
     const appName = rawName || "app";
@@ -300,6 +315,21 @@ intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) =>
   if (violation) {
     res.status(429).json({ error: violation.limit, message: violation.message });
     return;
+  }
+
+  // Refuse redeployment of a suspended app before any Fly call
+  if (existingAppId) {
+    const { rows: suspRows } = await pool.query<{ suspended_at: Date | null }>(
+      "SELECT suspended_at FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+      [existingAppId, orgId],
+    );
+    if (suspRows[0] && suspRows[0].suspended_at !== null) {
+      res.status(423).json({
+        error: "app_suspended",
+        message: "This app is suspended. Contact the platform admin.",
+      });
+      return;
+    }
   }
 
   const userId = await resolveUserId(req);

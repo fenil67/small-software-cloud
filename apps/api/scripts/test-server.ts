@@ -24,6 +24,11 @@ process.env.FLY_API_TOKEN = "test-token";
 process.env.FLY_ORG_SLUG = "test-org";
 process.env.CLERK_SECRET_KEY = "sk_test_fake";
 process.env.SSC_TEST = "1";
+// PLATFORM_ADMIN_CLERK_IDS: use env override if provided, otherwise default to
+// a single well-known test admin ID used by AF tests.
+if (!process.env.PLATFORM_ADMIN_CLERK_IDS) {
+  process.env.PLATFORM_ADMIN_CLERK_IDS = "user_admintest1";
+}
 // Proxy integration env — fake digest-pinned image and local URLs satisfy
 // the startup validation in index.ts (not used here, but deployRunner reads them).
 process.env.PROXY_IMAGE = `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`;
@@ -142,6 +147,36 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
     return;
   }
 
+  // Yield to the event loop so any pending HTTP requests (e.g. a suspend sent
+  // immediately after intake) are processed before we check state.  This makes
+  // the AF7 race test reliable without requiring real-deploy mode.
+  await new Promise<void>((r) => setTimeout(r, 10));
+
+  // Suspension check — mirrors deployRunner.ts Step 3 to catch the race where
+  // an app is suspended after intake accepted but before provisioning starts.
+  {
+    const { rows: suspRows } = await pool.query<{ suspended_at: Date | null }>(
+      "SELECT suspended_at FROM apps WHERE id = $1",
+      [appId],
+    );
+    if (suspRows[0]?.suspended_at !== null) {
+      await pool.query(
+        `UPDATE deployments SET status='failed', failure_stage='provision',
+         failure_message='This app is suspended. Contact the platform admin.',
+         finished_at=now() WHERE id=$1`,
+        [deploymentId],
+      );
+      eventBus.emit(deploymentId, {
+        type: "error",
+        stage: "provision",
+        message: "This app is suspended. Contact the platform admin.",
+      });
+      eventBus.emit(deploymentId, { type: "status", status: "failed" });
+      eventBus.emit(deploymentId, { type: "done" });
+      return;
+    }
+  }
+
   // Set fly_app_id on the app so subdomain works
   await pool.query("UPDATE apps SET fly_app_id=$1 WHERE id=$2", [flyAppName, appId]);
 
@@ -203,6 +238,8 @@ let _destroyFailuresRemaining = 0;
 let _flyErrorMode = false;
 let _egressFailMode = false;
 let _listMachinesResult: Array<{ id: string; state?: string }> = [{ id: "test-machine-1" }];
+// AF5: when true, destroyMachine always throws — used to test destroy_error:true
+let _destroyMachineFailMode = false;
 
 flyModule.createFlyApp = async (name: string, orgSlug: string, network: string) => {
   _flyCallLog.push({ fn: "createFlyApp", arg: name, body: { app_name: name, org_slug: orgSlug, network } });
@@ -222,6 +259,7 @@ flyModule.listMachines = async (appName: string) => {
 };
 flyModule.destroyMachine = async (appName: string, machineId: string) => {
   _flyCallLog.push({ fn: "destroyMachine", arg: appName, body: { machineId } });
+  if (_destroyMachineFailMode) throw new Error("destroyMachine failed (test mode)");
 };
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
@@ -291,6 +329,10 @@ flyModule.destroyFlyApp = async (appName: string) => {
 // Must use require() here — import statements are hoisted before this body runs.
 const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
 const { appAccessRouter } = require("../src/routes/appAccess") as typeof import("../src/routes/appAccess");
+const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/routes/admin") as typeof import("../src/routes/admin");
+// Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
+// With no-import-time-parsing design, this is the single place that fills _adminIds.
+_validateAdmin();
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
@@ -378,6 +420,13 @@ app.post("/test/set-fly-error", (req, res) => {
 app.post("/test/set-egress-fail", (req, res) => {
   _egressFailMode = !!(req.body as { fail?: boolean }).fail;
   res.json({ ok: true, egressFailMode: _egressFailMode });
+});
+
+// POST /test/set-destroy-machine-fail { fail: bool }
+// When enabled, the destroyMachine stub throws — used by AF5 to verify destroy_error:true.
+app.post("/test/set-destroy-machine-fail", (req, res) => {
+  _destroyMachineFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, destroyMachineFailMode: _destroyMachineFailMode });
 });
 
 // POST /test/set-machines { machines: [{ id: string }] }
@@ -615,6 +664,7 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
+app.use("/v1/admin", adminRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 
 // Final error middleware — catches anything forwarded via next(err)

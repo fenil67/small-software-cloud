@@ -123,6 +123,16 @@ export async function GET(request: NextRequest): Promise<Response> {
   }
 
   if (apiRes.status === 403) {
+    let errorCode = "";
+    try {
+      const errBody = (await apiRes.json()) as { error?: string };
+      errorCode = errBody.error ?? "";
+    } catch { /* ignore parse errors */ }
+
+    if (errorCode === "app_suspended") {
+      return htmlResponse("<p>This app has been suspended by the platform.</p>", 403);
+    }
+
     const user = await currentUser();
     const email = user?.primaryEmailAddress?.emailAddress ?? "";
     return htmlResponse(

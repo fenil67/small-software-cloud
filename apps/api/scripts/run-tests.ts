@@ -195,6 +195,7 @@ interface SeedResult {
 async function seed(): Promise<SeedResult> {
   // Clean up from prior runs
   await pool.query("DELETE FROM deployments");
+  await pool.query("DELETE FROM admin_audit");
   await pool.query("DELETE FROM apps");
   await pool.query("DELETE FROM api_keys");
   await pool.query("DELETE FROM users");
@@ -5937,6 +5938,558 @@ async function main(): Promise<void> {
       // Reset
       await request("POST", "/test/set-egress-fail", { body: { fail: false } });
       await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AF: Platform Admin Kill Switch");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    // ── AF setup ──────────────────────────────────────────────────────────────
+    const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
+
+    // Admin user — clerk ID matches PLATFORM_ADMIN_CLERK_IDS = "user_admintest1"
+    const afAdminClerkId = "user_admintest1";
+    const afAdminUserRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      [afAdminClerkId, "admin@test.local", "AF Admin"],
+    );
+    const afAdminUserId = afAdminUserRow.rows[0].id;
+
+    // Non-admin user
+    const afNonAdminClerkId = "clerk_af_nonAdmin";
+    const afNonAdminUserRow = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) RETURNING id",
+      [afNonAdminClerkId, "nonadmin@test.local", "AF NonAdmin"],
+    );
+    const afNonAdminUserId = afNonAdminUserRow.rows[0].id;
+    void afAdminUserId; // used only for DB actor linkage
+
+    // Register both with the fake Clerk endpoint (ensureUser is called by /codes)
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: afAdminClerkId, email: "admin@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: afNonAdminClerkId, email: "nonadmin@test.local", verified: true } });
+
+    // App under orgA with https subdomain + fly_app_id so suspend calls destroyMachine
+    const afAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'af-kill-app', 'af-kill-app', 'zip') RETURNING id`,
+      [orgAId, afNonAdminUserId],
+    );
+    const afAppId = afAppRow.rows[0].id;
+    await pool.query(
+      "UPDATE apps SET subdomain = $1, fly_app_id = $2 WHERE id = $3",
+      ["https://af-kill-app.fly.dev", "af-proxy-fly", afAppId],
+    );
+
+    // Grant non-admin user access + issue proxy token
+    await pool.query(
+      "INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1, $2, NULL)",
+      [afAppId, afNonAdminUserId],
+    );
+    const afProxyToken = await issueProxyToken(afAppId);
+
+    // Header helpers
+    const afAdminHeaders = { "x-test-clerk-user-id": afAdminClerkId };
+    const afNonAdminHeaders = { "x-test-clerk-user-id": afNonAdminClerkId };
+
+    // ── AF1: startup validation ───────────────────────────────────────────────
+    {
+      const tsx = path.join(__dirname, "../node_modules/.bin/tsx");
+      const apiDir = path.join(__dirname, "..");
+
+      // AF1a: invalid entry → exit 1 AND stderr contains the FATAL message
+      {
+        const af1aScript = path.join(__dirname, "_af1a_admin_tmp.ts");
+        try {
+          fs.writeFileSync(
+            af1aScript,
+            `import { validateAdminConfig } from "../src/routes/admin";\nvalidateAdminConfig();\n`,
+          );
+          const r1a = await new Promise<{ code: number; stderr: string }>((resolve) => {
+            const child = require("child_process").spawn(tsx, [af1aScript], {
+              cwd: apiDir,
+              env: { ...process.env, PLATFORM_ADMIN_CLERK_IDS: "not-valid!@#" },
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let stderr = "";
+            child.stdout.on("data", () => {});
+            child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+            child.on("close", (code: number | null) => resolve({ code: code ?? 1, stderr }));
+          });
+          r1a.code === 1
+            ? ok("AF1a: invalid PLATFORM_ADMIN_CLERK_IDS → exit 1")
+            : fail("AF1a: invalid admin ID should exit 1", `exit=${r1a.code} stderr=${r1a.stderr.slice(0, 200)}`);
+          r1a.stderr.includes("[startup] FATAL: PLATFORM_ADMIN_CLERK_IDS")
+            ? ok("AF1a: stderr contains [startup] FATAL: PLATFORM_ADMIN_CLERK_IDS message")
+            : fail("AF1a: stderr missing PLATFORM_ADMIN_CLERK_IDS fatal message", r1a.stderr.slice(0, 300));
+        } finally {
+          try { fs.unlinkSync(af1aScript); } catch {}
+        }
+      }
+
+      // AF1b: empty PLATFORM_ADMIN_CLERK_IDS → server starts (health 200), then stop
+      {
+        const AF1B_PORT = 14099;
+        const af1bScript = path.join(__dirname, "_af1b_admin_tmp.ts");
+        try {
+          fs.writeFileSync(
+            af1bScript,
+            [
+              `import express from "express";`,
+              `import { validateAdminConfig } from "../src/routes/admin";`,
+              `validateAdminConfig();`,
+              `const app = express();`,
+              `app.get("/health", (_req: import("express").Request, res: import("express").Response) => res.json({ ok: true }));`,
+              `app.listen(${AF1B_PORT}, () => { process.stdout.write("ready:\\n"); });`,
+            ].join("\n") + "\n",
+          );
+          const r1b = await new Promise<{ healthy: boolean }>((resolve) => {
+            let resolved = false;
+            const done = (healthy: boolean) => { if (!resolved) { resolved = true; resolve({ healthy }); } };
+            const child = require("child_process").spawn(tsx, [af1bScript], {
+              cwd: apiDir,
+              env: { ...process.env, PLATFORM_ADMIN_CLERK_IDS: "" },
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            child.stdout.on("data", (d: Buffer) => {
+              if (d.toString().includes("ready")) {
+                http.get(`http://localhost:${AF1B_PORT}/health`, (res) => {
+                  child.kill();
+                  done(res.statusCode === 200);
+                }).on("error", () => { child.kill(); done(false); });
+              }
+            });
+            child.on("close", () => done(false));
+            setTimeout(() => { child.kill(); done(false); }, 15000);
+          });
+          r1b.healthy
+            ? ok("AF1b: empty PLATFORM_ADMIN_CLERK_IDS → server starts, health 200")
+            : fail("AF1b: server should start with empty PLATFORM_ADMIN_CLERK_IDS");
+        } finally {
+          try { fs.unlinkSync(af1bScript); } catch {}
+        }
+      }
+
+      // AF1c: in-process — Clerk user not in PLATFORM_ADMIN_CLERK_IDS → 403
+      const r1c = await request("GET", "/v1/admin/apps", { headers: afNonAdminHeaders });
+      r1c.status === 403 && (r1c.body as any).error === "admin_required"
+        ? ok("AF1c: Clerk user not in admin list → 403 admin_required")
+        : fail("AF1c: unregistered Clerk should 403", `got ${r1c.status} ${JSON.stringify(r1c.body)}`);
+    }
+
+    // ── AF2: non-admin callers → 403 on every admin endpoint ─────────────────
+    {
+      const adminEndpoints: Array<[string, string, Record<string, unknown>?]> = [
+        ["GET",  "/v1/admin/apps",                             undefined],
+        ["POST", `/v1/admin/apps/${afAppId}/suspend`,          { reason: "test" }],
+        ["POST", `/v1/admin/apps/${afAppId}/unsuspend`,        undefined],
+        ["GET",  "/v1/admin/audit",                            undefined],
+      ];
+
+      for (const [method, url, body] of adminEndpoints) {
+        const label = `${method} ${url.replace(`/v1/admin/apps/${afAppId}`, "/v1/admin/apps/:id")}`;
+
+        // API key → 403
+        const rKey = await request(method, url, { headers: authHeaders(keyA), ...(body ? { body } : {}) });
+        rKey.status === 403 && (rKey.body as any).error === "admin_required"
+          ? ok(`AF2: API key → 403 on ${label}`)
+          : fail(`AF2: API key should 403 on ${label}`, `got ${rKey.status}`);
+
+        // Non-admin Clerk → 403
+        const rNa = await request(method, url, { headers: afNonAdminHeaders, ...(body ? { body } : {}) });
+        rNa.status === 403 && (rNa.body as any).error === "admin_required"
+          ? ok(`AF2: non-admin Clerk → 403 on ${label}`)
+          : fail(`AF2: non-admin should 403 on ${label}`, `got ${rNa.status}`);
+
+        // Org-admin Clerk (has org role, but not in _adminIds) → still 403
+        const rOrgAdmin = await request(method, url, {
+          headers: { "x-test-clerk-user-id": afNonAdminClerkId, "x-test-clerk-org-id": "clerk_org_aaa", "x-test-clerk-org-role": "org:admin" },
+          ...(body ? { body } : {}),
+        });
+        rOrgAdmin.status === 403 && (rOrgAdmin.body as any).error === "admin_required"
+          ? ok(`AF2: org-admin Clerk (not in list) → 403 on ${label}`)
+          : fail(`AF2: org admin should still 403 on ${label}`, `got ${rOrgAdmin.status}`);
+      }
+    }
+
+    // ── AF3: suspend + downstream effects ─────────────────────────────────────
+    {
+      // Issue a proxy code BEFORE suspension (for the exchange test)
+      const afPreState = crypto.randomBytes(16).toString("base64url");
+      const afPreCodeRes = await request("POST", "/v1/proxy/codes", {
+        headers: afNonAdminHeaders,
+        body: { app_id: afAppId, state: afPreState },
+      });
+      let afPreCode = "";
+      if (afPreCodeRes.status === 201) {
+        try {
+          const cbUrl = new URL((afPreCodeRes.body as any).redirect_url);
+          afPreCode = cbUrl.searchParams.get("code") ?? "";
+        } catch { /* ignore */ }
+      }
+
+      // Confirm access is allowed before suspension
+      const afPreAccess = await request("GET", `/v1/proxy/access?user_id=${afNonAdminUserId}`, {
+        headers: { Authorization: `Bearer ${afProxyToken}` },
+      });
+      afPreAccess.status === 200 && (afPreAccess.body as any).allowed === true
+        ? ok("AF3: pre-suspension /access → allowed:true")
+        : fail("AF3: pre-suspension access should be true", `got ${JSON.stringify(afPreAccess.body)}`);
+
+      // Reset fly call log then suspend
+      await request("POST", "/test/reset-fly-call-log");
+      const suspendRes = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "ToS violation — AF3" },
+      });
+      suspendRes.status === 200
+        ? ok("AF3: suspend → 200")
+        : fail("AF3: suspend should 200", `got ${suspendRes.status} ${JSON.stringify(suspendRes.body)}`);
+      (suspendRes.body as any).suspended === true
+        ? ok("AF3: response.suspended = true")
+        : fail("AF3: suspend should return suspended:true", JSON.stringify(suspendRes.body));
+      typeof (suspendRes.body as any).machines_destroyed === "number"
+        ? ok(`AF3: machines_destroyed reported (${(suspendRes.body as any).machines_destroyed})`)
+        : fail("AF3: machines_destroyed missing from response");
+      (suspendRes.body as any).destroy_error === false
+        ? ok("AF3: destroy_error:false (clean destroy)")
+        : fail("AF3: destroy_error should be false", String((suspendRes.body as any).destroy_error));
+
+      // Audit row created
+      const auditRows = (await request("GET", "/v1/admin/audit", { headers: afAdminHeaders })).body as any[];
+      const suspAudit = auditRows.find((r: any) => r.action === "suspend" && r.app_id === afAppId);
+      suspAudit
+        ? ok("AF3: audit row created for suspend")
+        : fail("AF3: audit row missing after suspend");
+      suspAudit?.actor_clerk_user_id === afAdminClerkId
+        ? ok("AF3: audit row actor_clerk_user_id = admin")
+        : fail("AF3: audit actor mismatch", suspAudit?.actor_clerk_user_id ?? "(none)");
+
+      // destroyMachine was called
+      const flyLog = (await request("GET", "/test/fly-call-log")).body as { calls: any[] };
+      flyLog.calls.some((c) => c.fn === "destroyMachine")
+        ? ok("AF3: destroyMachine called on suspend")
+        : fail("AF3: destroyMachine should be called on suspend");
+
+      // POST /codes → 403 app_suspended
+      const afCodesRes = await request("POST", "/v1/proxy/codes", {
+        headers: afNonAdminHeaders,
+        body: { app_id: afAppId, state: crypto.randomBytes(16).toString("base64url") },
+      });
+      afCodesRes.status === 403 && (afCodesRes.body as any).error === "app_suspended"
+        ? ok("AF3: POST /codes → 403 app_suspended")
+        : fail("AF3: /codes should 403 app_suspended", `got ${afCodesRes.status} ${JSON.stringify(afCodesRes.body)}`);
+
+      // GET /access → allowed:false
+      const afAccessRes = await request("GET", `/v1/proxy/access?user_id=${afNonAdminUserId}`, {
+        headers: { Authorization: `Bearer ${afProxyToken}` },
+      });
+      afAccessRes.status === 200 && (afAccessRes.body as any).allowed === false
+        ? ok("AF3: GET /access → allowed:false after suspension")
+        : fail("AF3: /access should be false after suspend", `got ${JSON.stringify(afAccessRes.body)}`);
+
+      // Exchange pre-suspension code → 401
+      if (afPreCode) {
+        const afExchangeRes = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${afProxyToken}` },
+          body: { code: afPreCode, state: afPreState },
+        });
+        afExchangeRes.status === 401
+          ? ok("AF3: exchange pre-suspension code → 401 (app now suspended)")
+          : fail("AF3: exchange should 401 for suspended app", `got ${afExchangeRes.status} ${JSON.stringify(afExchangeRes.body)}`);
+      } else {
+        fail("AF3: pre-suspension code setup failed — cannot test exchange path");
+      }
+
+      // Intake redeploy → 423
+      const afZip = await buildZip({ "index.js": "// redeploy" });
+      const afForm = new FormData();
+      afForm.append("code", afZip, { filename: "app.zip", contentType: "application/zip" });
+      afForm.append("app_id", afAppId);
+      const afIntakeRes = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(keyA),
+        formData: afForm,
+      });
+      afIntakeRes.status === 423 && (afIntakeRes.body as any).error === "app_suspended"
+        ? ok("AF3: intake/zip redeploy of suspended app → 423 app_suspended")
+        : fail("AF3: intake redeploy should 423", `got ${afIntakeRes.status} ${JSON.stringify(afIntakeRes.body)}`);
+
+      // GET /v1/apps/:id → suspended:true
+      const afAppGetRes = await request("GET", `/v1/apps/${afAppId}`, { headers: authHeaders(keyA) });
+      (afAppGetRes.body as any).suspended === true
+        ? ok("AF3: GET /v1/apps/:id → suspended:true")
+        : fail("AF3: app should show suspended:true", JSON.stringify(afAppGetRes.body));
+
+      // GET /v1/admin/apps → app appears with suspended:true
+      const afAdminAppsRes = await request("GET", "/v1/admin/apps", { headers: afAdminHeaders });
+      const afAdminApps = afAdminAppsRes.body as any[];
+      afAdminApps.some((a) => a.id === afAppId && a.suspended === true)
+        ? ok("AF3: admin GET /apps includes suspended app with suspended:true")
+        : fail("AF3: admin apps list should show suspended:true");
+    }
+
+    // ── AF4: idempotency ──────────────────────────────────────────────────────
+    {
+      // Count existing audit rows for this app (from AF3: 1 suspend row)
+      const auditBefore = ((await request("GET", "/v1/admin/audit", { headers: afAdminHeaders })).body as any[])
+        .filter((r: any) => r.app_id === afAppId);
+
+      // Second suspend (already suspended) → 200, no new audit row
+      const reSuspendRes = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "again" },
+      });
+      reSuspendRes.status === 200
+        ? ok("AF4: second suspend (idempotent) → 200")
+        : fail("AF4: idempotent suspend should 200", `got ${reSuspendRes.status}`);
+      const auditAfterReSuspend = ((await request("GET", "/v1/admin/audit", { headers: afAdminHeaders })).body as any[])
+        .filter((r: any) => r.app_id === afAppId);
+      auditAfterReSuspend.length === auditBefore.length
+        ? ok("AF4: second suspend adds no audit row")
+        : fail("AF4: idempotent suspend must not add audit row", `before=${auditBefore.length} after=${auditAfterReSuspend.length}`);
+
+      // Unsuspend → access restored
+      const unsuspendRes = await request("POST", `/v1/admin/apps/${afAppId}/unsuspend`, {
+        headers: afAdminHeaders,
+      });
+      unsuspendRes.status === 200 && (unsuspendRes.body as any).suspended === false
+        ? ok("AF4: unsuspend → 200 suspended:false")
+        : fail("AF4: unsuspend should 200 with suspended:false", `got ${unsuspendRes.status} ${JSON.stringify(unsuspendRes.body)}`);
+
+      const afAccessAfter = await request("GET", `/v1/proxy/access?user_id=${afNonAdminUserId}`, {
+        headers: { Authorization: `Bearer ${afProxyToken}` },
+      });
+      afAccessAfter.status === 200 && (afAccessAfter.body as any).allowed === true
+        ? ok("AF4: access restored after unsuspend → allowed:true")
+        : fail("AF4: access should be restored", `got ${JSON.stringify(afAccessAfter.body)}`);
+
+      // Exactly 1 new audit row (the unsuspend)
+      const auditAfterUnsuspend = ((await request("GET", "/v1/admin/audit", { headers: afAdminHeaders })).body as any[])
+        .filter((r: any) => r.app_id === afAppId);
+      auditAfterUnsuspend.length === auditBefore.length + 1
+        ? ok("AF4: exactly 1 new audit row after unsuspend")
+        : fail("AF4: should be exactly 1 new audit row", `before=${auditBefore.length} after=${auditAfterUnsuspend.length}`);
+      auditAfterUnsuspend.some((r: any) => r.action === "unsuspend")
+        ? ok("AF4: unsuspend audit row has action='unsuspend'")
+        : fail("AF4: unsuspend audit row missing");
+
+      // Second unsuspend → 200, no new audit row
+      const reUnsuspendRes = await request("POST", `/v1/admin/apps/${afAppId}/unsuspend`, {
+        headers: afAdminHeaders,
+      });
+      reUnsuspendRes.status === 200
+        ? ok("AF4: second unsuspend (idempotent) → 200")
+        : fail("AF4: idempotent unsuspend should 200", `got ${reUnsuspendRes.status}`);
+      const auditAfterReUnsuspend = ((await request("GET", "/v1/admin/audit", { headers: afAdminHeaders })).body as any[])
+        .filter((r: any) => r.app_id === afAppId);
+      auditAfterReUnsuspend.length === auditAfterUnsuspend.length
+        ? ok("AF4: second unsuspend adds no audit row")
+        : fail("AF4: idempotent unsuspend must not add audit row");
+
+      // Re-suspend for AF5 / AF6 tests
+      await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "re-suspend for AF5/AF6" },
+      });
+    }
+
+    // ── AF5: destroyMachine failure → still suspended, destroy_error:true ─────
+    {
+      // Start from unsuspended state
+      await request("POST", `/v1/admin/apps/${afAppId}/unsuspend`, { headers: afAdminHeaders });
+
+      // Enable destroyMachine failure
+      await request("POST", "/test/set-destroy-machine-fail", { body: { fail: true } });
+
+      const af5Res = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "AF5 destroy fail test" },
+      });
+      af5Res.status === 200
+        ? ok("AF5: suspend 200 even when destroyMachine fails")
+        : fail("AF5: suspend should still 200 on destroy failure", `got ${af5Res.status}`);
+      (af5Res.body as any).suspended === true
+        ? ok("AF5: app suspended despite machine destroy failure")
+        : fail("AF5: suspended should be true even with destroy error", JSON.stringify(af5Res.body));
+      (af5Res.body as any).destroy_error === true
+        ? ok("AF5: destroy_error:true when destroyMachine throws")
+        : fail("AF5: destroy_error should be true", String((af5Res.body as any).destroy_error));
+
+      // DB confirms suspended_at is set
+      const { rows: af5DbRows } = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [afAppId],
+      );
+      af5DbRows[0]?.suspended_at !== null
+        ? ok("AF5: suspended_at set in DB despite machine destroy failure")
+        : fail("AF5: suspended_at should be set in DB");
+
+      // Restore
+      await request("POST", "/test/set-destroy-machine-fail", { body: { fail: false } });
+      await request("POST", `/v1/admin/apps/${afAppId}/unsuspend`, { headers: afAdminHeaders });
+    }
+
+    // ── AF6: reason validation + unknown / deleted apps ───────────────────────
+    {
+      // Missing reason body → 400
+      const r6a = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: {},
+      });
+      r6a.status === 400 && (r6a.body as any).error === "validation_error"
+        ? ok("AF6: missing reason → 400 validation_error")
+        : fail("AF6: missing reason should 400", `got ${r6a.status} ${JSON.stringify(r6a.body)}`);
+
+      // Empty reason → 400
+      const r6b = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "  " },
+      });
+      r6b.status === 400 && (r6b.body as any).error === "validation_error"
+        ? ok("AF6: whitespace-only reason → 400 validation_error")
+        : fail("AF6: empty reason should 400", `got ${r6b.status}`);
+
+      // 501-char reason → 400
+      const r6c = await request("POST", `/v1/admin/apps/${afAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "x".repeat(501) },
+      });
+      r6c.status === 400 && (r6c.body as any).error === "validation_error"
+        ? ok("AF6: 501-char reason → 400 validation_error")
+        : fail("AF6: 501-char reason should 400", `got ${r6c.status}`);
+
+      // Unknown UUID → 404
+      const fakeUuid = "00000000-0000-0000-0000-000000000099";
+      const r6d = await request("POST", `/v1/admin/apps/${fakeUuid}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "test" },
+      });
+      r6d.status === 404 && (r6d.body as any).error === "app_not_found"
+        ? ok("AF6: unknown UUID → 404 app_not_found")
+        : fail("AF6: unknown UUID should 404", `got ${r6d.status} ${JSON.stringify(r6d.body)}`);
+
+      // Deleted app → 404
+      const af6DelRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, 'af6-del-app', 'af6-del-app', 'zip') RETURNING id`,
+        [orgAId, afNonAdminUserId],
+      );
+      const af6DelAppId = af6DelRow.rows[0].id;
+      await pool.query("UPDATE apps SET deleted_at = now() WHERE id = $1", [af6DelAppId]);
+      const r6e = await request("POST", `/v1/admin/apps/${af6DelAppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "test" },
+      });
+      r6e.status === 404 && (r6e.body as any).error === "app_not_found"
+        ? ok("AF6: soft-deleted app → 404 app_not_found")
+        : fail("AF6: deleted app should 404", `got ${r6e.status}`);
+
+      // Non-UUID param → 404
+      const r6f = await request("POST", "/v1/admin/apps/not-a-uuid/suspend", {
+        headers: afAdminHeaders,
+        body: { reason: "test" },
+      });
+      r6f.status === 404 && (r6f.body as any).error === "app_not_found"
+        ? ok("AF6: non-UUID param → 404 app_not_found")
+        : fail("AF6: non-UUID should 404", `got ${r6f.status}`);
+    }
+
+    // ── AF7: race — intake accepted, app suspended before deploy runs ─────────
+    {
+      // Fresh unsuspended app under orgA (no fly_app_id — avoids machine list calls)
+      const af7AppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, 'af-race-app', 'af-race-app', 'zip') RETURNING id`,
+        [orgAId, afNonAdminUserId],
+      );
+      const af7AppId = af7AppRow.rows[0].id;
+
+      // Start intake (202 immediately; deploy stub runs async with a 10 ms yield)
+      const af7Zip = await buildZip({ "index.js": "// race test" });
+      const af7Form = new FormData();
+      af7Form.append("code", af7Zip, { filename: "app.zip", contentType: "application/zip" });
+      af7Form.append("app_id", af7AppId);
+      const af7Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(keyA),
+        formData: af7Form,
+      });
+      af7Intake.status === 202
+        ? ok("AF7: race intake accepted → 202")
+        : fail("AF7: race intake should 202", `got ${af7Intake.status} ${JSON.stringify(af7Intake.body)}`);
+
+      const af7DeploymentId = (af7Intake.body as any).deployment_id ?? "";
+
+      // Suspend immediately — the 10 ms stub yield lets this HTTP request complete
+      // first, so the stub sees suspended_at set when it resumes after setTimeout.
+      await request("POST", `/v1/admin/apps/${af7AppId}/suspend`, {
+        headers: afAdminHeaders,
+        body: { reason: "AF7 race suspend" },
+      });
+
+      // Poll for deploy result
+      const af7Poll = await pollDeployment(af7DeploymentId, keyA, 10000);
+
+      af7Poll.status === "failed"
+        ? ok("AF7: race deploy → failed (suspension caught at provision)")
+        : fail("AF7: race deploy should fail", `got status=${af7Poll.status}`);
+      af7Poll.failure_stage === "provision"
+        ? ok("AF7: failure_stage = provision")
+        : fail("AF7: failure_stage should be 'provision'", af7Poll.failure_stage ?? "(none)");
+      (af7Poll.failure_message ?? "").toLowerCase().includes("suspended")
+        ? ok("AF7: failure_message mentions suspension")
+        : fail("AF7: failure_message should mention suspension", af7Poll.failure_message ?? "(none)");
+    }
+
+    // ── AF8: intake suspension guard doesn't fire for unknown / cross-org ids ──
+    // Before the fix, `suspRows[0]?.suspended_at !== null` evaluated to true when
+    // no row was returned (undefined !== null), producing a spurious 423.
+    {
+      const fakeUuid = "00000000-0000-0000-0000-000000000099";
+
+      // Cross-org target: an app that belongs to orgB, not orgA
+      const af8OrgBAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, 'af8-orgb-app', 'af8-orgb-app', 'zip') RETURNING id`,
+        [orgBId, userId],
+      );
+      const af8OrgBAppId = af8OrgBAppRow.rows[0].id;
+
+      const af8Zip = await buildZip({ "index.js": "// af8" });
+
+      // Unknown UUID → 404, not 423
+      {
+        const af8Form = new FormData();
+        af8Form.append("code", af8Zip, { filename: "app.zip", contentType: "application/zip" });
+        af8Form.append("app_id", fakeUuid);
+        const r = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(keyA),
+          formData: af8Form,
+        });
+        r.status === 404
+          ? ok("AF8: unknown app_id in zip intake → 404 (not 423)")
+          : fail("AF8: unknown app_id should 404 not 423", `got ${r.status} ${JSON.stringify(r.body)}`);
+        (r.body as any).error !== "app_suspended"
+          ? ok("AF8: unknown app_id does not trigger app_suspended")
+          : fail("AF8: unknown app_id must not return app_suspended");
+      }
+
+      // Cross-org app_id (orgB app, orgA key) → 404, not 423
+      {
+        const af8Form2 = new FormData();
+        af8Form2.append("code", af8Zip, { filename: "app.zip", contentType: "application/zip" });
+        af8Form2.append("app_id", af8OrgBAppId);
+        const r = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(keyA),  // orgA key — orgB app is invisible to orgA
+          formData: af8Form2,
+        });
+        r.status === 404
+          ? ok("AF8: cross-org app_id in zip intake → 404 (not 423)")
+          : fail("AF8: cross-org app_id should 404 not 423", `got ${r.status} ${JSON.stringify(r.body)}`);
+        (r.body as any).error !== "app_suspended"
+          ? ok("AF8: cross-org app_id does not trigger app_suspended")
+          : fail("AF8: cross-org app_id must not return app_suspended");
+      }
     }
   }
 

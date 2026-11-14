@@ -25,7 +25,8 @@ appsRouter.get("/", asyncHandler(async (req: Request, res: Response) => {
   if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
 
   const { rows } = await pool.query(
-    `SELECT id, name, slug, source_type, source_ref, fly_app_id, subdomain, created_at
+    `SELECT id, name, slug, source_type, source_ref, fly_app_id, subdomain, created_at,
+            suspended_at IS NOT NULL AS suspended
      FROM apps WHERE org_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`,
     [orgId],
   );
@@ -37,7 +38,8 @@ appsRouter.get("/:id", asyncHandler(async (req: Request, res: Response) => {
   if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
 
   const { rows } = await pool.query(
-    `SELECT id, name, slug, source_type, source_ref, fly_app_id, subdomain, created_at
+    `SELECT id, name, slug, source_type, source_ref, fly_app_id, subdomain, created_at,
+            suspended_at IS NOT NULL AS suspended
      FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL`,
     [req.params.id, orgId],
   );
