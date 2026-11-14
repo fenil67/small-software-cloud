@@ -194,6 +194,8 @@ interface SeedResult {
 
 async function seed(): Promise<SeedResult> {
   // Clean up from prior runs
+  await pool.query("DELETE FROM watchdog_alerts");
+  await pool.query("DELETE FROM watchdog_probe_state");
   await pool.query("DELETE FROM deployments");
   await pool.query("DELETE FROM admin_audit");
   await pool.query("DELETE FROM apps");
@@ -6543,6 +6545,677 @@ async function main(): Promise<void> {
           ? ok("AF8: cross-org app_id does not trigger app_suspended")
           : fail("AF8: cross-org app_id must not return app_suspended");
       }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AG: Watchdog + Discord Alerts");
+  // ════════════════════════════════════════════════════════════════════════════
+
+  {
+    // ── AG setup ──────────────────────────────────────────────────────────────
+    // Reuse the existing admin Clerk IDs from the AF section and the orgA/orgB
+    // IDs from seed.  Create a fresh app with a successful deployment.
+
+    const agAdminClerkId = "user_admintest1";
+    const agAdminHeaders = { "x-test-clerk-user-id": agAdminClerkId };
+
+    // Ensure admin user exists (may have been created in AF section — INSERT OR IGNORE)
+    await pool.query(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO NOTHING`,
+      [agAdminClerkId, "admin@test.local", "AG Admin"],
+    );
+
+    // Helper: create a user, app, and successful deployment
+    async function makeDeployedApp(
+      flyAppId: string,
+      name: string,
+      extraAppUpdates?: Record<string, string>,
+    ): Promise<{ appId: string }> {
+      const { rows: [app] } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, $3, $4, 'zip') RETURNING id`,
+        [orgAId, userId, name, name],
+      );
+      await pool.query(
+        "UPDATE apps SET fly_app_id = $1 WHERE id = $2",
+        [flyAppId, app.id],
+      );
+      if (extraAppUpdates) {
+        for (const [col, val] of Object.entries(extraAppUpdates)) {
+          await pool.query(`UPDATE apps SET ${col} = $1 WHERE id = $2`, [val, app.id]);
+        }
+      }
+      await pool.query(
+        `INSERT INTO deployments (app_id, triggered_by, version, status, finished_at)
+         VALUES ($1, $2, 1, 'success', now())`,
+        [app.id, userId],
+      );
+      return { appId: app.id };
+    }
+
+    // Helper: reset all AG state between sub-tests
+    async function agReset(): Promise<void> {
+      await request("POST", "/test/clear-probe-state");
+      await request("POST", "/test/set-prometheus-data", { body: { cpu: [], egress: [] } });
+      await request("POST", "/test/set-prometheus-fail", { body: { fail: false } });
+      await request("POST", "/test/set-discord-fail", { body: { fail: false } });
+      await request("GET", "/test/drain-discord");
+    }
+
+    // ── AG1: startup validation (spawns dist/index.js, same as AF0/AF1) ───────
+    {
+      const distEntry = path.join(__dirname, "../dist/index.js");
+
+      // Build a production env with all required vars
+      function makeWatchdogProdEnv(
+        port: number,
+        extra: Record<string, string> = {},
+      ): { env: NodeJS.ProcessEnv; cleanup: () => void } {
+        const flyDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-ag-fly-"));
+        fs.writeFileSync(
+          path.join(flyDir, "flyctl"),
+          "#!/bin/sh\necho 'flyctl v0.5.1'\nexit 0\n",
+          { mode: 0o755 },
+        );
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          PATH: flyDir + ":" + (process.env.PATH ?? ""),
+          PORT: String(port),
+          SSC_TEST: "1",
+          FLY_API_TOKEN: "test-token",
+          FLY_ORG_SLUG: "test-org",
+          CLERK_SECRET_KEY: "sk_test_fake",
+          PROXY_IMAGE: `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`,
+          API_PUBLIC_URL: `http://localhost:${port}`,
+          WEB_URL: `http://localhost:${port}`,
+          PLATFORM_ADMIN_CLERK_IDS: "user_admintest1",
+          WATCHDOG_ENABLED: "false",
+          // Discord URL and thresholds must be valid or absent
+          ...extra,
+        };
+        // Remove ALERT_DISCORD_WEBHOOK_URL if not in extra (avoid inheriting test-server value)
+        if (!extra.ALERT_DISCORD_WEBHOOK_URL) {
+          delete env.ALERT_DISCORD_WEBHOOK_URL;
+        }
+        if (!extra.FLY_METRICS_BASE) {
+          delete env.FLY_METRICS_BASE;
+        }
+        const cleanup = () => {
+          try { fs.rmSync(flyDir, { recursive: true }); } catch {}
+        };
+        return { env, cleanup };
+      }
+
+      async function spawnAndWaitExit(
+        env: NodeJS.ProcessEnv,
+        timeoutMs: number,
+      ): Promise<{ code: number | null; stderr: string }> {
+        return new Promise((resolve) => {
+          let stderr = "";
+          const child = require("child_process").spawn(
+            process.execPath, [distEntry],
+            { cwd: path.join(__dirname, ".."), env, stdio: ["ignore", "ignore", "pipe"] },
+          );
+          child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+          child.on("close", (code: number | null) => resolve({ code, stderr }));
+          setTimeout(() => { child.kill("SIGTERM"); resolve({ code: null, stderr }); }, timeoutMs);
+        });
+      }
+
+      // AG1a: non-Discord https URL → exit 1; URL must NOT appear in stderr
+      {
+        const badUrl = "https://evil.com/api/webhooks/fake";
+        const { env, cleanup } = makeWatchdogProdEnv(14110, {
+          ALERT_DISCORD_WEBHOOK_URL: badUrl,
+        });
+        try {
+          const r = await spawnAndWaitExit(env, 15000);
+          r.code === 1
+            ? ok("AG1a: non-Discord URL → exit 1")
+            : fail("AG1a: non-Discord URL should exit 1", `code=${r.code}`);
+          r.stderr.includes("[startup] FATAL: ALERT_DISCORD_WEBHOOK_URL")
+            ? ok("AG1a: stderr contains ALERT_DISCORD_WEBHOOK_URL fatal message")
+            : fail("AG1a: stderr missing fatal message", r.stderr.slice(0, 300));
+          !r.stderr.includes(badUrl)
+            ? ok("AG1a: URL does not appear in stderr")
+            : fail("AG1a: URL must NOT appear in stderr");
+        } finally { cleanup(); }
+      }
+
+      // AG1b: http URL in production mode (SSC_TEST not 1) → exit 1; URL not in stderr
+      {
+        const httpUrl = "http://localhost:9999/api/webhooks/fake";
+        const { env, cleanup } = makeWatchdogProdEnv(14111, {
+          ALERT_DISCORD_WEBHOOK_URL: httpUrl,
+          SSC_TEST: "", // not "1" → http not allowed
+        });
+        try {
+          const r = await spawnAndWaitExit(env, 15000);
+          r.code === 1
+            ? ok("AG1b: http webhook URL in prod mode → exit 1")
+            : fail("AG1b: http webhook URL should exit 1 in prod mode", `code=${r.code}`);
+          !r.stderr.includes(httpUrl)
+            ? ok("AG1b: URL does not appear in stderr")
+            : fail("AG1b: URL must NOT appear in stderr");
+        } finally { cleanup(); }
+      }
+
+      // AG1c: non-numeric WATCHDOG_CPU_CORES → exit 1
+      {
+        const { env, cleanup } = makeWatchdogProdEnv(14112, {
+          WATCHDOG_CPU_CORES: "abc",
+        });
+        try {
+          const r = await spawnAndWaitExit(env, 15000);
+          r.code === 1
+            ? ok("AG1c: non-numeric WATCHDOG_CPU_CORES → exit 1")
+            : fail("AG1c: non-numeric threshold should exit 1", `code=${r.code}`);
+          r.stderr.includes("[startup] FATAL: WATCHDOG_CPU_CORES")
+            ? ok("AG1c: stderr contains WATCHDOG_CPU_CORES fatal message")
+            : fail("AG1c: stderr missing WATCHDOG_CPU_CORES message", r.stderr.slice(0, 300));
+        } finally { cleanup(); }
+      }
+    }
+
+    // ── AG2: healthy app — no alert, no suspension, counter reset ─────────────
+    {
+      await agReset();
+      const { appId: ag2AppId } = await makeDeployedApp("ag2-fly", "ag2-app");
+
+      // Set up probe in healthy mode
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag2-fly", mode: "healthy", appId: ag2AppId },
+      });
+
+      // Prime probe state with consecutive_unreachable = 2 (should be reset)
+      await pool.query(
+        `INSERT INTO watchdog_probe_state (app_id, consecutive_unreachable, last_probe_at)
+         VALUES ($1, 2, now())
+         ON CONFLICT (app_id) DO UPDATE SET consecutive_unreachable = 2`,
+        [ag2AppId],
+      );
+
+      await request("POST", "/test/run-probe-round");
+
+      // No alerts
+      const alerts = await pool.query<{ kind: string }>(
+        "SELECT kind FROM watchdog_alerts WHERE app_id = $1",
+        [ag2AppId],
+      );
+      alerts.rows.length === 0
+        ? ok("AG2: healthy app → no alert stored")
+        : fail("AG2: healthy app should produce no alert", JSON.stringify(alerts.rows));
+
+      // Not suspended
+      const app2 = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [ag2AppId],
+      );
+      app2.rows[0]?.suspended_at === null
+        ? ok("AG2: healthy app → not suspended")
+        : fail("AG2: healthy app should not be suspended");
+
+      // Counter reset to 0
+      const state2 = await pool.query<{ consecutive_unreachable: number }>(
+        "SELECT consecutive_unreachable FROM watchdog_probe_state WHERE app_id = $1",
+        [ag2AppId],
+      );
+      state2.rows[0]?.consecutive_unreachable === 0
+        ? ok("AG2: healthy app → consecutive_unreachable reset to 0")
+        : fail("AG2: counter should be 0", String(state2.rows[0]?.consecutive_unreachable));
+    }
+
+    // ── AG3: exposed (each of three variants) ─────────────────────────────────
+    for (const [variant, probeMode] of [
+      ["200-without-signature",    "exposed-no-sig"],
+      ["missing-health-signature", "exposed-no-health-sig"],
+      ["wrong-redirect",           "exposed-wrong-redirect"],
+    ] as const) {
+      await agReset();
+      const flyId = `ag3-fly-${variant}`;
+      const { appId } = await makeDeployedApp(flyId, `ag3-${variant}`);
+
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: flyId, mode: probeMode, appId },
+      });
+      await request("POST", "/test/reset-fly-call-log");
+
+      await request("POST", "/test/run-probe-round");
+
+      // App suspended
+      const appRow = await pool.query<{
+        suspended_at: Date | null;
+        suspend_reason: string | null;
+      }>("SELECT suspended_at, suspend_reason FROM apps WHERE id = $1", [appId]);
+      appRow.rows[0]?.suspended_at !== null
+        ? ok(`AG3 (${variant}): app suspended`)
+        : fail(`AG3 (${variant}): app should be suspended`);
+      (appRow.rows[0]?.suspend_reason ?? "").includes("watchdog")
+        ? ok(`AG3 (${variant}): suspend_reason mentions watchdog`)
+        : fail(`AG3 (${variant}): suspend_reason should mention watchdog`, appRow.rows[0]?.suspend_reason ?? "");
+
+      // destroyMachine called
+      const flyLog = await request("GET", "/test/fly-call-log");
+      const destroyCalls = (flyLog.body as any).calls.filter((c: any) => c.fn === "destroyMachine");
+      destroyCalls.length > 0
+        ? ok(`AG3 (${variant}): destroyMachine called`)
+        : fail(`AG3 (${variant}): destroyMachine should be called`);
+
+      // Audit row with actor "system:watchdog"
+      const audit = await pool.query<{ actor_clerk_user_id: string; reason: string }>(
+        "SELECT actor_clerk_user_id, reason FROM admin_audit WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [appId],
+      );
+      audit.rows[0]?.actor_clerk_user_id === "system:watchdog"
+        ? ok(`AG3 (${variant}): audit actor = system:watchdog`)
+        : fail(`AG3 (${variant}): audit actor should be system:watchdog`, audit.rows[0]?.actor_clerk_user_id ?? "none");
+
+      // Discord message sent
+      const discord1 = await request("GET", "/test/drain-discord");
+      const msgs1 = (discord1.body as any).messages as Array<{ content: string }>;
+      msgs1.length === 1
+        ? ok(`AG3 (${variant}): exactly 1 Discord message on first exposure`)
+        : fail(`AG3 (${variant}): expected 1 Discord message, got ${msgs1.length}`);
+
+      // Second round — no duplicate alert (dedupe), app skipped (suspended)
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: flyId, mode: probeMode, appId },
+      });
+      await request("POST", "/test/run-probe-round");
+
+      const discord2 = await request("GET", "/test/drain-discord");
+      const msgs2 = (discord2.body as any).messages as Array<{ content: string }>;
+      msgs2.length === 0
+        ? ok(`AG3 (${variant}): second round → no duplicate Discord message`)
+        : fail(`AG3 (${variant}): second round must not send duplicate Discord message`);
+
+      const alertCount = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_exposed_suspended'",
+        [appId],
+      );
+      parseInt(alertCount.rows[0].n) === 1
+        ? ok(`AG3 (${variant}): exactly 1 app_exposed_suspended alert (dedup)`)
+        : fail(`AG3 (${variant}): should be exactly 1 alert`, alertCount.rows[0].n);
+    }
+
+    // ── AG3b: health answers without proxy sig, root returns 5xx → EXPOSED ───
+    {
+      await agReset();
+      const flyId3b = "ag3b-fly";
+      const { appId: ag3bAppId } = await makeDeployedApp(flyId3b, "ag3b-app");
+
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: flyId3b, mode: "exposed-health-no-sig-root-5xx", appId: ag3bAppId },
+      });
+      await request("POST", "/test/reset-fly-call-log");
+      await request("POST", "/test/run-probe-round");
+
+      const appRow3b = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [ag3bAppId],
+      );
+      appRow3b.rows[0]?.suspended_at !== null
+        ? ok("AG3b: health-no-sig+root-5xx → app suspended (EXPOSED wins)")
+        : fail("AG3b: app should be suspended (EXPOSED beats UNREACHABLE)");
+
+      const alert3b = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_exposed_suspended'",
+        [ag3bAppId],
+      );
+      parseInt(alert3b.rows[0].n) === 1
+        ? ok("AG3b: exactly 1 app_exposed_suspended alert")
+        : fail("AG3b: expected 1 app_exposed_suspended alert", alert3b.rows[0].n);
+    }
+
+    // ── AG3c: root answers without proxy sig, health returns 503 → EXPOSED ───
+    {
+      await agReset();
+      const flyId3c = "ag3c-fly";
+      const { appId: ag3cAppId } = await makeDeployedApp(flyId3c, "ag3c-app");
+
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: flyId3c, mode: "exposed-root-no-sig-health-5xx", appId: ag3cAppId },
+      });
+      await request("POST", "/test/reset-fly-call-log");
+      await request("POST", "/test/run-probe-round");
+
+      const appRow3c = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [ag3cAppId],
+      );
+      appRow3c.rows[0]?.suspended_at !== null
+        ? ok("AG3c: root-no-sig+health-5xx → app suspended (EXPOSED wins)")
+        : fail("AG3c: app should be suspended (EXPOSED beats UNREACHABLE)");
+
+      const alert3c = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_exposed_suspended'",
+        [ag3cAppId],
+      );
+      parseInt(alert3c.rows[0].n) === 1
+        ? ok("AG3c: exactly 1 app_exposed_suspended alert")
+        : fail("AG3c: expected 1 app_exposed_suspended alert", alert3c.rows[0].n);
+    }
+
+    // ── AG4: unreachable ──────────────────────────────────────────────────────
+    {
+      await agReset();
+      const { appId: ag4AppId } = await makeDeployedApp("ag4-fly", "ag4-app");
+
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag4-fly", mode: "unreachable", appId: ag4AppId },
+      });
+
+      // Round 1 — no alert
+      await request("POST", "/test/run-probe-round");
+      const a1 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_unreachable'",
+        [ag4AppId],
+      );
+      parseInt(a1.rows[0].n) === 0
+        ? ok("AG4: round 1 unreachable → no alert")
+        : fail("AG4: round 1 should produce no alert");
+
+      // Round 2 — no alert
+      await request("POST", "/test/run-probe-round");
+      const a2 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_unreachable'",
+        [ag4AppId],
+      );
+      parseInt(a2.rows[0].n) === 0
+        ? ok("AG4: round 2 unreachable → no alert")
+        : fail("AG4: round 2 should produce no alert");
+
+      // Round 3 — exactly one app_unreachable alert
+      await request("POST", "/test/run-probe-round");
+      const a3 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_unreachable'",
+        [ag4AppId],
+      );
+      parseInt(a3.rows[0].n) === 1
+        ? ok("AG4: round 3 unreachable → exactly 1 app_unreachable alert")
+        : fail("AG4: round 3 should produce exactly 1 alert", a3.rows[0].n);
+
+      // No suspension
+      const appRow4 = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [ag4AppId],
+      );
+      appRow4.rows[0]?.suspended_at === null
+        ? ok("AG4: unreachable app → not suspended")
+        : fail("AG4: unreachable app must not be suspended");
+
+      // Healthy round resets counter
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag4-fly", mode: "healthy", appId: ag4AppId },
+      });
+      await request("POST", "/test/run-probe-round");
+
+      const state4 = await pool.query<{ consecutive_unreachable: number }>(
+        "SELECT consecutive_unreachable FROM watchdog_probe_state WHERE app_id = $1",
+        [ag4AppId],
+      );
+      state4.rows[0]?.consecutive_unreachable === 0
+        ? ok("AG4: healthy round after unreachable → counter reset to 0")
+        : fail("AG4: counter should be 0 after healthy", String(state4.rows[0]?.consecutive_unreachable));
+    }
+
+    // ── AG4b: both paths return 5xx without proxy sig → UNREACHABLE, no suspend
+    {
+      await agReset();
+      const flyId4b = "ag4b-fly";
+      const { appId: ag4bAppId } = await makeDeployedApp(flyId4b, "ag4b-app");
+
+      // "unreachable" mode: both health and root return 503 without proxy header
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: flyId4b, mode: "unreachable", appId: ag4bAppId },
+      });
+      await request("POST", "/test/reset-fly-call-log");
+
+      // Round 1 — no alert, no suspension
+      await request("POST", "/test/run-probe-round");
+      const appRow4b = await pool.query<{ suspended_at: Date | null }>(
+        "SELECT suspended_at FROM apps WHERE id = $1",
+        [ag4bAppId],
+      );
+      appRow4b.rows[0]?.suspended_at === null
+        ? ok("AG4b: both-5xx round 1 → not suspended (UNREACHABLE, not EXPOSED)")
+        : fail("AG4b: app must not be suspended when both paths return 5xx");
+
+      const exposed4b = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_exposed_suspended'",
+        [ag4bAppId],
+      );
+      parseInt(exposed4b.rows[0].n) === 0
+        ? ok("AG4b: no app_exposed_suspended alert for 5xx-only paths")
+        : fail("AG4b: must not produce app_exposed_suspended alert", exposed4b.rows[0].n);
+
+      const flyLog4b = await request("GET", "/test/fly-call-log");
+      const destroyCalls4b = (flyLog4b.body as any).calls.filter((c: any) => c.fn === "destroyMachine");
+      destroyCalls4b.length === 0
+        ? ok("AG4b: no destroyMachine called for UNREACHABLE")
+        : fail("AG4b: destroyMachine must not be called for UNREACHABLE");
+    }
+
+    // ── AG5: metrics ──────────────────────────────────────────────────────────
+    {
+      await agReset();
+      const { appId: ag5AppId } = await makeDeployedApp("ag5-fly", "ag5-app");
+
+      // CPU above threshold → one cpu_high alert
+      await request("POST", "/test/set-prometheus-data", {
+        body: { cpu: [{ app: "ag5-fly", value: 2.5 }], egress: [] },
+      });
+      await request("POST", "/test/run-metrics-round");
+
+      const cpu1 = await pool.query<{ kind: string; detail: Record<string, unknown> }>(
+        "SELECT kind, detail FROM watchdog_alerts WHERE app_id = $1 AND kind = 'cpu_high'",
+        [ag5AppId],
+      );
+      cpu1.rows.length === 1
+        ? ok("AG5: CPU above threshold → 1 cpu_high alert")
+        : fail("AG5: expected 1 cpu_high alert", String(cpu1.rows.length));
+      typeof cpu1.rows[0]?.detail?.value === "number" && (cpu1.rows[0].detail.value as number) > 0
+        ? ok("AG5: cpu_high alert detail contains measured value")
+        : fail("AG5: cpu_high detail should contain value", JSON.stringify(cpu1.rows[0]?.detail));
+
+      // Second round within 6 hours → no duplicate
+      await request("POST", "/test/run-metrics-round");
+      const cpu2 = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1 AND kind = 'cpu_high'",
+        [ag5AppId],
+      );
+      parseInt(cpu2.rows[0].n) === 1
+        ? ok("AG5: second cpu round within 6 h → no duplicate alert")
+        : fail("AG5: second round should be deduped", cpu2.rows[0].n);
+
+      // Values below threshold → no alert
+      await request("POST", "/test/set-prometheus-data", {
+        body: { cpu: [{ app: "ag5-fly", value: 0.1 }], egress: [{ app: "ag5-fly", value: 100 }] },
+      });
+      // Clear existing cpu_high alert so we can test from scratch; use different app
+      const { appId: ag5bAppId } = await makeDeployedApp("ag5b-fly", "ag5b-app");
+      await request("POST", "/test/set-prometheus-data", {
+        body: { cpu: [{ app: "ag5b-fly", value: 0.1 }], egress: [{ app: "ag5b-fly", value: 100 }] },
+      });
+      await request("POST", "/test/run-metrics-round");
+      const noAlert = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1",
+        [ag5bAppId],
+      );
+      parseInt(noAlert.rows[0].n) === 0
+        ? ok("AG5: values below threshold → no alert")
+        : fail("AG5: below-threshold values should not produce alert", noAlert.rows[0].n);
+
+      // ssc-proxy-image and unknown apps are ignored
+      await request("POST", "/test/set-prometheus-data", {
+        body: {
+          cpu: [
+            { app: "ssc-proxy-image", value: 999 },
+            { app: "completely-unknown-app", value: 999 },
+          ],
+          egress: [],
+        },
+      });
+      await request("POST", "/test/run-metrics-round");
+      const ignoredAlerts = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE kind IN ('cpu_high', 'egress_high')"
+        + " AND app_id NOT IN ($1, $2)",
+        [ag5AppId, ag5bAppId],
+      );
+      parseInt(ignoredAlerts.rows[0].n) === 0
+        ? ok("AG5: ssc-proxy-image and unknown apps ignored by metrics")
+        : fail("AG5: unknown apps should not produce alerts", ignoredAlerts.rows[0].n);
+
+      // Failing metrics endpoint → metrics_unavailable alert, no crash
+      await request("POST", "/test/set-prometheus-fail", { body: { fail: true } });
+      await request("POST", "/test/run-metrics-round");
+      await request("POST", "/test/set-prometheus-fail", { body: { fail: false } });
+      const metricsUnavail = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE kind = 'metrics_unavailable' AND app_id IS NULL",
+      );
+      parseInt(metricsUnavail.rows[0].n) >= 1
+        ? ok("AG5: failing metrics endpoint → metrics_unavailable alert stored")
+        : fail("AG5: should store metrics_unavailable alert on endpoint failure");
+    }
+
+    // ── AG6: Discord failure — alert stored with delivered=false ──────────────
+    {
+      await agReset();
+      await request("POST", "/test/set-discord-fail", { body: { fail: true } });
+
+      const { appId: ag6AppId } = await makeDeployedApp("ag6-fly", "ag6-app");
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag6-fly", mode: "exposed-no-sig", appId: ag6AppId },
+      });
+
+      await request("POST", "/test/run-probe-round");
+      await request("POST", "/test/set-discord-fail", { body: { fail: false } });
+
+      // Alert stored
+      const alert6 = await pool.query<{ delivered: boolean }>(
+        "SELECT delivered FROM watchdog_alerts WHERE app_id = $1 AND kind = 'app_exposed_suspended'",
+        [ag6AppId],
+      );
+      alert6.rows.length === 1
+        ? ok("AG6: Discord failure → alert still stored in DB")
+        : fail("AG6: alert should be stored even when Discord fails", String(alert6.rows.length));
+      alert6.rows[0]?.delivered === false
+        ? ok("AG6: Discord failure → delivered=false")
+        : fail("AG6: delivered should be false when Discord fails");
+
+      // Logs must not contain the webhook URL — fetch the actual URL from the server
+      // (process.env.ALERT_DISCORD_WEBHOOK_URL is set in test-server's process, not here)
+      const logs6 = await request("GET", "/test/drain-logs");
+      const logText = ((logs6.body as any).logs as string[]).join("\n");
+      const webhookUrlResp = await request("GET", "/test/get-webhook-url");
+      const webhookUrl = (webhookUrlResp.body as any).url as string;
+      webhookUrl.length > 30
+        ? ok("AG6: got webhook URL from server (non-empty, >30 chars)")
+        : fail("AG6: webhook URL is too short or empty — test harness bug", `url="${webhookUrl}"`);
+      !logText.includes(webhookUrl)
+        ? ok("AG6: webhook URL not in logs after Discord failure")
+        : fail("AG6: webhook URL must not appear in error logs");
+    }
+
+    // ── AG7: suspended, deleted, never-deployed apps not probed ──────────────
+    {
+      await agReset();
+
+      // Suspended app
+      const { appId: ag7SuspId } = await makeDeployedApp("ag7-susp-fly", "ag7-susp");
+      await pool.query(
+        "UPDATE apps SET suspended_at = now(), suspend_reason = 'test' WHERE id = $1",
+        [ag7SuspId],
+      );
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag7-susp-fly", mode: "exposed-no-sig", appId: ag7SuspId },
+      });
+
+      // Deleted app
+      const { appId: ag7DelId } = await makeDeployedApp("ag7-del-fly", "ag7-del");
+      await pool.query("UPDATE apps SET deleted_at = now() WHERE id = $1", [ag7DelId]);
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag7-del-fly", mode: "exposed-no-sig", appId: ag7DelId },
+      });
+
+      // Never-deployed app (no deployments)
+      const { rows: [ag7NdApp] } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type, fly_app_id)
+         VALUES ($1, $2, 'ag7-nd', 'ag7-nd', 'zip', 'ag7-nd-fly') RETURNING id`,
+        [orgAId, userId],
+      );
+      await request("POST", "/test/set-app-probe-mode", {
+        body: { flyAppId: "ag7-nd-fly", mode: "exposed-no-sig", appId: ag7NdApp.id },
+      });
+
+      await request("POST", "/test/reset-fly-call-log");
+      await request("POST", "/test/run-probe-round");
+
+      // None of the three apps should have alerts or be suspended (they were excluded)
+      for (const [label, appId] of [
+        ["suspended", ag7SuspId],
+        ["deleted", ag7DelId],
+        ["never-deployed", ag7NdApp.id],
+      ] as const) {
+        const alertCount = await pool.query<{ n: string }>(
+          "SELECT COUNT(*) AS n FROM watchdog_alerts WHERE app_id = $1",
+          [appId],
+        );
+        parseInt(alertCount.rows[0].n) === 0
+          ? ok(`AG7: ${label} app → not probed, no alert`)
+          : fail(`AG7: ${label} app should be excluded from probing`, alertCount.rows[0].n);
+      }
+
+      // Suspended app stays suspended (no additional audit rows from watchdog)
+      const auditCount = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM admin_audit WHERE app_id = $1 AND actor_clerk_user_id = 'system:watchdog'",
+        [ag7SuspId],
+      );
+      parseInt(auditCount.rows[0].n) === 0
+        ? ok("AG7: suspended app → no watchdog audit row added")
+        : fail("AG7: watchdog should not audit-suspend an already-suspended app");
+    }
+
+    // ── AG8: GET /v1/admin/alerts ─────────────────────────────────────────────
+    {
+      await agReset();
+
+      // Insert a couple of alerts directly
+      await pool.query(
+        `INSERT INTO watchdog_alerts (app_id, kind, detail) VALUES (NULL, 'test_alert_1', '{"x":1}')`,
+      );
+      await pool.query(
+        `INSERT INTO watchdog_alerts (app_id, kind, detail) VALUES (NULL, 'test_alert_2', '{"x":2}')`,
+      );
+
+      // Admin can list alerts
+      const r8Admin = await request("GET", "/v1/admin/alerts", {
+        headers: agAdminHeaders,
+      });
+      r8Admin.status === 200
+        ? ok("AG8: admin GET /v1/admin/alerts → 200")
+        : fail("AG8: admin should get 200", String(r8Admin.status));
+      Array.isArray(r8Admin.body) && (r8Admin.body as unknown[]).length >= 2
+        ? ok("AG8: response is an array with at least 2 alerts")
+        : fail("AG8: expected array of alerts", JSON.stringify(r8Admin.body));
+
+      // API key → 403
+      const r8Key = await request("GET", "/v1/admin/alerts", {
+        headers: authHeaders(keyA),
+      });
+      r8Key.status === 403 && (r8Key.body as any).error === "admin_required"
+        ? ok("AG8: API key → 403 on GET /v1/admin/alerts")
+        : fail("AG8: API key should 403", String(r8Key.status));
+
+      // Non-admin Clerk → 403
+      const r8NonAdmin = await request("GET", "/v1/admin/alerts", {
+        headers: { "x-test-clerk-user-id": "clerk_af_nonAdmin" },
+      });
+      r8NonAdmin.status === 403 && (r8NonAdmin.body as any).error === "admin_required"
+        ? ok("AG8: non-admin Clerk → 403 on GET /v1/admin/alerts")
+        : fail("AG8: non-admin should 403", String(r8NonAdmin.status));
     }
   }
 

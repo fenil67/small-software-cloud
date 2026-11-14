@@ -96,6 +96,7 @@ import { deploymentsRouter } from "./routes/deployments";
 import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
 import { startReaper } from "./lib/reaper";
+import { validateWatchdogConfig } from "./lib/watchdog";
 
 // PLATFORM_ADMIN_CLERK_IDS — optional; each entry must match ^user_[A-Za-z0-9]+$
 // Called here, directly after the ./routes/admin import, so the compiled require()
@@ -104,6 +105,9 @@ import { startReaper } from "./lib/reaper";
 // because TypeScript's CommonJS output places the require() in source order, not
 // hoisted, so admin_1 was not yet initialised when the IIFE executed.)
 validateAdminConfig();
+// Watchdog config: ALERT_DISCORD_WEBHOOK_URL, WATCHDOG_CPU_CORES,
+// WATCHDOG_EGRESS_BYTES_PER_SEC — same placement rule as above.
+validateWatchdogConfig();
 
 const app = express();
 // Railway injects PORT; API_PORT is the local-dev fallback

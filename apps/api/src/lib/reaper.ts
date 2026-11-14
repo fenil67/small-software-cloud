@@ -13,6 +13,7 @@
 import { pool } from "../db";
 import { safeErr } from "./safeErr";
 import { destroyFlyApp } from "../services/flyClient";
+import { runProbeRound, runMetricsRound } from "./watchdog";
 
 const TIMEOUT_MINUTES = 15;
 const INTERVAL_MS = 5 * 60 * 1000;
@@ -83,6 +84,9 @@ export async function reapExpiredProxyCodes(): Promise<number> {
   return count;
 }
 
+const PROBE_INTERVAL_MS    = 5  * 60 * 1000; //  5 minutes
+const METRICS_INTERVAL_MS  = 15 * 60 * 1000; // 15 minutes
+
 export function startReaper(): void {
   reapStalledDeployments().catch((err) =>
     console.error("[reaper] boot run failed:", safeErr(err)),
@@ -104,4 +108,31 @@ export function startReaper(): void {
       console.error("[reaper] proxy-codes interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
+
+  // ── Watchdog scheduler ─────────────────────────────────────────────────────
+  // Skipped when WATCHDOG_ENABLED=false or SSC_TEST=1 (tests trigger rounds
+  // explicitly via /test/run-probe-round and /test/run-metrics-round).
+  if (process.env.WATCHDOG_ENABLED !== "false" && process.env.SSC_TEST !== "1") {
+    // Stagger the boot run by 30 s to let the server finish starting.
+    setTimeout(() => {
+      runProbeRound().catch((err) =>
+        console.error("[watchdog] probe boot run failed:", safeErr(err)),
+      );
+      runMetricsRound().catch((err) =>
+        console.error("[watchdog] metrics boot run failed:", safeErr(err)),
+      );
+    }, 30_000);
+
+    setInterval(() => {
+      runProbeRound().catch((err) =>
+        console.error("[watchdog] probe interval failed:", safeErr(err)),
+      );
+    }, PROBE_INTERVAL_MS);
+
+    setInterval(() => {
+      runMetricsRound().catch((err) =>
+        console.error("[watchdog] metrics interval failed:", safeErr(err)),
+      );
+    }, METRICS_INTERVAL_MS);
+  }
 }

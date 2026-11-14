@@ -300,3 +300,18 @@ adminRouter.get(
     res.json(rows);
   }),
 );
+
+// ── GET /v1/admin/alerts ──────────────────────────────────────────────────────
+
+adminRouter.get(
+  "/alerts",
+  asyncHandler(async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(`
+      SELECT id, app_id, kind, detail, created_at, delivered
+      FROM watchdog_alerts
+      ORDER BY created_at DESC
+      LIMIT 200
+    `);
+    res.json(rows);
+  }),
+);

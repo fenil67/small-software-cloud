@@ -38,6 +38,10 @@ process.env.WEB_URL = `http://localhost:${_testPort}`;
 process.env.SSC_VERIFY_BASE_URL = `http://localhost:${_testPort}`;
 // Keep verification fast in tests (1 s timeout, 100 ms poll)
 process.env.SSC_VERIFY_TIMEOUT_MS = "1000";
+// Fake Discord webhook — SSC_TEST=1 allows http://localhost; alerts.ts uses this URL.
+process.env.ALERT_DISCORD_WEBHOOK_URL = `http://localhost:${_testPort}/test-discord-webhook`;
+// Fake Fly Prometheus — flyMetrics.ts honours FLY_METRICS_BASE for loopback hosts.
+process.env.FLY_METRICS_BASE = `http://localhost:${_testPort}/fake-prometheus`;
 // Fake Clerk API — clerkSync uses this base URL when SSC_TEST=1 and this var is set
 process.env.SSC_TEST_CLERK_API_BASE = `http://localhost:${_testPort}/clerk-stub`;
 
@@ -333,6 +337,48 @@ const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/rou
 // Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
 // With no-import-time-parsing design, this is the single place that fills _adminIds.
 _validateAdmin();
+
+// ── Watchdog stubs ────────────────────────────────────────────────────────────
+// Import the watchdog module and validate config (env vars are set above).
+// Timers are NOT started — tests trigger rounds via /test/run-probe-round and
+// /test/run-metrics-round endpoints.
+const watchdogModule = require("../src/lib/watchdog") as typeof import("../src/lib/watchdog");
+watchdogModule.validateWatchdogConfig();
+
+// ── Fake app probe endpoints ──────────────────────────────────────────────────
+// Per-app probe modes, keyed by fly_app_id.
+// Mode "healthy":              health 200 + x-ssc-proxy:1; root 302 + x-ssc-proxy:1 + correct Location
+// Mode "exposed-no-sig":       root returns 200 without x-ssc-proxy:1
+// Mode "exposed-no-health-sig":health returns 200 without x-ssc-proxy:1
+// Mode "exposed-wrong-redirect":health OK; root 302+proxy but Location is /wrong-path
+// Mode "unreachable":          both endpoints respond with 503 and no proxy header
+//                              (simulates "5xx from Fly edge, no proxy response")
+// Default: "healthy"
+const _appProbeModes = new Map<string, string>();
+
+// Set base URLs in watchdog module for each probe mode so probes hit this server.
+// Called when test sets a probe mode for a fly_app_id.
+function _registerProbeBase(flyAppId: string): void {
+  watchdogModule._setTestProbeBaseUrl(
+    flyAppId,
+    `http://localhost:${_testPort}/_probe/${flyAppId}`,
+  );
+}
+
+// ── Fake Discord webhook ──────────────────────────────────────────────────────
+const _discordBodies: Array<{ content: string }> = [];
+let _discordFailMode = false;
+
+// ── Fake Fly Prometheus ───────────────────────────────────────────────────────
+// Settable per-metric results.  Keys are PromQL query substrings used to route.
+// Default: empty result set (no apps in alarm).
+interface FakePrometheusResult {
+  metric: { app: string };
+  value: [number, string];
+}
+let _promCpuResults: FakePrometheusResult[] = [];
+let _promEgressResults: FakePrometheusResult[] = [];
+let _promFailMode = false;
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
@@ -652,6 +698,181 @@ app.get("/", (req, res, next) => {
   }
   // success
   res.set("x-ssc-proxy", "1").redirect(302, `${webUrl}/access?app=${_FAKE_APP_UUID}`);
+});
+
+// ── Fake app probe routes ─────────────────────────────────────────────────────
+
+// GET /_probe/:flyAppId/__ssc/health
+// Modes and health responses:
+//   healthy / exposed-no-sig / exposed-wrong-redirect    → 200 + x-ssc-proxy:1
+//   exposed-no-health-sig / exposed-health-no-sig-root-5xx → 200, no proxy header
+//   unreachable / exposed-root-no-sig-health-5xx          → 503, no proxy header
+app.get("/_probe/:flyAppId/__ssc/health", (req, res) => {
+  const mode = _appProbeModes.get(req.params.flyAppId) ?? "healthy";
+  if (mode === "unreachable" || mode === "exposed-root-no-sig-health-5xx") {
+    res.status(503).json({ error: "unavailable" }); return;
+  }
+  if (mode === "exposed-no-health-sig" || mode === "exposed-health-no-sig-root-5xx") {
+    res.status(200).json({ ok: true }); return; // no x-ssc-proxy header
+  }
+  // healthy / exposed-no-sig / exposed-wrong-redirect — health has the proxy header
+  res.set("x-ssc-proxy", "1").status(200).json({ ok: true });
+});
+
+// GET /_probe/:flyAppId/
+// Modes and root responses:
+//   healthy / exposed-no-health-sig                      → 302 + x-ssc-proxy:1 + correct Location
+//   exposed-no-sig / exposed-root-no-sig-health-5xx      → 200, no proxy header
+//   exposed-wrong-redirect                               → 302 + x-ssc-proxy:1 + wrong Location
+//   unreachable / exposed-health-no-sig-root-5xx         → 503, no proxy header
+app.get("/_probe/:flyAppId/", (req, res) => {
+  const mode = _appProbeModes.get(req.params.flyAppId) ?? "healthy";
+  const webUrl = process.env.WEB_URL ?? "";
+  const appId  = _probeAppIds.get(req.params.flyAppId) ?? "00000000-0000-0000-0000-000000000000";
+
+  if (mode === "unreachable" || mode === "exposed-health-no-sig-root-5xx") {
+    res.status(503).json({ error: "unavailable" }); return;
+  }
+  if (mode === "exposed-no-sig" || mode === "exposed-root-no-sig-health-5xx") {
+    res.status(200).send("<html>hello</html>"); return; // no proxy header
+  }
+  if (mode === "exposed-wrong-redirect") {
+    res.set("x-ssc-proxy", "1")
+      .redirect(302, `${webUrl}/wrong-path?app=${appId}`);
+    return;
+  }
+  // healthy / exposed-no-health-sig — correct redirect with real appId
+  res.set("x-ssc-proxy", "1").redirect(302, `${webUrl}/access?app=${appId}`);
+});
+
+// Map from fly_app_id → app UUID (needed to generate correct redirect Location)
+const _probeAppIds = new Map<string, string>();
+
+// ── POST /test/set-app-probe-mode { flyAppId, mode, appId? } ──────────────────
+// Controls per-app probe behavior.
+// mode: "healthy" | "exposed-no-sig" | "exposed-no-health-sig" | "exposed-wrong-redirect" | "unreachable"
+app.post("/test/set-app-probe-mode", (req, res) => {
+  const { flyAppId, mode, appId } = req.body as {
+    flyAppId?: string; mode?: string; appId?: string;
+  };
+  if (!flyAppId) { res.status(400).json({ error: "flyAppId required" }); return; }
+  const validModes = ["healthy", "exposed-no-sig", "exposed-no-health-sig", "exposed-wrong-redirect", "unreachable", "exposed-health-no-sig-root-5xx", "exposed-root-no-sig-health-5xx"];
+  if (mode && !validModes.includes(mode)) {
+    res.status(400).json({ error: `invalid mode; valid: ${validModes.join(", ")}` }); return;
+  }
+  _appProbeModes.set(flyAppId, mode ?? "healthy");
+  if (appId) _probeAppIds.set(flyAppId, appId);
+  _registerProbeBase(flyAppId);
+  res.json({ ok: true, flyAppId, mode: mode ?? "healthy" });
+});
+
+// POST /test/clear-probe-state — removes watchdog_probe_state rows and clears local maps
+app.post("/test/clear-probe-state", async (_req, res) => {
+  _appProbeModes.clear();
+  _probeAppIds.clear();
+  watchdogModule._clearTestProbeBaseUrls();
+  try {
+    await pool.query("DELETE FROM watchdog_probe_state");
+    await pool.query("DELETE FROM watchdog_alerts");
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── Fake Discord webhook ──────────────────────────────────────────────────────
+
+app.post("/test-discord-webhook", (req, res) => {
+  if (_discordFailMode) {
+    res.status(500).json({ error: "discord simulated failure" }); return;
+  }
+  _discordBodies.push(req.body as { content: string });
+  res.status(204).end();
+});
+
+// GET /test/drain-discord — returns and clears all recorded Discord bodies
+app.get("/test/drain-discord", (_req, res) => {
+  res.json({ messages: _discordBodies.splice(0) });
+});
+
+// GET /test/get-webhook-url — returns the actual ALERT_DISCORD_WEBHOOK_URL for log-leak assertions
+app.get("/test/get-webhook-url", (_req, res) => {
+  res.json({ url: process.env.ALERT_DISCORD_WEBHOOK_URL ?? "" });
+});
+
+// POST /test/set-discord-fail { fail: bool }
+app.post("/test/set-discord-fail", (req, res) => {
+  _discordFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, discordFailMode: _discordFailMode });
+});
+
+// ── Fake Fly Prometheus endpoint ──────────────────────────────────────────────
+// Served at /fake-prometheus (FLY_METRICS_BASE=http://localhost:<port>/fake-prometheus)
+// Full path: GET /fake-prometheus/prometheus/:org/api/v1/query?query=...
+
+app.get("/fake-prometheus/prometheus/:org/api/v1/query", (req, res) => {
+  if (_promFailMode) {
+    res.status(500).json({ error: "prometheus simulated failure" }); return;
+  }
+  const query = (req.query.query as string) ?? "";
+  let result: FakePrometheusResult[];
+  if (query.includes("fly_instance_cpu")) {
+    result = _promCpuResults;
+  } else if (query.includes("fly_instance_net_sent_bytes")) {
+    result = _promEgressResults;
+  } else {
+    result = [];
+  }
+  res.json({ status: "success", data: { resultType: "vector", result } });
+});
+
+// POST /test/set-prometheus-data { cpu?: [{app, value}], egress?: [{app, value}] }
+app.post("/test/set-prometheus-data", (req, res) => {
+  const { cpu, egress } = req.body as {
+    cpu?: Array<{ app: string; value: number }>;
+    egress?: Array<{ app: string; value: number }>;
+  };
+  if (cpu !== undefined) {
+    _promCpuResults = cpu.map((c) => ({
+      metric: { app: c.app },
+      value: [Math.floor(Date.now() / 1000), String(c.value)] as [number, string],
+    }));
+  }
+  if (egress !== undefined) {
+    _promEgressResults = egress.map((c) => ({
+      metric: { app: c.app },
+      value: [Math.floor(Date.now() / 1000), String(c.value)] as [number, string],
+    }));
+  }
+  res.json({ ok: true });
+});
+
+// POST /test/set-prometheus-fail { fail: bool }
+app.post("/test/set-prometheus-fail", (req, res) => {
+  _promFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, promFailMode: _promFailMode });
+});
+
+// ── Watchdog test-trigger endpoints ──────────────────────────────────────────
+
+// POST /test/run-probe-round — triggers one proxy probe round synchronously
+app.post("/test/run-probe-round", async (_req, res) => {
+  try {
+    await watchdogModule.runProbeRound();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /test/run-metrics-round — triggers one metrics round synchronously
+app.post("/test/run-metrics-round", async (_req, res) => {
+  try {
+    await watchdogModule.runMetricsRound();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // NOTE: no clerkMiddleware() — we only test API-key auth paths
