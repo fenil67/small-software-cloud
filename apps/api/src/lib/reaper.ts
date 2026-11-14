@@ -14,6 +14,7 @@ import { pool } from "../db";
 import { safeErr } from "./safeErr";
 import { destroyFlyApp } from "../services/flyClient";
 import { runProbeRound, runMetricsRound } from "./watchdog";
+import { checkOrgMembership } from "./clerkSync";
 
 const TIMEOUT_MINUTES = 15;
 const INTERVAL_MS = 5 * 60 * 1000;
@@ -84,8 +85,63 @@ export async function reapExpiredProxyCodes(): Promise<number> {
   return count;
 }
 
+/**
+ * Checks every active API key that has a creator and revokes those whose
+ * creator has left their org or been deleted.
+ *
+ * Returns the number of keys revoked.
+ * Never revokes on API errors (checkOrgMembership returns null).
+ */
+export async function reapKeysByMembership(): Promise<number> {
+  // Fetch all active keys that have a created_by user
+  const { rows } = await pool.query<{
+    key_id: string;
+    clerk_user_id: string;
+    clerk_org_id: string;
+  }>(
+    `SELECT ak.id AS key_id, u.clerk_user_id, o.clerk_org_id
+     FROM api_keys ak
+     JOIN users u ON u.id = ak.created_by
+     JOIN orgs  o ON o.id = ak.org_id
+     WHERE ak.revoked_at IS NULL
+       AND ak.created_by IS NOT NULL`,
+  );
+
+  let revoked = 0;
+  for (const { key_id, clerk_user_id, clerk_org_id } of rows) {
+    let result: Awaited<ReturnType<typeof checkOrgMembership>>;
+    try {
+      result = await checkOrgMembership(clerk_user_id, clerk_org_id);
+    } catch {
+      // Unexpected error from checkOrgMembership itself — skip
+      continue;
+    }
+
+    if (result === null) {
+      // API error — do not revoke
+      continue;
+    }
+
+    if (!result.member) {
+      const reason = result.reason === "deleted" ? "creator_deleted" : "creator_left_org";
+      await pool.query(
+        `UPDATE api_keys SET revoked_at = now(), revoked_reason = $1
+         WHERE id = $2 AND revoked_at IS NULL`,
+        [reason, key_id],
+      );
+      revoked++;
+    }
+  }
+
+  if (revoked > 0) {
+    console.log(`[reaper] revoked ${revoked} key(s) whose creator left or was deleted`);
+  }
+  return revoked;
+}
+
 const PROBE_INTERVAL_MS    = 5  * 60 * 1000; //  5 minutes
 const METRICS_INTERVAL_MS  = 15 * 60 * 1000; // 15 minutes
+const MEMBERSHIP_REAP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 export function startReaper(): void {
   reapStalledDeployments().catch((err) =>
@@ -108,6 +164,15 @@ export function startReaper(): void {
       console.error("[reaper] proxy-codes interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
+
+  // Hourly membership reconciliation (skipped in test mode — tests trigger via /test/run-key-reconciliation)
+  if (process.env.SSC_TEST !== "1") {
+    setInterval(() => {
+      reapKeysByMembership().catch((err) =>
+        console.error("[reaper] membership reap interval failed:", safeErr(err)),
+      );
+    }, MEMBERSHIP_REAP_INTERVAL_MS);
+  }
 
   // ── Watchdog scheduler ─────────────────────────────────────────────────────
   // Skipped when WATCHDOG_ENABLED=false or SSC_TEST=1 (tests trigger rounds

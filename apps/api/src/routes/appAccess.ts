@@ -12,6 +12,7 @@
 
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { asyncHandler } from "../lib/asyncHandler";
 
@@ -97,6 +98,7 @@ async function authorize(req: Request, res: Response): Promise<AuthResult | null
 
 appAccessRouter.get(
   "/",
+  requireScope("manage"),
   asyncHandler(async (req: Request, res: Response) => {
     const auth = await authorize(req, res);
     if (!auth) return;
@@ -125,6 +127,7 @@ appAccessRouter.get(
 
 appAccessRouter.post(
   "/",
+  requireScope("manage"),
   asyncHandler(async (req: Request, res: Response) => {
     const auth = await authorize(req, res);
     if (!auth) return;
@@ -153,6 +156,7 @@ appAccessRouter.post(
 
 appAccessRouter.delete(
   "/:email",
+  requireScope("manage"),
   asyncHandler(async (req: Request, res: Response) => {
     const auth = await authorize(req, res);
     if (!auth) return;

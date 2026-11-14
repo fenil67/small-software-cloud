@@ -44,6 +44,10 @@ process.env.ALERT_DISCORD_WEBHOOK_URL = `http://localhost:${_testPort}/test-disc
 process.env.FLY_METRICS_BASE = `http://localhost:${_testPort}/fake-prometheus`;
 // Fake Clerk API — clerkSync uses this base URL when SSC_TEST=1 and this var is set
 process.env.SSC_TEST_CLERK_API_BASE = `http://localhost:${_testPort}/clerk-stub`;
+// Clerk webhook signing secret — fixed 24-byte key, base64-encoded with whsec_ prefix
+const _TEST_WEBHOOK_SECRET_BYTES = Buffer.alloc(24).fill(0xab);
+export const _TEST_WEBHOOK_SECRET = "whsec_" + _TEST_WEBHOOK_SECRET_BYTES.toString("base64");
+process.env.CLERK_WEBHOOK_SIGNING_SECRET = _TEST_WEBHOOK_SECRET;
 
 // ── Log capture (intercept console.error BEFORE any module imports) ───────────
 // Section N drains these to verify no secret leaks in error logs.
@@ -66,9 +70,9 @@ import { appsRouter } from "../src/routes/apps";
 import { deploymentsRouter } from "../src/routes/deployments";
 import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
-import { apiKeysRouter } from "../src/routes/apiKeys";
+// apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
-import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership } from "../src/lib/reaper";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
 import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/errorHandler";
@@ -337,6 +341,9 @@ flyModule.destroyFlyApp = async (appName: string) => {
 // Must use require() here — import statements are hoisted before this body runs.
 const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
 const { appAccessRouter } = require("../src/routes/appAccess") as typeof import("../src/routes/appAccess");
+const { apiKeysRouter } = require("../src/routes/apiKeys") as typeof import("../src/routes/apiKeys");
+const { webhookRouter } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
+const { verifyClerkWebhookSignature } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/routes/admin") as typeof import("../src/routes/admin");
 // Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
 // With no-import-time-parsing design, this is the single place that fills _adminIds.
@@ -386,6 +393,10 @@ let _promFailMode = false;
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
+
+// webhook router MUST be mounted before express.json() to capture raw body
+app.use("/v1/webhooks", webhookRouter);
+
 app.use(express.json());
 
 // Attach a request ID so the error middleware can echo it back
@@ -612,6 +623,72 @@ app.get("/test/drain-logs", (_req, res) => {
   res.json({ logs: _recentErrorLogs.splice(0) });
 });
 
+// POST /test/set-clerk-membership { clerkOrgId, clerkUserId, isMember }
+// Controls what the fake /clerk-stub/organizations/:orgId/memberships endpoint returns.
+app.post("/test/set-clerk-membership", (req, res) => {
+  const { clerkOrgId, clerkUserId, isMember } = req.body as {
+    clerkOrgId?: string; clerkUserId?: string; isMember?: boolean;
+  };
+  if (!clerkOrgId || !clerkUserId) {
+    res.status(400).json({ error: "clerkOrgId and clerkUserId required" }); return;
+  }
+  const key = `${clerkOrgId}:${clerkUserId}`;
+  _clerkMembershipStubs.set(key, isMember !== false);
+  res.json({ ok: true, key, isMember: isMember !== false });
+});
+
+// POST /test/set-clerk-membership-fail { fail: bool }
+// When enabled, the membership endpoint returns 500 (simulates Clerk API error).
+app.post("/test/set-clerk-membership-fail", (req, res) => {
+  _clerkMembershipFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, clerkMembershipFailMode: _clerkMembershipFailMode });
+});
+
+// POST /test/sign-webhook-event { body, timestamp?, id? }
+// Computes svix HMAC-SHA256 signature using the test webhook secret.
+// Returns svixId, svixTimestamp, svixSignature ready to pass as headers.
+app.post("/test/sign-webhook-event", (req, res) => {
+  const { body, timestamp, id } = req.body as {
+    body?: unknown; timestamp?: string; id?: string;
+  };
+  if (body === undefined) { res.status(400).json({ error: "body required" }); return; }
+  const rawBody = typeof body === "string" ? body : JSON.stringify(body);
+  const svixId = id ?? `msg_${Date.now()}`;
+  const svixTimestamp = timestamp ?? String(Math.floor(Date.now() / 1000));
+  const secret = process.env.CLERK_WEBHOOK_SIGNING_SECRET ?? _TEST_WEBHOOK_SECRET;
+
+  // Compute signature: HMAC-SHA256(base64decode(secret after "whsec_"), "<id>.<ts>.<body>")
+  const { createHmac } = require("crypto") as typeof import("crypto");
+  const secretBytes = Buffer.from(secret.slice("whsec_".length), "base64");
+  const signedPayload = `${svixId}.${svixTimestamp}.${rawBody}`;
+  const sig = createHmac("sha256", secretBytes).update(signedPayload).digest("base64");
+
+  res.json({ svixId, svixTimestamp, svixSignature: `v1,${sig}` });
+});
+
+// POST /test/set-webhook-secret { secret: string | null }
+// Overrides CLERK_WEBHOOK_SIGNING_SECRET for AI6 startup-check tests.
+// Pass null to unset.
+app.post("/test/set-webhook-secret", (req, res) => {
+  const { secret } = req.body as { secret?: string | null };
+  if (secret === null || secret === undefined) {
+    delete process.env.CLERK_WEBHOOK_SIGNING_SECRET;
+  } else {
+    process.env.CLERK_WEBHOOK_SIGNING_SECRET = secret;
+  }
+  res.json({ ok: true });
+});
+
+// POST /test/run-key-reconciliation — triggers one membership reconciliation pass
+app.post("/test/run-key-reconciliation", async (_req, res) => {
+  try {
+    const revoked = await reapKeysByMembership();
+    res.json({ ok: true, revoked });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // ── Fake Clerk API stub ───────────────────────────────────────────────────────
 // clerkSync uses SSC_TEST_CLERK_API_BASE (set above) to route Clerk API calls
 // here when SSC_TEST=1.  Tests configure per-user responses via /test/set-clerk-user.
@@ -625,6 +702,11 @@ interface ClerkUserStub {
 }
 
 const _clerkUserStubs = new Map<string, ClerkUserStub>();
+
+// Membership stubs: key = "${orgId}:${userId}", value = true (member) | false (not a member)
+// Absent = not configured — returns 200 total_count=0 by default (safe: triggers "left" check)
+const _clerkMembershipStubs = new Map<string, boolean>();
+let _clerkMembershipFailMode = false;
 
 // GET /clerk-stub/users/:id — fake Clerk GET /v1/users/:id
 // Returns 404 for any user not explicitly registered via POST /test/set-clerk-user so that
@@ -641,6 +723,20 @@ app.get("/clerk-stub/users/:id", (req, res) => {
 // GET /clerk-stub/organizations/:id — fake Clerk GET /v1/organizations/:id
 app.get("/clerk-stub/organizations/:id", (req, res) => {
   res.json({ id: req.params.id, name: req.params.id, slug: req.params.id });
+});
+
+// GET /clerk-stub/organizations/:orgId/memberships?user_id=:userId
+// Returns { total_count: 1 } if the user is a member, { total_count: 0 } if not.
+// 500 when _clerkMembershipFailMode is true (simulates API error).
+app.get("/clerk-stub/organizations/:orgId/memberships", (req, res) => {
+  if (_clerkMembershipFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId } = req.params;
+  const userId = (req.query.user_id as string) ?? "";
+  const key = `${orgId}:${userId}`;
+  const isMember = _clerkMembershipStubs.get(key) ?? false;
+  res.json({ total_count: isMember ? 1 : 0, data: [] });
 });
 
 // POST /test/set-clerk-user { clerkUserId, email, verified }
@@ -909,10 +1005,12 @@ app.post("/test/run-metrics-round", async (_req, res) => {
 });
 
 // NOTE: no clerkMiddleware() — we only test API-key auth paths
+const { orgsRouter } = require("../src/routes/orgs") as typeof import("../src/routes/orgs");
 app.use("/health", healthRouter);
 app.use("/v1/auth", authRouter);
 app.use("/v1/apps/:id/access", appAccessRouter);
 app.use("/v1/apps", appsRouter);
+app.use("/v1/orgs", orgsRouter);
 app.use("/v1/api-keys", apiKeysRouter);
 app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);

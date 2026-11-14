@@ -8,6 +8,9 @@ import { asyncHandler } from "../lib/asyncHandler";
 export const apiKeysRouter = Router();
 apiKeysRouter.use(requireAuth);
 
+const VALID_SCOPES = new Set(["read", "deploy", "manage"]);
+const DEFAULT_SCOPES: string[] = ["read", "deploy"];
+
 // Only Clerk org admins can manage API keys (API key auth can't create more keys)
 function requireClerkOrgAdmin(req: Request, res: Response, next: NextFunction): void {
   const sscAuth = req.sscAuth!;
@@ -30,10 +33,27 @@ function requireClerkOrgAdmin(req: Request, res: Response, next: NextFunction): 
 
 apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
-  const { name } = req.body as { name?: string };
+  const { name, scopes: rawScopes } = req.body as { name?: string; scopes?: unknown };
   if (!name?.trim()) {
     res.status(400).json({ error: "validation_error", message: "Field 'name' is required." });
     return;
+  }
+
+  let scopes: string[];
+  if (rawScopes !== undefined) {
+    if (!Array.isArray(rawScopes) || rawScopes.length === 0) {
+      res.status(400).json({ error: "validation_error", message: "scopes must be a non-empty array." });
+      return;
+    }
+    for (const s of rawScopes) {
+      if (typeof s !== "string" || !VALID_SCOPES.has(s)) {
+        res.status(400).json({ error: "validation_error", message: `Invalid scope: "${String(s)}". Must be one of: read, deploy, manage.` });
+        return;
+      }
+    }
+    scopes = [...new Set(rawScopes as string[])]; // deduplicate
+  } else {
+    scopes = DEFAULT_SCOPES;
   }
 
   const userId = await ensureUser(sscAuth.clerkUserId!);
@@ -41,9 +61,9 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, 
   const { fullKey, keyPrefix, keyHash } = generateApiKey();
 
   const { rows } = await pool.query<{ id: string; created_at: Date }>(
-    `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash)
-     VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-    [orgId, userId, name.trim(), keyPrefix, keyHash],
+    `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+    [orgId, userId, name.trim(), keyPrefix, keyHash, scopes],
   );
 
   res.status(201).json({
@@ -51,6 +71,7 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, 
     name: name.trim(),
     key: fullKey,
     key_prefix: keyPrefix,
+    scopes,
     created_at: rows[0].created_at,
   });
 }));

@@ -10,6 +10,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { validateZip, ZipValidationError } from "../lib/zipValidate";
 import { checkDeployLimits } from "../lib/deployLimits";
@@ -178,6 +179,7 @@ async function createAppAndDeployment(
 
 intakeRouter.post(
   "/zip",
+  requireScope("deploy"),
   limitedUpload,
   asyncHandler(async (req: Request, res: Response) => {
     if (!req.file) {
@@ -280,7 +282,7 @@ intakeRouter.post(
 
 // ─── POST /github ─────────────────────────────────────────────────────────────
 
-intakeRouter.post("/github", asyncHandler(async (req: Request, res: Response) => {
+intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Request, res: Response) => {
   const { github_url, app_id: existingAppId, app_name } = req.body as {
     github_url?: string;
     app_id?: string;

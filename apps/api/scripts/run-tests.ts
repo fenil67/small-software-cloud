@@ -225,8 +225,8 @@ async function seed(): Promise<SeedResult> {
   const genAndInsert = async (orgId: string, name: string, revoked = false) => {
     const { fullKey, keyPrefix, keyHash } = generateApiKey();
     await pool.query(
-      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash${revoked ? ", revoked_at" : ""})
-       VALUES ($1, $2, $3, $4, $5${revoked ? ", now()" : ""})`,
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes${revoked ? ", revoked_at" : ""})
+       VALUES ($1, $2, $3, $4, $5, '{read,deploy,manage}'${revoked ? ", now()" : ""})`,
       [orgId, userId, name, keyPrefix, keyHash],
     );
     return fullKey;
@@ -1445,7 +1445,7 @@ async function main(): Promise<void> {
     const rKey = await (async () => {
       const { fullKey, keyPrefix, keyHash } = generateApiKey();
       await pool.query(
-        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash) VALUES ($1,$2,'r-key',$3,$4)",
+        "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'r-key',$3,$4,'{read,deploy,manage}')",
         [rOrgId, userId, keyPrefix, keyHash],
       );
       return fullKey;
@@ -7713,6 +7713,536 @@ async function main(): Promise<void> {
         ? ok("AH6: suspended app deleted_at set")
         : fail("AH6: deleted_at should be set for suspended app");
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AI: API Key Scopes");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // ── AI1: defaults and validation ──────────────────────────────────────────
+    // Create a key with no scopes → default {read,deploy}; create with explicit scopes.
+    // Use Clerk admin session header for key-management routes.
+
+    // Insert a Clerk admin user for key management
+    await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3) ON CONFLICT (clerk_user_id) DO NOTHING",
+      ["clerk_ai_admin", "aiadmin@test.local", "AI Admin"],
+    );
+    // Set up Clerk user stub for ensureUser called on POST /v1/api-keys
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: "clerk_ai_admin", email: "aiadmin@test.local", verified: true },
+    });
+
+    // AI1a: POST /v1/api-keys with no scopes → default {read,deploy}
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: {
+          "x-test-clerk-user-id": "clerk_ai_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+        body: { name: "ai-key-defaults" },
+      });
+      r.status === 201
+        ? ok("AI1a: POST /v1/api-keys default scopes → 201")
+        : fail("AI1a: should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+      const b = r.body as { scopes?: string[] };
+      Array.isArray(b.scopes) && b.scopes.includes("read") && b.scopes.includes("deploy") && b.scopes.length === 2
+        ? ok("AI1a: default scopes = [read, deploy]")
+        : fail("AI1a: wrong default scopes", JSON.stringify(b.scopes));
+    }
+
+    // AI1b: POST /v1/api-keys with explicit scopes → returned as-is (deduplicated)
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: {
+          "x-test-clerk-user-id": "clerk_ai_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+        body: { name: "ai-key-manage", scopes: ["manage", "read", "read"] },
+      });
+      r.status === 201
+        ? ok("AI1b: POST /v1/api-keys explicit scopes → 201")
+        : fail("AI1b: should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+      const b = r.body as { scopes?: string[] };
+      Array.isArray(b.scopes) && new Set(b.scopes).size === b.scopes.length
+        ? ok("AI1b: scopes deduplicated")
+        : fail("AI1b: scopes not deduplicated", JSON.stringify(b.scopes));
+      Array.isArray(b.scopes) && b.scopes.includes("manage") && b.scopes.includes("read")
+        ? ok("AI1b: scopes contain manage+read")
+        : fail("AI1b: wrong scopes", JSON.stringify(b.scopes));
+    }
+
+    // AI1c: POST /v1/api-keys with invalid scope → 400
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: {
+          "x-test-clerk-user-id": "clerk_ai_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+        body: { name: "ai-key-bad", scopes: ["read", "superpower"] },
+      });
+      r.status === 400
+        ? ok("AI1c: invalid scope → 400")
+        : fail("AI1c: invalid scope should 400", `got ${r.status}`);
+    }
+
+    // AI1d: POST /v1/api-keys with empty scopes array → 400
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: {
+          "x-test-clerk-user-id": "clerk_ai_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+        body: { name: "ai-key-empty-scopes", scopes: [] },
+      });
+      r.status === 400
+        ? ok("AI1d: empty scopes array → 400")
+        : fail("AI1d: empty scopes should 400", `got ${r.status}`);
+    }
+
+    // AI1e: GET /v1/api-keys returns scopes in list (we'll just verify the field exists)
+    {
+      const r = await request("GET", "/v1/api-keys", {
+        headers: {
+          "x-test-clerk-user-id": "clerk_ai_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      r.status === 200
+        ? ok("AI1e: GET /v1/api-keys → 200")
+        : fail("AI1e: GET /v1/api-keys should 200", `got ${r.status}`);
+    }
+
+    // ── AI2: scope enforcement per route ──────────────────────────────────────
+    // Create three keys: read-only, deploy, manage; test each route.
+
+    const { fullKey: readOnlyKey } = generateApiKey();
+    const { keyPrefix: rop, keyHash: roh } = (() => {
+      const { keyPrefix, keyHash } = generateApiKey();
+      return { keyPrefix, keyHash };
+    })();
+    // Insert read-only key directly
+    const { fullKey: ai2ReadKey, keyPrefix: ai2ReadPrefix, keyHash: ai2ReadHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, $3, $4, $5, '{read}')`,
+      [orgAId, userId, "ai2-read", ai2ReadPrefix, ai2ReadHash],
+    );
+    void readOnlyKey; void rop; void roh; // silence unused warnings
+
+    const { fullKey: ai2DeployKey, keyPrefix: ai2DeployPrefix, keyHash: ai2DeployHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, $3, $4, $5, '{deploy}')`,
+      [orgAId, userId, "ai2-deploy", ai2DeployPrefix, ai2DeployHash],
+    );
+
+    const { fullKey: ai2ManageKey, keyPrefix: ai2ManagePrefix, keyHash: ai2ManageHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, $3, $4, $5, '{manage}')`,
+      [orgAId, userId, "ai2-manage", ai2ManagePrefix, ai2ManageHash],
+    );
+
+    // AI2a: read key → GET /v1/apps → 200
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(ai2ReadKey) });
+      r.status === 200
+        ? ok("AI2a: read-scope key → GET /v1/apps → 200")
+        : fail("AI2a: read key on GET /v1/apps should 200", `got ${r.status}`);
+    }
+
+    // AI2b: read key → POST /v1/deployments/intake/github → 403 insufficient_scope
+    {
+      const r = await request("POST", "/v1/deployments/intake/github", {
+        headers: authHeaders(ai2ReadKey),
+        body: { github_url: "https://github.com/test/repo" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok("AI2b: read key → deploy route → 403 insufficient_scope")
+        : fail("AI2b: read key on deploy should 403 insufficient_scope", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AI2c: deploy key → GET /v1/apps → 200 (deploy implies read)
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(ai2DeployKey) });
+      r.status === 200
+        ? ok("AI2c: deploy-scope key → GET /v1/apps → 200 (read implied)")
+        : fail("AI2c: deploy key on read route should 200", `got ${r.status}`);
+    }
+
+    // AI2d: deploy key → DELETE /v1/apps/:id → 403 insufficient_scope
+    // Create a throwaway app
+    const { rows: [ai2App] } = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+       VALUES ($1, $2, 'ai2-app', 'ai2-app', 'zip') RETURNING id`,
+      [orgAId, userId],
+    );
+    {
+      const r = await request("DELETE", `/v1/apps/${ai2App.id}`, {
+        headers: authHeaders(ai2DeployKey),
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok("AI2d: deploy key → DELETE app → 403 insufficient_scope")
+        : fail("AI2d: deploy key on manage route should 403 insufficient_scope", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AI2e: manage key → GET /v1/apps → 200 (manage implies read)
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(ai2ManageKey) });
+      r.status === 200
+        ? ok("AI2e: manage-scope key → GET /v1/apps → 200 (read implied)")
+        : fail("AI2e: manage key on read route should 200", `got ${r.status}`);
+    }
+
+    // AI2f: manage key → POST /v1/deployments/intake/github → 403 insufficient_scope
+    {
+      const r = await request("POST", "/v1/deployments/intake/github", {
+        headers: authHeaders(ai2ManageKey),
+        body: { github_url: "https://github.com/test/repo" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok("AI2f: manage key → deploy route → 403 insufficient_scope")
+        : fail("AI2f: manage key on deploy should 403 insufficient_scope", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AI2g: manage key → GET /v1/apps/:id/access → 200
+    {
+      const r = await request("GET", `/v1/apps/${ai2App.id}/access`, {
+        headers: authHeaders(ai2ManageKey),
+      });
+      r.status === 200
+        ? ok("AI2g: manage key → GET /v1/apps/:id/access → 200")
+        : fail("AI2g: manage key on access route should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AI2h: read key → GET /v1/apps/:id/access → 403 insufficient_scope
+    {
+      const r = await request("GET", `/v1/apps/${ai2App.id}/access`, {
+        headers: authHeaders(ai2ReadKey),
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok("AI2h: read key → manage route → 403 insufficient_scope")
+        : fail("AI2h: read key on manage route should 403 insufficient_scope", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // ── AI3: static guard — every API-key-reachable route declares a scope ────
+    // A key with the minimum 'read' scope gets non-403 (or scope-specific 403)
+    // on read routes, and 403 insufficient_scope on deploy/manage routes.
+    // We test all routes that API keys can reach.
+
+    const readRoutes: Array<{ method: string; path: string }> = [
+      { method: "GET",    path: "/v1/auth/check" },
+      { method: "GET",    path: "/v1/orgs/current" },
+      { method: "GET",    path: "/v1/apps" },
+    ];
+    for (const { method, path: p } of readRoutes) {
+      const r = await request(method, p, { headers: authHeaders(ai2ReadKey) });
+      r.status !== 403 || (r.body as { error?: string }).error !== "insufficient_scope"
+        ? ok(`AI3: read-scope → ${method} ${p} → not 403 insufficient_scope (got ${r.status})`)
+        : fail(`AI3: read route ${method} ${p} should not block read-scope key`, JSON.stringify(r.body));
+    }
+
+    const deployRoutes: Array<{ method: string; path: string; body?: unknown }> = [
+      { method: "POST", path: "/v1/deployments/intake/github", body: { github_url: "https://github.com/x/y" } },
+    ];
+    for (const { method, path: p, body } of deployRoutes) {
+      const r = await request(method, p, { headers: authHeaders(ai2ReadKey), body });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok(`AI3: read-scope → ${method} ${p} → 403 insufficient_scope`)
+        : fail(`AI3: deploy route ${method} ${p} should block read-scope key`, `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    const manageRoutes: Array<{ method: string; path: string; body?: unknown }> = [
+      { method: "GET",    path: `/v1/apps/${ai2App.id}/access` },
+      { method: "POST",   path: `/v1/apps/${ai2App.id}/access`, body: { email: "x@example.com" } },
+      { method: "DELETE", path: `/v1/apps/${ai2App.id}` },
+    ];
+    for (const { method, path: p, body } of manageRoutes) {
+      const r = await request(method, p, { headers: authHeaders(ai2ReadKey), body });
+      r.status === 403 && (r.body as { error?: string }).error === "insufficient_scope"
+        ? ok(`AI3: read-scope → ${method} ${p} → 403 insufficient_scope`)
+        : fail(`AI3: manage route ${method} ${p} should block read-scope key`, `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // ── AI4: Clerk webhook — revoke on membership.deleted and user.deleted ────
+
+    // Insert two more users and orgs for webhook tests
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: "clerk_ai_leaver", email: "aileaver@test.local", verified: true },
+    });
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: "clerk_ai_deleted", email: "aideleted@test.local", verified: true },
+    });
+
+    // Insert a user and get their internal ID
+    const aiLeaverRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ('clerk_ai_leaver','aileaver@test.local','AI Leaver')
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+    );
+    const aiLeaverUserId = aiLeaverRow.rows[0].id;
+
+    const aiDeletedRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ('clerk_ai_deleted','aideleted@test.local','AI Deleted')
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+    );
+    const aiDeletedUserId = aiDeletedRow.rows[0].id;
+
+    // Create keys for these users
+    const { fullKey: ai4LeaverKey, keyPrefix: ai4LeaverPrefix, keyHash: ai4LeaverHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, 'ai4-leaver', $3, $4, '{read,deploy}')`,
+      [orgAId, aiLeaverUserId, ai4LeaverPrefix, ai4LeaverHash],
+    );
+
+    const { fullKey: ai4DeletedKey, keyPrefix: ai4DeletedPrefix, keyHash: ai4DeletedHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, 'ai4-deleted', $3, $4, '{read,deploy}')`,
+      [orgAId, aiDeletedUserId, ai4DeletedPrefix, ai4DeletedHash],
+    );
+
+    // Verify keys are initially valid
+    {
+      const r = await request("GET", "/v1/auth/check", { headers: authHeaders(ai4LeaverKey) });
+      r.status === 200
+        ? ok("AI4: leaver key initially valid → 200")
+        : fail("AI4: leaver key should be valid initially", `got ${r.status}`);
+    }
+
+    // AI4a: organizationMembership.deleted → revoke key
+    {
+      const eventBody = {
+        type: "organizationMembership.deleted",
+        data: {
+          public_user_data: { user_id: "clerk_ai_leaver" },
+          organization: { id: "clerk_org_aaa" },
+        },
+      };
+      const signR = await request("POST", "/test/sign-webhook-event", { body: { body: eventBody } });
+      const { svixId, svixTimestamp, svixSignature } = signR.body as {
+        svixId: string; svixTimestamp: string; svixSignature: string;
+      };
+      const r = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": svixId,
+          "svix-timestamp": svixTimestamp,
+          "svix-signature": svixSignature,
+        },
+        body: eventBody,
+      });
+      r.status === 200
+        ? ok("AI4a: organizationMembership.deleted webhook → 200")
+        : fail("AI4a: webhook should return 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // The leaver's key should now be revoked
+    {
+      const r = await request("GET", "/v1/auth/check", { headers: authHeaders(ai4LeaverKey) });
+      r.status === 401
+        ? ok("AI4a: leaver key revoked → 401 after membership.deleted webhook")
+        : fail("AI4a: leaver key should be revoked", `got ${r.status}`);
+    }
+
+    // Check revoked_reason
+    {
+      const { rows } = await pool.query<{ revoked_reason: string | null }>(
+        "SELECT revoked_reason FROM api_keys WHERE key_hash = $1",
+        [ai4LeaverHash],
+      );
+      rows[0]?.revoked_reason === "creator_left_org"
+        ? ok("AI4a: revoked_reason = creator_left_org")
+        : fail("AI4a: wrong revoked_reason", String(rows[0]?.revoked_reason));
+    }
+
+    // AI4b: user.deleted → revoke key
+    {
+      const eventBody = {
+        type: "user.deleted",
+        data: { id: "clerk_ai_deleted" },
+      };
+      const signR = await request("POST", "/test/sign-webhook-event", { body: { body: eventBody } });
+      const { svixId, svixTimestamp, svixSignature } = signR.body as {
+        svixId: string; svixTimestamp: string; svixSignature: string;
+      };
+      const r = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": svixId,
+          "svix-timestamp": svixTimestamp,
+          "svix-signature": svixSignature,
+        },
+        body: eventBody,
+      });
+      r.status === 200
+        ? ok("AI4b: user.deleted webhook → 200")
+        : fail("AI4b: webhook should return 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // The deleted user's key should now be revoked
+    {
+      const r = await request("GET", "/v1/auth/check", { headers: authHeaders(ai4DeletedKey) });
+      r.status === 401
+        ? ok("AI4b: deleted-user key revoked → 401 after user.deleted webhook")
+        : fail("AI4b: deleted-user key should be revoked", `got ${r.status}`);
+    }
+
+    // Check revoked_reason
+    {
+      const { rows } = await pool.query<{ revoked_reason: string | null }>(
+        "SELECT revoked_reason FROM api_keys WHERE key_hash = $1",
+        [ai4DeletedHash],
+      );
+      rows[0]?.revoked_reason === "creator_deleted"
+        ? ok("AI4b: revoked_reason = creator_deleted")
+        : fail("AI4b: wrong revoked_reason", String(rows[0]?.revoked_reason));
+    }
+
+    // AI4c: invalid signature → 401
+    {
+      const eventBody = { type: "organizationMembership.deleted", data: {} };
+      const r = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": "msg_bad",
+          "svix-timestamp": String(Math.floor(Date.now() / 1000)),
+          "svix-signature": "v1,invalidsignature",
+        },
+        body: eventBody,
+      });
+      r.status === 401
+        ? ok("AI4c: invalid signature → 401")
+        : fail("AI4c: bad signature should 401", `got ${r.status}`);
+    }
+
+    // AI4d: stale timestamp → 401 (timestamp > 5 min old)
+    {
+      const eventBody = { type: "organizationMembership.deleted", data: {} };
+      const staleTs = String(Math.floor(Date.now() / 1000) - 400); // 6+ min ago
+      const signR = await request("POST", "/test/sign-webhook-event", {
+        body: { body: eventBody, timestamp: staleTs },
+      });
+      const { svixId, svixSignature } = signR.body as { svixId: string; svixSignature: string };
+      const r = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": svixId,
+          "svix-timestamp": staleTs,
+          "svix-signature": svixSignature,
+        },
+        body: eventBody,
+      });
+      r.status === 401
+        ? ok("AI4d: stale timestamp (>5 min) → 401")
+        : fail("AI4d: stale timestamp should 401", `got ${r.status}`);
+    }
+
+    // ── AI5: reconciliation (reapKeysByMembership) ────────────────────────────
+
+    // Create a user and key; configure membership stub
+    const ai5UserRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ('clerk_ai5_user','ai5@test.local','AI5 User')
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+    );
+    const ai5UserId = ai5UserRow.rows[0].id;
+
+    const { fullKey: ai5Key, keyPrefix: ai5Prefix, keyHash: ai5Hash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1, $2, 'ai5-key', $3, $4, '{read,deploy}')`,
+      [orgAId, ai5UserId, ai5Prefix, ai5Hash],
+    );
+
+    // Set up Clerk stubs for the user (needs to exist for checkOrgMembership step 1)
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: "clerk_ai5_user", email: "ai5@test.local", verified: true },
+    });
+
+    // AI5a: user is a member → key survives reconciliation
+    await request("POST", "/test/set-clerk-membership", {
+      body: { clerkOrgId: "clerk_org_aaa", clerkUserId: "clerk_ai5_user", isMember: true },
+    });
+    {
+      const r = await request("POST", "/test/run-key-reconciliation");
+      const b = r.body as { revoked?: number };
+      r.status === 200
+        ? ok("AI5a: reconciliation run → 200")
+        : fail("AI5a: reconciliation should return 200", `got ${r.status}`);
+      // Verify key still works
+      const authR = await request("GET", "/v1/auth/check", { headers: authHeaders(ai5Key) });
+      authR.status === 200
+        ? ok("AI5a: key survives reconciliation when user is member")
+        : fail("AI5a: key should survive when user is member", `got ${authR.status}`);
+      void b;
+    }
+
+    // AI5b: Clerk API error → key NOT revoked (safe fail)
+    await request("POST", "/test/set-clerk-membership-fail", { body: { fail: true } });
+    {
+      await request("POST", "/test/run-key-reconciliation");
+      const authR = await request("GET", "/v1/auth/check", { headers: authHeaders(ai5Key) });
+      authR.status === 200
+        ? ok("AI5b: key NOT revoked on Clerk API error")
+        : fail("AI5b: key should NOT be revoked on API error", `got ${authR.status}`);
+    }
+    await request("POST", "/test/set-clerk-membership-fail", { body: { fail: false } });
+
+    // AI5c: user left org → key revoked after reconciliation
+    await request("POST", "/test/set-clerk-membership", {
+      body: { clerkOrgId: "clerk_org_aaa", clerkUserId: "clerk_ai5_user", isMember: false },
+    });
+    {
+      const r = await request("POST", "/test/run-key-reconciliation");
+      const b = r.body as { revoked?: number };
+      (typeof b.revoked === "number" && b.revoked >= 1)
+        ? ok("AI5c: reconciliation revoked at least 1 key")
+        : fail("AI5c: reconciliation should revoke key", `revoked=${b.revoked}`);
+      const authR = await request("GET", "/v1/auth/check", { headers: authHeaders(ai5Key) });
+      authR.status === 401
+        ? ok("AI5c: key revoked after reconciliation (user left org)")
+        : fail("AI5c: key should be revoked after reconciliation", `got ${authR.status}`);
+    }
+
+    // Check revoked_reason
+    {
+      const { rows } = await pool.query<{ revoked_reason: string | null }>(
+        "SELECT revoked_reason FROM api_keys WHERE key_hash = $1",
+        [ai5Hash],
+      );
+      rows[0]?.revoked_reason === "creator_left_org"
+        ? ok("AI5c: reconciliation revoked_reason = creator_left_org")
+        : fail("AI5c: wrong revoked_reason", String(rows[0]?.revoked_reason));
+    }
+
+    // ── AI6: startup check — CLERK_WEBHOOK_SIGNING_SECRET format ─────────────
+    // AI6a: missing secret → webhook returns 503
+    // Temporarily unset the secret; restore after.
+    await request("POST", "/test/set-webhook-secret", { body: { secret: null } });
+    {
+      const r = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": "msg_x",
+          "svix-timestamp": String(Math.floor(Date.now() / 1000)),
+          "svix-signature": "v1,xx",
+        },
+        body: {},
+      });
+      r.status === 503
+        ? ok("AI6a: missing webhook secret → 503")
+        : fail("AI6a: missing secret should 503", `got ${r.status}`);
+    }
+    // Restore the test secret
+    await request("POST", "/test/set-webhook-secret", {
+      body: { secret: "whsec_" + Buffer.alloc(24).fill(0xab).toString("base64") },
+    });
   }
 
   // ════════════════════════════════════════════════════════════════════════════

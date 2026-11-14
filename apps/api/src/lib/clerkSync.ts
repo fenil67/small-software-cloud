@@ -1,4 +1,4 @@
-import axios from "axios";
+import axios, { AxiosError } from "axios";
 import { pool } from "../db";
 
 /**
@@ -12,6 +12,56 @@ function clerkApiBase(): string {
     return process.env.SSC_TEST_CLERK_API_BASE;
   }
   return "https://api.clerk.com/v1";
+}
+
+/**
+ * Checks whether a Clerk user is still a member of a Clerk org.
+ *
+ * Returns:
+ *   { member: true }                        — user exists and is a member
+ *   { member: false, reason: "deleted" }    — user's Clerk account was deleted (404)
+ *   { member: false, reason: "left" }       — user exists but is not in the org
+ *   null                                    — API error; caller should NOT revoke
+ */
+export async function checkOrgMembership(
+  clerkUserId: string,
+  clerkOrgId: string,
+): Promise<{ member: boolean; reason?: "left" | "deleted" } | null> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  const base = clerkApiBase();
+
+  // Step 1: check the user still exists
+  try {
+    await axios.get(`${base}/users/${clerkUserId}`, {
+      headers: { Authorization: `Bearer ${clerkKey}` },
+    });
+  } catch (err) {
+    const axErr = err as AxiosError;
+    if (axErr.response?.status === 404) {
+      return { member: false, reason: "deleted" };
+    }
+    // Any other error (5xx, network) → caller must not revoke
+    return null;
+  }
+
+  // Step 2: check org membership
+  try {
+    const { data } = await axios.get(
+      `${base}/organizations/${clerkOrgId}/memberships`,
+      {
+        params: { user_id: clerkUserId },
+        headers: { Authorization: `Bearer ${clerkKey}` },
+      },
+    );
+    const totalCount: number = (data as { total_count?: number }).total_count ?? 0;
+    if (totalCount === 0) {
+      return { member: false, reason: "left" };
+    }
+    return { member: true };
+  } catch {
+    // API error → do not revoke
+    return null;
+  }
 }
 
 export async function ensureUser(clerkUserId: string): Promise<string> {

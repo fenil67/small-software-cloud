@@ -1,12 +1,13 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { asyncHandler } from "../lib/asyncHandler";
 
 export const orgsRouter = Router();
 orgsRouter.use(requireAuth);
 
-orgsRouter.get("/current", asyncHandler(async (req: Request, res: Response) => {
+orgsRouter.get("/current", requireScope("read"), asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
   let orgId: string;
 

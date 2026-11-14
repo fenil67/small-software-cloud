@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { asyncHandler } from "../lib/asyncHandler";
 
@@ -17,7 +18,7 @@ async function resolveCallerOrgId(req: Request): Promise<string | null> {
   return rows[0]?.id ?? null;
 }
 
-deploymentsRouter.get("/:id", asyncHandler(async (req: Request, res: Response) => {
+deploymentsRouter.get("/:id", requireScope("read"), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
 
   const callerOrgId = await resolveCallerOrgId(req);

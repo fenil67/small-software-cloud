@@ -82,6 +82,13 @@ installProcessHandlers();
     }
   })();
 
+  // CLERK_WEBHOOK_SIGNING_SECRET is optional; if set it must start with "whsec_"
+  const webhookSecret = process.env.CLERK_WEBHOOK_SIGNING_SECRET;
+  if (webhookSecret !== undefined && webhookSecret !== "" && !webhookSecret.startsWith("whsec_")) {
+    console.error('[startup] FATAL: CLERK_WEBHOOK_SIGNING_SECRET must start with "whsec_".');
+    process.exit(1);
+  }
+
 })();
 
 import { healthRouter } from "./routes/health";
@@ -95,6 +102,7 @@ import { deployStreamRouter } from "./routes/deployStream";
 import { deploymentsRouter } from "./routes/deployments";
 import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
+import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
 
@@ -125,6 +133,10 @@ app.use(
   })
 );
 app.use(morgan("dev"));
+
+// ─── Webhook routes (BEFORE express.json — needs raw body) ───────────────────
+app.use("/v1/webhooks", webhookRouter);
+
 app.use(express.json());
 
 // ─── Clerk auth (attaches auth() to every request) ──────────────────────────
