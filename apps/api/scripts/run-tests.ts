@@ -8802,7 +8802,20 @@ async function main(): Promise<void> {
     // Expected exact file set in every published tarball (npm always adds package.json)
     const EXPECTED_FILES = new Set(["package.json", "README.md", "dist/index.js"]);
 
-    // ── AK1: build both packages ─────────────────────────────────────────────
+    // ── AK0: remove stale @ssc node_modules links ─────────────────────────────
+    // Proves builds use --alias, not a workspace symlink, to resolve @ssc/client.
+
+    for (const [label, pkgDir] of [["CLI", cliDir], ["MCP", mcpDir]] as [string, string][]) {
+      const staleLink = path.join(pkgDir, "node_modules", "@ssc");
+      if (fs.existsSync(staleLink)) {
+        fs.rmSync(staleLink, { recursive: true, force: true });
+        ok(`AK0: removed stale node_modules/@ssc from ${label} package`);
+      } else {
+        ok(`AK0: no stale node_modules/@ssc in ${label} package (already clean)`);
+      }
+    }
+
+    // ── AK1: build both packages (must succeed without @ssc in node_modules) ─────────────────────────────────────────────
 
     // AK1a: build @utir/ssc  (rm -rf dist is part of build script)
     {
@@ -8810,7 +8823,7 @@ async function main(): Promise<void> {
         cwd: repoRoot, encoding: "utf8", stdio: "pipe",
       });
       r.status === 0
-        ? ok("AK1a: pnpm build @utir/ssc exits 0")
+        ? ok("AK1a: pnpm build @utir/ssc exits 0 (no @ssc in node_modules)")
         : fail("AK1a: pnpm build @utir/ssc failed", (r.stderr ?? "").slice(0, 300));
     }
 
@@ -8820,7 +8833,7 @@ async function main(): Promise<void> {
         cwd: repoRoot, encoding: "utf8", stdio: "pipe",
       });
       r.status === 0
-        ? ok("AK1b: pnpm build @utir/ssc-mcp exits 0")
+        ? ok("AK1b: pnpm build @utir/ssc-mcp exits 0 (no @ssc in node_modules)")
         : fail("AK1b: pnpm build @utir/ssc-mcp failed", (r.stderr ?? "").slice(0, 300));
     }
 

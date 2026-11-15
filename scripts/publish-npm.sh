@@ -171,19 +171,27 @@ for pkg in "${TARGETS[@]}"; do
   echo "Secret scan passed."
 done
 
-# ── Publish ───────────────────────────────────────────────────────────────────
+# ── Publish (or dry-run) ──────────────────────────────────────────────────────
 
 for pkg in "${TARGETS[@]}"; do
   name="$(pkg_name "$pkg")"
   pkg_dir="$TMPDIR_BUILD/packages/$pkg"
+  version="$(node -e "process.stdout.write(require('$pkg_dir/package.json').version)")"
 
   echo ""
-  echo "=== Publishing $name ==="
-  publish_args=("npm" "publish")
-  [[ -n "$OTP_CODE" ]] && publish_args+=("--otp" "$OTP_CODE")
-
-  (cd "$pkg_dir" && "${publish_args[@]}")
-  echo "Published $name."
+  if [[ "${DRY_RUN:-}" == "1" ]]; then
+    PACK_DEST="$(mktemp -d)"
+    echo "=== DRY RUN: packing $name into $PACK_DEST ==="
+    (cd "$pkg_dir" && npm pack --pack-destination "$PACK_DEST")
+    echo "DRY RUN: would publish ${name}@${version}"
+    rm -rf "$PACK_DEST"
+  else
+    echo "=== Publishing $name ==="
+    publish_args=("npm" "publish")
+    [[ -n "$OTP_CODE" ]] && publish_args+=("--otp" "$OTP_CODE")
+    (cd "$pkg_dir" && "${publish_args[@]}")
+    echo "Published $name."
+  fi
 done
 
 echo ""
