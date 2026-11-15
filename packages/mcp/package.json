@@ -2,13 +2,23 @@
   "name": "@utir/ssc-mcp",
   "version": "0.1.0",
   "description": "MCP stdio server for Small Software Cloud — lets AI agents deploy and manage apps",
-  "keywords": ["smallsoftwarecloud", "mcp", "model-context-protocol", "deploy", "ssc", "utir"],
+  "keywords": [
+    "smallsoftwarecloud",
+    "mcp",
+    "model-context-protocol",
+    "deploy",
+    "ssc",
+    "utir"
+  ],
   "license": "UNLICENSED",
   "bin": {
     "ssc-mcp": "dist/index.js"
   },
   "main": "dist/index.js",
-  "files": ["dist/index.js", "README.md"],
+  "files": [
+    "dist/index.js",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -18,7 +28,7 @@
   "scripts": {
     "build": "rm -rf dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --external:@modelcontextprotocol/server --external:zod --external:axios --external:archiver --external:form-data --external:ignore --alias:@ssc/client=../client/src/index.ts --outfile=dist/index.js && chmod +x dist/index.js",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "echo 'Use scripts/publish-npm.sh to publish.' && exit 1"
+    "prepublishOnly": "node -e \"if(process.env.SSC_PUBLISH_VIA_SCRIPT!=='1'){console.error('Use scripts/publish-npm.sh to publish.');process.exit(1)}\""
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",

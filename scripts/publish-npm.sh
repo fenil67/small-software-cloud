@@ -189,7 +189,7 @@ for pkg in "${TARGETS[@]}"; do
     echo "=== Publishing $name ==="
     publish_args=("npm" "publish")
     [[ -n "$OTP_CODE" ]] && publish_args+=("--otp" "$OTP_CODE")
-    (cd "$pkg_dir" && "${publish_args[@]}")
+    (cd "$pkg_dir" && SSC_PUBLISH_VIA_SCRIPT=1 "${publish_args[@]}")
     echo "Published $name."
   fi
 done
