@@ -8789,6 +8789,286 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // AK: npm package build and pack (CLI + MCP)
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AK: npm package build and pack (@utir/ssc + @utir/ssc-mcp)");
+  {
+    const { spawnSync } = require("child_process") as typeof import("child_process");
+    const repoRoot = path.join(__dirname, "../../..");
+    const cliDir = path.join(repoRoot, "packages/cli");
+    const mcpDir = path.join(repoRoot, "packages/mcp");
+    const publishScript = path.join(repoRoot, "scripts/publish-npm.sh");
+
+    // Expected exact file set in every published tarball (npm always adds package.json)
+    const EXPECTED_FILES = new Set(["package.json", "README.md", "dist/index.js"]);
+
+    // ── AK1: build both packages ─────────────────────────────────────────────
+
+    // AK1a: build @utir/ssc  (rm -rf dist is part of build script)
+    {
+      const r = spawnSync("pnpm", ["--filter", "@utir/ssc", "run", "build"], {
+        cwd: repoRoot, encoding: "utf8", stdio: "pipe",
+      });
+      r.status === 0
+        ? ok("AK1a: pnpm build @utir/ssc exits 0")
+        : fail("AK1a: pnpm build @utir/ssc failed", (r.stderr ?? "").slice(0, 300));
+    }
+
+    // AK1b: build @utir/ssc-mcp
+    {
+      const r = spawnSync("pnpm", ["--filter", "@utir/ssc-mcp", "run", "build"], {
+        cwd: repoRoot, encoding: "utf8", stdio: "pipe",
+      });
+      r.status === 0
+        ? ok("AK1b: pnpm build @utir/ssc-mcp exits 0")
+        : fail("AK1b: pnpm build @utir/ssc-mcp failed", (r.stderr ?? "").slice(0, 300));
+    }
+
+    // ── AK2: CLI pack assertions ──────────────────────────────────────────────
+
+    {
+      // Plant a stale file to prove the explicit "files" list excludes it
+      const cliStale = path.join(cliDir, "dist", "stale.js");
+      fs.writeFileSync(cliStale, "// stale\n");
+
+      let packData: { name?: string; version?: string; files?: { path?: string }[] }[] = [];
+      try {
+        const r = spawnSync("npm", ["pack", "--json", "--dry-run"], {
+          cwd: cliDir, encoding: "utf8", stdio: "pipe",
+        });
+        r.status === 0
+          ? ok("AK2-setup: npm pack --dry-run @utir/ssc exits 0")
+          : fail("AK2-setup: npm pack --dry-run @utir/ssc failed", (r.stderr ?? "").slice(0, 300));
+        try { packData = JSON.parse(r.stdout ?? "[]"); } catch { /* ignore */ }
+      } finally {
+        try { fs.unlinkSync(cliStale); } catch { /* ignore */ }
+      }
+
+      const pack = packData[0] ?? {};
+
+      pack.name === "@utir/ssc"
+        ? ok("AK2a: CLI pack name is @utir/ssc")
+        : fail("AK2a: CLI pack name wrong", `got ${String(pack.name)}`);
+
+      pack.version === "0.1.0"
+        ? ok("AK2b: CLI pack version is 0.1.0")
+        : fail("AK2b: CLI pack version wrong", `got ${String(pack.version)}`);
+
+      // Exact file set: {package.json, README.md, dist/index.js} — no more, no less
+      const cliFiles = new Set((pack.files ?? []).map((f) => f.path ?? ""));
+      const cliMissing = [...EXPECTED_FILES].filter((f) => !cliFiles.has(f));
+      const cliExtra   = [...cliFiles].filter((f) => !EXPECTED_FILES.has(f));
+      (cliMissing.length === 0 && cliExtra.length === 0)
+        ? ok("AK2c: CLI pack file list is exactly {package.json, README.md, dist/index.js}")
+        : fail("AK2c: CLI pack file list wrong",
+            `missing=${cliMissing.join(",") || "none"}  extra=${cliExtra.join(",") || "none"}`);
+
+      // Stale file must not have leaked
+      !cliFiles.has("dist/stale.js")
+        ? ok("AK2d: CLI pack does not contain dist/stale.js (stale prevention works)")
+        : fail("AK2d: CLI pack leaked dist/stale.js — files field is too broad");
+
+      // No @ssc/* deps in published package.json
+      const cliPkg = JSON.parse(fs.readFileSync(path.join(cliDir, "package.json"), "utf8")) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+        peerDependencies?: Record<string, string>;
+      };
+      const cliAllDeps = { ...cliPkg.dependencies, ...cliPkg.devDependencies, ...cliPkg.peerDependencies };
+      const cliSscDeps = Object.keys(cliAllDeps).filter((d) => d.startsWith("@ssc/"));
+      cliSscDeps.length === 0
+        ? ok("AK2e: CLI package.json has no @ssc/* dependencies")
+        : fail("AK2e: CLI package.json still has @ssc/* deps", cliSscDeps.join(", "));
+
+      // Shebang — exactly one, on line 1
+      const cliDist = path.join(cliDir, "dist/index.js");
+      if (fs.existsSync(cliDist)) {
+        const lines = fs.readFileSync(cliDist, "utf8").split("\n");
+        lines[0] === "#!/usr/bin/env node"
+          ? ok("AK2f: CLI dist/index.js has shebang on line 1")
+          : fail("AK2f: CLI dist/index.js shebang wrong", `line 1: ${lines[0]}`);
+        lines[1] !== "#!/usr/bin/env node"
+          ? ok("AK2g: CLI dist/index.js shebang appears exactly once")
+          : fail("AK2g: CLI dist/index.js has duplicate shebang on line 2");
+
+        // Executable bit (owner execute bit set)
+        const cliMode = fs.statSync(cliDist).mode;
+        (cliMode & 0o100) !== 0
+          ? ok("AK2h: CLI dist/index.js is executable (mode includes 0o100)")
+          : fail("AK2h: CLI dist/index.js is not executable", `mode=0o${(cliMode & 0o777).toString(8)}`);
+      } else {
+        fail("AK2f: CLI dist/index.js not found after build");
+        fail("AK2g: (skipped — dist/index.js missing)");
+        fail("AK2h: (skipped — dist/index.js missing)");
+      }
+    }
+
+    // ── AK3: CLI --help ───────────────────────────────────────────────────────
+
+    {
+      const r = spawnSync(process.execPath, [path.join(cliDir, "dist/index.js"), "--help"], {
+        encoding: "utf8", stdio: "pipe",
+      });
+      r.status === 0
+        ? ok("AK3a: CLI dist/index.js --help exits 0")
+        : fail("AK3a: CLI --help should exit 0", `exit=${String(r.status)}`);
+
+      const helpText = (r.stdout ?? "") + (r.stderr ?? "");
+      (["deploy", "share", "destroy"] as const).every((cmd) => helpText.includes(cmd))
+        ? ok("AK3b: CLI --help output lists deploy, share, and destroy")
+        : fail("AK3b: CLI --help missing expected commands", `output: ${helpText.slice(0, 300)}`);
+    }
+
+    // ── AK4: MCP pack assertions ──────────────────────────────────────────────
+
+    {
+      // Plant a stale file to prove the explicit "files" list excludes it
+      const mcpStale = path.join(mcpDir, "dist", "stale.js");
+      fs.writeFileSync(mcpStale, "// stale\n");
+
+      let packData: { name?: string; version?: string; files?: { path?: string }[] }[] = [];
+      try {
+        const r = spawnSync("npm", ["pack", "--json", "--dry-run"], {
+          cwd: mcpDir, encoding: "utf8", stdio: "pipe",
+        });
+        r.status === 0
+          ? ok("AK4-setup: npm pack --dry-run @utir/ssc-mcp exits 0")
+          : fail("AK4-setup: npm pack --dry-run @utir/ssc-mcp failed", (r.stderr ?? "").slice(0, 300));
+        try { packData = JSON.parse(r.stdout ?? "[]"); } catch { /* ignore */ }
+      } finally {
+        try { fs.unlinkSync(mcpStale); } catch { /* ignore */ }
+      }
+
+      const pack = packData[0] ?? {};
+
+      pack.name === "@utir/ssc-mcp"
+        ? ok("AK4a: MCP pack name is @utir/ssc-mcp")
+        : fail("AK4a: MCP pack name wrong", `got ${String(pack.name)}`);
+
+      pack.version === "0.1.0"
+        ? ok("AK4b: MCP pack version is 0.1.0")
+        : fail("AK4b: MCP pack version wrong", `got ${String(pack.version)}`);
+
+      // Exact file set: {package.json, README.md, dist/index.js} — no more, no less
+      const mcpFiles = new Set((pack.files ?? []).map((f) => f.path ?? ""));
+      const mcpMissing = [...EXPECTED_FILES].filter((f) => !mcpFiles.has(f));
+      const mcpExtra   = [...mcpFiles].filter((f) => !EXPECTED_FILES.has(f));
+      (mcpMissing.length === 0 && mcpExtra.length === 0)
+        ? ok("AK4c: MCP pack file list is exactly {package.json, README.md, dist/index.js}")
+        : fail("AK4c: MCP pack file list wrong",
+            `missing=${mcpMissing.join(",") || "none"}  extra=${mcpExtra.join(",") || "none"}`);
+
+      // Stale file must not have leaked
+      !mcpFiles.has("dist/stale.js")
+        ? ok("AK4d: MCP pack does not contain dist/stale.js (stale prevention works)")
+        : fail("AK4d: MCP pack leaked dist/stale.js — files field is too broad");
+
+      // bin field: ssc-mcp → dist/index.js
+      const mcpPkg = JSON.parse(fs.readFileSync(path.join(mcpDir, "package.json"), "utf8")) as {
+        bin?: Record<string, string>;
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+        peerDependencies?: Record<string, string>;
+      };
+      mcpPkg.bin?.["ssc-mcp"] === "dist/index.js"
+        ? ok("AK4e: MCP package.json bin[ssc-mcp] = dist/index.js")
+        : fail("AK4e: MCP bin field wrong", `got: ${JSON.stringify(mcpPkg.bin)}`);
+
+      // No @ssc/* deps in published package.json
+      const mcpAllDeps = { ...mcpPkg.dependencies, ...mcpPkg.devDependencies, ...mcpPkg.peerDependencies };
+      const mcpSscDeps = Object.keys(mcpAllDeps).filter((d) => d.startsWith("@ssc/"));
+      mcpSscDeps.length === 0
+        ? ok("AK4f: MCP package.json has no @ssc/* dependencies")
+        : fail("AK4f: MCP package.json still has @ssc/* deps", mcpSscDeps.join(", "));
+
+      // Shebang — exactly one, on line 1
+      const mcpDist = path.join(mcpDir, "dist/index.js");
+      if (fs.existsSync(mcpDist)) {
+        const lines = fs.readFileSync(mcpDist, "utf8").split("\n");
+        lines[0] === "#!/usr/bin/env node"
+          ? ok("AK4g: MCP dist/index.js has shebang on line 1")
+          : fail("AK4g: MCP dist/index.js shebang wrong", `line 1: ${lines[0]}`);
+        lines[1] !== "#!/usr/bin/env node"
+          ? ok("AK4h: MCP dist/index.js shebang appears exactly once")
+          : fail("AK4h: MCP dist/index.js has duplicate shebang on line 2");
+
+        // Executable bit (owner execute bit set)
+        const mcpMode = fs.statSync(mcpDist).mode;
+        (mcpMode & 0o100) !== 0
+          ? ok("AK4i: MCP dist/index.js is executable (mode includes 0o100)")
+          : fail("AK4i: MCP dist/index.js is not executable", `mode=0o${(mcpMode & 0o777).toString(8)}`);
+      } else {
+        fail("AK4g: MCP dist/index.js not found after build");
+        fail("AK4h: (skipped — dist/index.js missing)");
+        fail("AK4i: (skipped — dist/index.js missing)");
+      }
+    }
+
+    // ── AK5: --scan-only ─────────────────────────────────────────────────────
+
+    // AK5a: scan on CLI bundle passes (no secrets)
+    {
+      const r = spawnSync("bash", [publishScript, "--scan-only", path.join(cliDir, "dist/index.js")], {
+        encoding: "utf8", stdio: "pipe",
+      });
+      r.status === 0
+        ? ok("AK5a: --scan-only on CLI dist/index.js passes (no secrets found)")
+        : fail("AK5a: --scan-only on CLI dist/index.js should pass", (r.stderr ?? "").slice(0, 300));
+    }
+
+    // AK5b: scan on MCP bundle passes (no secrets)
+    {
+      const r = spawnSync("bash", [publishScript, "--scan-only", path.join(mcpDir, "dist/index.js")], {
+        encoding: "utf8", stdio: "pipe",
+      });
+      r.status === 0
+        ? ok("AK5b: --scan-only on MCP dist/index.js passes (no secrets found)")
+        : fail("AK5b: --scan-only on MCP dist/index.js should pass", (r.stderr ?? "").slice(0, 300));
+    }
+
+    // AK5c: file containing a fake full-length ssc_ key → exits 1
+    {
+      const fakeKey = "ssc_" + "a".repeat(32); // 32 chars ≥ 24 required by pattern
+      const tmpFile5c = path.join(os.tmpdir(), `ak5c-${Date.now()}.txt`);
+      fs.writeFileSync(tmpFile5c, fakeKey + "\n");
+      try {
+        const r = spawnSync("bash", [publishScript, "--scan-only", tmpFile5c], {
+          encoding: "utf8", stdio: "pipe",
+        });
+        r.status === 1
+          ? ok("AK5c: --scan-only on file with fake ssc_ key exits 1")
+          : fail("AK5c: --scan-only should exit 1 for fake ssc_ key", `exit=${String(r.status)}`);
+        const stderr5c = r.stderr ?? "";
+        stderr5c.includes(tmpFile5c)
+          ? ok("AK5c: stderr names the offending file")
+          : fail("AK5c: stderr should name the file", stderr5c.slice(0, 200));
+        !stderr5c.includes(fakeKey)
+          ? ok("AK5c: stderr does not leak the key value")
+          : fail("AK5c: stderr must not contain the key value itself");
+      } finally {
+        try { fs.unlinkSync(tmpFile5c); } catch { /* ignore */ }
+      }
+    }
+
+    // AK5d: file containing only 'startsWith("ssc_")' → passes (no key-shaped value)
+    {
+      const tmpFile5d = path.join(os.tmpdir(), `ak5d-${Date.now()}.txt`);
+      fs.writeFileSync(tmpFile5d, 'startsWith("ssc_")\n');
+      try {
+        const r = spawnSync("bash", [publishScript, "--scan-only", tmpFile5d], {
+          encoding: "utf8", stdio: "pipe",
+        });
+        r.status === 0
+          ? ok('AK5d: --scan-only on \'startsWith("ssc_")\' passes (not key-shaped)')
+          : fail('AK5d: --scan-only on \'startsWith("ssc_")\' should pass',
+              `exit=${String(r.status)} stderr=${(r.stderr ?? "").slice(0, 200)}`);
+      } finally {
+        try { fs.unlinkSync(tmpFile5d); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

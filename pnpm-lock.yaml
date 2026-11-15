@@ -130,16 +130,28 @@ importers:
 
   packages/cli:
     dependencies:
-      '@ssc/client':
-        specifier: workspace:*
-        version: link:../client
+      archiver:
+        specifier: ^7.0.1
+        version: 7.0.1
+      axios:
+        specifier: ^1.6.0
+        version: 1.20.0(debug@4.4.3)
       commander:
         specifier: ^12.1.0
         version: 12.1.0
+      form-data:
+        specifier: ^4.0.0
+        version: 4.0.6
+      ignore:
+        specifier: ^5.3.1
+        version: 5.3.2
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.43
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.4.0
         version: 5.9.3
@@ -177,9 +189,18 @@ importers:
       '@modelcontextprotocol/server':
         specifier: ^2.3.1
         version: 2.3.1
-      '@ssc/client':
-        specifier: workspace:*
-        version: link:../client
+      archiver:
+        specifier: ^7.0.1
+        version: 7.0.1
+      axios:
+        specifier: ^1.6.0
+        version: 1.20.0(debug@4.4.3)
+      form-data:
+        specifier: ^4.0.0
+        version: 4.0.6
+      ignore:
+        specifier: ^5.3.1
+        version: 5.3.2
       zod:
         specifier: ^4.2.0
         version: 4.6.6
@@ -187,6 +208,9 @@ importers:
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.43
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.4.0
         version: 5.9.3

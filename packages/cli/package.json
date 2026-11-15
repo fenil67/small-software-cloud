@@ -1,23 +1,35 @@
 {
-  "name": "@ssc/cli",
+  "name": "@utir/ssc",
   "version": "0.1.0",
-  "description": "CLI for Small Software Cloud",
+  "description": "Deploy and manage apps on Small Software Cloud",
+  "keywords": ["smallsoftwarecloud", "deploy", "cli", "ssc", "utir"],
+  "license": "UNLICENSED",
   "bin": {
     "ssc": "dist/index.js"
   },
   "main": "dist/index.js",
-  "files": ["dist"],
+  "files": ["dist/index.js", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --external:commander --external:axios --external:archiver --external:form-data --external:ignore --outfile=dist/index.js && chmod +x dist/index.js",
     "typecheck": "tsc --noEmit",
-    "dev": "tsc --watch"
+    "prepublishOnly": "echo 'Use scripts/publish-npm.sh to publish.' && exit 1"
   },
   "dependencies": {
-    "@ssc/client": "workspace:*",
-    "commander": "^12.1.0"
+    "archiver": "^7.0.1",
+    "axios": "^1.6.0",
+    "commander": "^12.1.0",
+    "form-data": "^4.0.0",
+    "ignore": "^5.3.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "esbuild": "0.28.2",
     "typescript": "^5.4.0"
   }
 }

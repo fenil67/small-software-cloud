@@ -1,23 +1,36 @@
 {
-  "name": "@ssc/mcp",
+  "name": "@utir/ssc-mcp",
   "version": "0.1.0",
-  "description": "MCP stdio server for Small Software Cloud",
+  "description": "MCP stdio server for Small Software Cloud — lets AI agents deploy and manage apps",
+  "keywords": ["smallsoftwarecloud", "mcp", "model-context-protocol", "deploy", "ssc", "utir"],
+  "license": "UNLICENSED",
+  "bin": {
+    "ssc-mcp": "dist/index.js"
+  },
   "main": "dist/index.js",
-  "files": ["dist"],
+  "files": ["dist/index.js", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --external:@modelcontextprotocol/server --external:zod --external:axios --external:archiver --external:form-data --external:ignore --outfile=dist/index.js && chmod +x dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsc && node dist/index.test.js",
-    "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "prepublishOnly": "echo 'Use scripts/publish-npm.sh to publish.' && exit 1"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",
-    "@ssc/client": "workspace:*",
+    "archiver": "^7.0.1",
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0",
+    "ignore": "^5.3.1",
     "zod": "^4.2.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "esbuild": "0.28.2",
     "typescript": "^5.4.0"
   }
 }
