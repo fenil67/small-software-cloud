@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { cookies } from "next/headers";
 import { ClerkProvider } from "@clerk/nextjs";
+import { parseTheme, themeClass, THEME_COOKIE } from "../lib/theme";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -14,22 +16,25 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Small Software Cloud",
+  title: "Utir",
   description: "Deploy AI-built apps instantly",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const cookieStore = await cookies();
+  const theme = parseTheme(cookieStore.get(THEME_COOKIE)?.value);
+
   return (
-    <ClerkProvider>
+    <ClerkProvider signInUrl="/sign-in" signUpUrl="/sign-up">
       <html
         lang="en"
-        className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+        className={`${geistSans.variable} ${geistMono.variable} h-full antialiased ${themeClass(theme)}`}
       >
-        <body className="min-h-full flex flex-col bg-gray-950 text-gray-50">
+        <body className="min-h-full flex flex-col bg-bg text-fg">
           {children}
         </body>
       </html>

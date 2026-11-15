@@ -1,26 +1,143 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* ─── Design tokens ─────────────────────────────────────────────────────────── */
+
+/* t-dark is unconditional — always dark regardless of OS preference */
+.t-dark {
+  --bg: #000000;
+  --surface: #181818;
+  --surface-2: #1f1f1f;
+  --surface-3: #272727;
+  --surface-4: #313131;
+  --line: #272727;
+  --line-strong: #313131;
+  --fg: #f5f5f7;
+  --fg-2: #a1a1a6;
+  --fg-3: #8e8e93;
+  --btn-bg: #f5f5f7;
+  --btn-fg: #000000;
+  --green: #30d158;
+  --red: #ff6961;
+  --orange: #ffb340;
+  --blue: #64d2ff;
+  color-scheme: dark;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+/* t-system defaults to dark tokens; the media query below flips it for light OS */
+.t-system {
+  --bg: #000000;
+  --surface: #181818;
+  --surface-2: #1f1f1f;
+  --surface-3: #272727;
+  --surface-4: #313131;
+  --line: #272727;
+  --line-strong: #313131;
+  --fg: #f5f5f7;
+  --fg-2: #a1a1a6;
+  --fg-3: #8e8e93;
+  --btn-bg: #f5f5f7;
+  --btn-fg: #000000;
+  --green: #30d158;
+  --red: #ff6961;
+  --orange: #ffb340;
+  --blue: #64d2ff;
+  color-scheme: dark;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+.t-light {
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --surface-2: #f2f2f4;
+  --surface-3: #e8e8ed;
+  --surface-4: #dcdce1;
+  --line: #e5e5ea;
+  --line-strong: #d2d2d7;
+  --fg: #1d1d1f;
+  --fg-2: #515154;
+  --fg-3: #6e6e73;
+  --btn-bg: #1d1d1f;
+  --btn-fg: #ffffff;
+  --green: #1a7f37;
+  --red: #c9001a;
+  --orange: #a84b00;
+  --blue: #0062c4;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  .t-system {
+    --bg: #f5f5f7;
+    --surface: #ffffff;
+    --surface-2: #f2f2f4;
+    --surface-3: #e8e8ed;
+    --surface-4: #dcdce1;
+    --line: #e5e5ea;
+    --line-strong: #d2d2d7;
+    --fg: #1d1d1f;
+    --fg-2: #515154;
+    --fg-3: #6e6e73;
+    --btn-bg: #1d1d1f;
+    --btn-fg: #ffffff;
+    --green: #1a7f37;
+    --red: #c9001a;
+    --orange: #a84b00;
+    --blue: #0062c4;
+    color-scheme: light;
   }
 }
 
+/* ─── Tailwind v4 custom utilities ──────────────────────────────────────────── */
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-4: var(--surface-4);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-btn-bg: var(--btn-bg);
+  --color-btn-fg: var(--btn-fg);
+  --color-green: var(--green);
+  --color-red: var(--red);
+  --color-orange: var(--orange);
+  --color-blue: var(--blue);
+}
+
+/* ─── Base styles ───────────────────────────────────────────────────────────── */
+
+html,
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* ─── Logo theme swap (CSS-only) ─────────────────────────────────────────────
+   Default: dark logo visible, light logo hidden.
+   .t-light and .t-system + prefers-color-scheme:light flip them.           */
+
+.logo-on-dark {
+  display: block;
+}
+.logo-on-light {
+  display: none;
+}
+.t-light .logo-on-dark {
+  display: none;
+}
+.t-light .logo-on-light {
+  display: block;
+}
+@media (prefers-color-scheme: light) {
+  .t-system .logo-on-dark {
+    display: none;
+  }
+  .t-system .logo-on-light {
+    display: block;
+  }
 }
