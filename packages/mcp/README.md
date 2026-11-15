@@ -1,6 +1,6 @@
-# ssc-mcp — Small Software Cloud MCP Server
+# ssc-mcp — Utir MCP Server
 
-An [MCP](https://modelcontextprotocol.io) stdio server that lets AI agents (Claude, Cursor, etc.) deploy and manage apps on [Small Software Cloud](https://smallsoftware.cloud).
+An MCP stdio server that lets AI agents (Claude, Cursor, etc.) deploy and manage apps on [Utir](https://app.utir.dev).
 
 ## Install
 
@@ -25,7 +25,7 @@ npm install -g @utir/ssc-mcp
       "command": "ssc-mcp",
       "env": {
         "SSC_API_KEY": "ssc_...",
-        "SSC_API_URL": "https://api.smallsoftware.cloud"
+        "SSC_API_URL": "https://api.utir.dev"
       }
     }
   }

@@ -12,8 +12,8 @@ const program = new Command();
 
 program
   .name("ssc")
-  .description("Small Software Cloud CLI")
-  .version("0.1.0");
+  .description("Utir CLI")
+  .version("0.1.1");
 
 // ─── login ────────────────────────────────────────────────────────────────────
 program

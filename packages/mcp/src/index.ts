@@ -14,7 +14,7 @@
  *         "args": ["/absolute/path/to/packages/mcp/dist/index.js"],
  *         "env": {
  *           "SSC_API_KEY": "ssc_...",
- *           "SSC_API_URL": "https://api.smallsoftware.cloud"
+ *           "SSC_API_URL": "https://api.utir.dev"
  *         }
  *       }
  *     }
@@ -73,7 +73,7 @@ export function createServer(): McpServer {
   server.registerTool(
     "deploy_app",
     {
-      description: `Deploy an application to Small Software Cloud from a local directory or a GitHub URL.
+      description: `Deploy an application to Utir from a local directory or a GitHub URL.
 
 RESULT — SUCCESS: returns deployment_id, app_id, status="success", url.
 RESULT — FAILURE: returns deployment_id, app_id, status="failed", failure_stage, failure_message, and the last 20 log lines. Read them to diagnose the problem before retrying.

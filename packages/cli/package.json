@@ -1,9 +1,8 @@
 {
   "name": "@utir/ssc",
-  "version": "0.1.0",
-  "description": "Deploy and manage apps on Small Software Cloud",
+  "version": "0.1.1",
+  "description": "Deploy and manage apps on Utir",
   "keywords": [
-    "smallsoftwarecloud",
     "deploy",
     "cli",
     "ssc",

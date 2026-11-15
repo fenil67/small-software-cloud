@@ -8863,8 +8863,8 @@ async function main(): Promise<void> {
         ? ok("AK2a: CLI pack name is @utir/ssc")
         : fail("AK2a: CLI pack name wrong", `got ${String(pack.name)}`);
 
-      pack.version === "0.1.0"
-        ? ok("AK2b: CLI pack version is 0.1.0")
+      pack.version === "0.1.1"
+        ? ok("AK2b: CLI pack version is 0.1.1")
         : fail("AK2b: CLI pack version wrong", `got ${String(pack.version)}`);
 
       // Exact file set: {package.json, README.md, dist/index.js} — no more, no less
@@ -8958,8 +8958,8 @@ async function main(): Promise<void> {
         ? ok("AK4a: MCP pack name is @utir/ssc-mcp")
         : fail("AK4a: MCP pack name wrong", `got ${String(pack.name)}`);
 
-      pack.version === "0.1.0"
-        ? ok("AK4b: MCP pack version is 0.1.0")
+      pack.version === "0.1.1"
+        ? ok("AK4b: MCP pack version is 0.1.1")
         : fail("AK4b: MCP pack version wrong", `got ${String(pack.version)}`);
 
       // Exact file set: {package.json, README.md, dist/index.js} — no more, no less
@@ -9077,6 +9077,107 @@ async function main(): Promise<void> {
               `exit=${String(r.status)} stderr=${(r.stderr ?? "").slice(0, 200)}`);
       } finally {
         try { fs.unlinkSync(tmpFile5d); } catch { /* ignore */ }
+      }
+    }
+
+    // ── AK6: no "smallsoftware" and no forbidden URLs ─────────────────────────
+    // Checks that the product rename to Utir is complete in both bundles and READMEs,
+    // and that all https URLs are on the allowed domains.
+
+    {
+      // Allowed URL prefixes; github.com/owner/repo is the docs placeholder.
+      const ALLOWED_URL_PREFIXES = [
+        "https://api.utir.dev",
+        "https://app.utir.dev",
+        "https://github.com/owner/repo",
+      ];
+
+      function extractHttpsUrls(content: string): string[] {
+        const raw = content.match(/https:\/\/[^\s"'`)\]\\,\n]+/g) ?? [];
+        // Drop template-literal fragments like https://${app.subdomain}
+        return [...new Set(raw.filter((u) => !u.includes("${")))];
+      }
+
+      function allUrlsAllowed(urls: string[]): { ok: boolean; bad: string[] } {
+        const bad = urls.filter((u) => !ALLOWED_URL_PREFIXES.some((p) => u.startsWith(p)));
+        return { ok: bad.length === 0, bad };
+      }
+
+      const cliDist = path.join(cliDir, "dist/index.js");
+      const mcpDist = path.join(mcpDir, "dist/index.js");
+      const cliReadme = path.join(cliDir, "README.md");
+      const mcpReadme = path.join(mcpDir, "README.md");
+
+      // AK6a: CLI bundle does not contain "smallsoftware"
+      {
+        const content = fs.existsSync(cliDist) ? fs.readFileSync(cliDist, "utf8") : "";
+        !/smallsoftware/i.test(content)
+          ? ok("AK6a: CLI dist/index.js contains no 'smallsoftware'")
+          : fail("AK6a: CLI dist/index.js still contains 'smallsoftware'");
+      }
+
+      // AK6b: MCP bundle does not contain "smallsoftware"
+      {
+        const content = fs.existsSync(mcpDist) ? fs.readFileSync(mcpDist, "utf8") : "";
+        !/smallsoftware/i.test(content)
+          ? ok("AK6b: MCP dist/index.js contains no 'smallsoftware'")
+          : fail("AK6b: MCP dist/index.js still contains 'smallsoftware'");
+      }
+
+      // AK6c: CLI README does not contain "smallsoftware"
+      {
+        const content = fs.existsSync(cliReadme) ? fs.readFileSync(cliReadme, "utf8") : "";
+        !/smallsoftware/i.test(content)
+          ? ok("AK6c: CLI README.md contains no 'smallsoftware'")
+          : fail("AK6c: CLI README.md still contains 'smallsoftware'");
+      }
+
+      // AK6d: MCP README does not contain "smallsoftware"
+      {
+        const content = fs.existsSync(mcpReadme) ? fs.readFileSync(mcpReadme, "utf8") : "";
+        !/smallsoftware/i.test(content)
+          ? ok("AK6d: MCP README.md contains no 'smallsoftware'")
+          : fail("AK6d: MCP README.md still contains 'smallsoftware'");
+      }
+
+      // AK6e: CLI README URLs are all on allowed domains
+      {
+        const content = fs.existsSync(cliReadme) ? fs.readFileSync(cliReadme, "utf8") : "";
+        const urls = extractHttpsUrls(content);
+        const { ok: allOk, bad } = allUrlsAllowed(urls);
+        allOk
+          ? ok(`AK6e: CLI README.md URLs are all on allowed domains (${urls.join(", ") || "none"})`)
+          : fail("AK6e: CLI README.md contains forbidden URL(s)", bad.join(", "));
+      }
+
+      // AK6f: MCP README URLs are all on allowed domains
+      {
+        const content = fs.existsSync(mcpReadme) ? fs.readFileSync(mcpReadme, "utf8") : "";
+        const urls = extractHttpsUrls(content);
+        const { ok: allOk, bad } = allUrlsAllowed(urls);
+        allOk
+          ? ok(`AK6f: MCP README.md URLs are all on allowed domains (${urls.join(", ") || "none"})`)
+          : fail("AK6f: MCP README.md contains forbidden URL(s)", bad.join(", "));
+      }
+
+      // AK6g: CLI bundle URLs are all on allowed domains
+      {
+        const content = fs.existsSync(cliDist) ? fs.readFileSync(cliDist, "utf8") : "";
+        const urls = extractHttpsUrls(content);
+        const { ok: allOk, bad } = allUrlsAllowed(urls);
+        allOk
+          ? ok(`AK6g: CLI dist/index.js URLs are all on allowed domains (${urls.join(", ") || "none"})`)
+          : fail("AK6g: CLI dist/index.js contains forbidden URL(s)", bad.join(", "));
+      }
+
+      // AK6h: MCP bundle URLs are all on allowed domains
+      {
+        const content = fs.existsSync(mcpDist) ? fs.readFileSync(mcpDist, "utf8") : "";
+        const urls = extractHttpsUrls(content);
+        const { ok: allOk, bad } = allUrlsAllowed(urls);
+        allOk
+          ? ok(`AK6h: MCP dist/index.js URLs are all on allowed domains (${urls.join(", ") || "none"})`)
+          : fail("AK6h: MCP dist/index.js contains forbidden URL(s)", bad.join(", "));
       }
     }
   }

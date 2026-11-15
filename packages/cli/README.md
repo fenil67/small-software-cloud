@@ -1,6 +1,6 @@
-# ssc — Small Software Cloud CLI
+# ssc — Utir CLI
 
-Deploy and manage apps on [Small Software Cloud](https://smallsoftware.cloud) from your terminal.
+Deploy and manage apps on [Utir](https://app.utir.dev) from your terminal.
 
 ## Install
 

@@ -1,9 +1,8 @@
 {
   "name": "@utir/ssc-mcp",
-  "version": "0.1.0",
-  "description": "MCP stdio server for Small Software Cloud — lets AI agents deploy and manage apps",
+  "version": "0.1.1",
+  "description": "MCP stdio server for Utir — lets AI agents deploy and manage apps",
   "keywords": [
-    "smallsoftwarecloud",
     "mcp",
     "model-context-protocol",
     "deploy",
