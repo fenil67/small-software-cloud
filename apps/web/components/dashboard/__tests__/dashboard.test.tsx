@@ -809,3 +809,129 @@ describe("ErrorCard – Try again", () => {
     expect(mockRouterRefresh).toHaveBeenCalledTimes(1);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OnboardingClient – BUG B: navigation after workspace creation
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("OnboardingClient – BUG B: navigation after workspace creation", () => {
+  let mockAssign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockAssign = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { assign: mockAssign, replace: vi.fn(), href: "/" },
+      writable: true,
+      configurable: true,
+    });
+    _mockSessionOrgId = null; // brand-new user, no active org yet
+  });
+
+  it("Enter key submits the form (form has onSubmit)", async () => {
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    _mockSessionOrgId = "org_new"; // session confirms immediately after setActive
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My New Workspace" } });
+    await act(async () => {
+      fireEvent.submit(screen.getByRole("textbox").closest("form")!);
+    });
+    expect(mockCreateOrganization).toHaveBeenCalledWith({ name: "My New Workspace" });
+  });
+
+  it("navigates to /apps after session confirms new org", async () => {
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    _mockSessionOrgId = "org_new"; // session confirms immediately
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+  });
+
+  it("navigates to /apps after 5-second cap even if session never confirms (mutation: remove fallback → test fails)", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCreateOrganization.mockResolvedValue({ id: "org_new_slow" });
+      _mockSessionOrgId = null; // session never updates (simulates slow Clerk propagation)
+      render(<OnboardingClient firstName={null} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+      // Trigger the click synchronously — the async handler polls in the background
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+      // Advance past the 5-second polling deadline and flush all pending promises
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      // The only path to this call is the unconditional navigateHard after pollSession.
+      // Mutation: remove navigateHard("/apps") from handleCreate → this assertion fails.
+      expect(mockAssign).toHaveBeenCalledWith("/apps");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("failure shows error message and does not navigate", async () => {
+    mockCreateOrganization.mockRejectedValue(new Error("clerk_error"));
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(mockAssign).not.toHaveBeenCalled();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Contract: fixture shapes (AQ)
+// ═════════════════════════════════════════════════════════════════════════════
+
+import deploymentsFixture from "../../../../api/scripts/fixtures/deployments.json";
+import accessFixture from "../../../../api/scripts/fixtures/access.json";
+import type { Deployment as DeploymentType, AppAccess as AppAccessType } from "../../../lib/api-types";
+
+describe("Contract: deployments fixture shape", () => {
+  it("is an array (mutation: wrap in {items:[...]} → Array.isArray fails → web map crashes)", () => {
+    // This test fails if fixtures/deployments.json changes from [...] to {items:[...]}
+    expect(Array.isArray(deploymentsFixture)).toBe(true);
+    const deps = deploymentsFixture as unknown as DeploymentType[];
+    for (const dep of deps) {
+      expect(dep).toHaveProperty("id");
+      expect(dep).toHaveProperty("status");
+      expect(dep).toHaveProperty("version");
+    }
+  });
+
+  it("DeploymentRow renders with real fixture data", () => {
+    const dep = (deploymentsFixture as unknown as DeploymentType[])[0];
+    if (!dep) return; // empty fixture is acceptable (non-empty ensured by API test AQ1)
+    render(<DeploymentRow deployment={dep} isLatest={true} />);
+    expect(document.body).toBeInTheDocument(); // render did not throw
+  });
+});
+
+describe("Contract: access fixture shape", () => {
+  it("has {users, pending} shape (mutation: change to flat array → isAppAccessResponse fails → crash)", () => {
+    // This test fails if fixtures/access.json changes from {users,pending} to [...]
+    expect(typeof accessFixture).toBe("object");
+    expect(Array.isArray(accessFixture)).toBe(false);
+    expect(accessFixture).toHaveProperty("users");
+    expect(accessFixture).toHaveProperty("pending");
+    const a = accessFixture as unknown as { users: unknown[]; pending: unknown[] };
+    expect(Array.isArray(a.users)).toBe(true);
+    expect(Array.isArray(a.pending)).toBe(true);
+  });
+
+  it("AppDetailClient renders normalized access list from fixture", () => {
+    const a = accessFixture as unknown as { users: { email: string; granted_at: string }[]; pending: { email: string; granted_at: string }[] };
+    const accessList: AppAccessType[] = [
+      ...a.users.map((u) => ({ email: u.email, display_name: null, granted_at: u.granted_at, status: "active" as const })),
+      ...a.pending.map((p) => ({ email: p.email, display_name: null, granted_at: p.granted_at, status: "pending" as const })),
+    ];
+    render(<AppDetailClient appId="app-fixture" appName="Fixture App" accessList={accessList} isAdmin={false} />);
+    expect(screen.getByText(/who can open it/i)).toBeInTheDocument();
+    if (accessList.length > 0) {
+      expect(screen.getByText(accessList[0].email)).toBeInTheDocument();
+    }
+  });
+});

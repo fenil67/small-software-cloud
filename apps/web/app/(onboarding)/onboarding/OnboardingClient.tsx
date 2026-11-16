@@ -5,10 +5,25 @@ import { useRouter } from "next/navigation";
 import { useOrganizationList, useClerk } from "@clerk/nextjs";
 import { Logo } from "../../../components/brand/Logo";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
+import { navigateHard } from "../../../lib/navigate";
 
 interface Props {
   firstName: string | null;
   forceNew?: boolean;
+}
+
+// Polls until the Clerk session reflects the new active org or the timeout elapses.
+// Defined outside the component so Date.now() is not flagged by react-hooks/purity.
+async function pollSession(
+  getActiveOrgId: () => string | null | undefined,
+  targetOrgId: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (getActiveOrgId() === targetOrgId) return;
+    await new Promise<void>((r) => setTimeout(r, 100));
+  }
 }
 
 export function OnboardingClient({ firstName, forceNew = false }: Props) {
@@ -36,10 +51,9 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
       const org = await createOrganization?.({ name: trimmed });
       if (org) {
         await setActive?.({ organization: org.id });
-        // Confirm session reflects new org (SignedInSessionResource.lastActiveOrganizationId)
-        if (clerk.session?.lastActiveOrganizationId === org.id) {
-          window.location.assign("/apps");
-        }
+        // Poll for ≤5 seconds for session to reflect new org, then navigate regardless
+        await pollSession(() => clerk.session?.lastActiveOrganizationId, org.id, 5000);
+        navigateHard("/apps");
       }
     } catch {
       setError("Something went wrong. Please try again.");
@@ -54,10 +68,9 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
       const inv = userInvitations?.data?.find((i) => i.id === invitationId);
       if (inv) await inv.accept();
       await setActive?.({ organization: orgId });
-      // Confirm session reflects new org (SignedInSessionResource.lastActiveOrganizationId)
-      if (clerk.session?.lastActiveOrganizationId === orgId) {
-        window.location.assign("/apps");
-      }
+      // Poll for ≤5 seconds for session to reflect new org, then navigate regardless
+      await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
+      navigateHard("/apps");
     } catch {
       setJoiningId(null);
     }

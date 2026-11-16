@@ -53,6 +53,24 @@ export interface ApiKeyCreated extends ApiKey {
   key: string;
 }
 
+// Raw shapes returned by GET /v1/apps/:id/access
+export interface AppAccessUser {
+  user_id: string;
+  email: string;
+  granted_at: string;
+}
+
+export interface AppPending {
+  email: string;
+  granted_at: string;
+}
+
+export interface AppAccessResponse {
+  users: AppAccessUser[];
+  pending: AppPending[];
+}
+
+// Normalized client shape used by AppDetailClient
 export interface AppAccess {
   email: string;
   display_name: string | null;

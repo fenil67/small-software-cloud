@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useClerk, useUser, useOrganization, useOrganizationList } from "@clerk/nextjs";
 import { Logo } from "../brand/Logo";
+import { navigateHard } from "../../lib/navigate";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -70,7 +71,7 @@ export function Sidebar() {
           // clerk.session is SignedInSessionResource from @clerk/nextjs;
           // lastActiveOrganizationId should equal orgId since setActive has resolved.
           if (clerk.session?.lastActiveOrganizationId === orgId) {
-            window.location.assign("/apps");
+            navigateHard("/apps");
           }
         }}
       />

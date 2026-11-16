@@ -2,8 +2,8 @@ import { auth } from "@clerk/nextjs/server";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ErrorCard } from "../../../../components/dashboard/ErrorCard";
-import { apiFetch } from "../../../../lib/api";
-import type { App, AppAccess } from "../../../../lib/api-types";
+import { apiFetch, isAppAccessResponse, isDeploymentArray } from "../../../../lib/api";
+import type { App, AppAccess, AppAccessResponse } from "../../../../lib/api-types";
 import type { Deployment } from "../../../../lib/api-types";
 import { resolveAppStatus } from "../../../../lib/status";
 import { AppStatusBadge } from "../../../../components/dashboard/AppStatusBadge";
@@ -44,12 +44,32 @@ export default async function AppDetailPage({ params }: PageProps) {
     );
   }
 
-  const [deployments, accessList] = await Promise.all([
-    apiFetch<Deployment[]>(`/v1/apps/${id}/deployments`, { token }).catch(() => [] as Deployment[]),
+  const [rawDeployments, rawAccess] = await Promise.all([
+    apiFetch<unknown>(`/v1/apps/${id}/deployments`, { token }).catch((): unknown => []),
     isAdmin
-      ? apiFetch<AppAccess[]>(`/v1/apps/${id}/access`, { token }).catch(() => [] as AppAccess[])
-      : Promise.resolve([] as AppAccess[]),
+      ? apiFetch<unknown>(`/v1/apps/${id}/access`, { token }).catch((): unknown => null)
+      : Promise.resolve(null),
   ]);
+
+  let deployments: Deployment[] = [];
+  if (isDeploymentArray(rawDeployments)) {
+    deployments = rawDeployments;
+  } else if (rawDeployments !== null) {
+    console.error(`[apps/${id}] GET /v1/apps/${id}/deployments shape mismatch: expected array, got ${typeof rawDeployments}`);
+  }
+
+  let accessList: AppAccess[] = [];
+  if (rawAccess !== null) {
+    if (isAppAccessResponse(rawAccess)) {
+      const r = rawAccess as AppAccessResponse;
+      accessList = [
+        ...r.users.map((u) => ({ email: u.email, display_name: null, granted_at: u.granted_at, status: "active" as const })),
+        ...r.pending.map((p) => ({ email: p.email, display_name: null, granted_at: p.granted_at, status: "pending" as const })),
+      ];
+    } else {
+      console.error(`[apps/${id}] GET /v1/apps/${id}/access shape mismatch: expected {users, pending}, got ${JSON.stringify(Object.keys(rawAccess as Record<string, unknown>))}`);
+    }
+  }
 
   const resolved = resolveAppStatus(app.suspended, app.status, app.latest_deployment_status);
   const appUrl = app.subdomain ? `https://${app.subdomain}` : null;

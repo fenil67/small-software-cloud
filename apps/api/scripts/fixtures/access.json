@@ -1,0 +1,15 @@
+{
+  "users": [
+    {
+      "user_id": "user-fixture-1",
+      "email": "alice@example.com",
+      "granted_at": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "pending": [
+    {
+      "email": "bob@example.com",
+      "granted_at": "2026-01-01T00:00:30.000Z"
+    }
+  ]
+}

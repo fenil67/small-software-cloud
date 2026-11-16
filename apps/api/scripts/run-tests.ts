@@ -9819,6 +9819,105 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AQ: Response shape contracts — save real response fixtures");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    const fixturesDir = path.resolve(__dirname, "fixtures");
+    fs.mkdirSync(fixturesDir, { recursive: true });
+
+    // Use an org that has real data from earlier sections (Section S created sOrgId apps)
+    // We need an org and app that exist for these shape tests. Use orgA from seed.
+    // Create a fresh fixture org + app + deployment for predictable shape checking.
+    const { rows: aqOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_aq','AQ Org','aq-org') RETURNING id",
+    );
+    const aqOrgId = aqOrgRows[0].id;
+    const { fullKey: aqKey, keyPrefix: aqKP, keyHash: aqKH } = generateApiKey();
+    await pool.query(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'aq-key',$3,$4,'{read,deploy,manage}')",
+      [aqOrgId, userId, aqKP, aqKH],
+    );
+
+    // Create an app + deployment directly in DB for shape testing
+    const { rows: aqAppRows } = await pool.query<{ id: string }>(
+      "INSERT INTO apps (org_id, name, slug, status) VALUES ($1,'AQ App','aq-app','running') RETURNING id",
+      [aqOrgId],
+    );
+    const aqAppId = aqAppRows[0].id;
+    await pool.query(
+      `INSERT INTO deployments (app_id, status, version, started_at, finished_at)
+       VALUES ($1,'success',1,now()-interval'1 minute',now())`,
+      [aqAppId],
+    );
+
+    // ── AQ1: GET /v1/apps/:id/deployments → verify shape + save fixture ───────
+    {
+      const r = await request("GET", `/v1/apps/${aqAppId}/deployments`, {
+        headers: authHeaders(aqKey),
+      });
+      console.log(`  AQ1: GET /v1/apps/${aqAppId.slice(0, 8)}.../deployments → ${r.status}`);
+      if (r.status === 200 && Array.isArray(r.body)) {
+        ok("AQ1: deployments endpoint returns an array");
+        const arr = r.body as Record<string, unknown>[];
+        const hasShape = arr.every((d) =>
+          typeof d.id === "string" &&
+          typeof d.status === "string" &&
+          "version" in d,
+        );
+        hasShape
+          ? ok("AQ1: each deployment has {id, status, version}")
+          : fail("AQ1: deployment shape mismatch", JSON.stringify(arr[0]));
+        fs.writeFileSync(
+          path.join(fixturesDir, "deployments.json"),
+          JSON.stringify(r.body, null, 2),
+        );
+        ok("AQ1: deployments.json saved");
+      } else {
+        fail("AQ1: deployments should be a 200 array", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+    // ── AQ2: GET /v1/apps/:id/access → verify shape + save fixture ───────────
+    {
+      // Grant a pending access entry so the fixture is non-empty
+      await pool.query(
+        "INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1,'aq-fixture@example.com',NULL) ON CONFLICT DO NOTHING",
+        [aqAppId],
+      );
+      const r = await request("GET", `/v1/apps/${aqAppId}/access`, {
+        headers: authHeaders(aqKey),
+      });
+      console.log(`  AQ2: GET /v1/apps/${aqAppId.slice(0, 8)}.../access → ${r.status}`);
+      if (r.status === 200) {
+        const b = r.body as Record<string, unknown>;
+        const hasShape = Array.isArray(b.users) && Array.isArray(b.pending);
+        hasShape
+          ? ok("AQ2: access endpoint returns {users, pending}")
+          : fail("AQ2: access shape mismatch — expected {users:[], pending:[]}", JSON.stringify(b));
+        fs.writeFileSync(
+          path.join(fixturesDir, "access.json"),
+          JSON.stringify(r.body, null, 2),
+        );
+        ok("AQ2: access.json saved");
+      } else {
+        fail("AQ2: access should return 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+    // ── AQ3: GET /v1/apps → verify array shape ────────────────────────────────
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(aqKey) });
+      console.log(`  AQ3: GET /v1/apps → ${r.status} (${Array.isArray(r.body) ? (r.body as unknown[]).length : "not array"} apps)`);
+      r.status === 200 && Array.isArray(r.body)
+        ? ok("AQ3: GET /v1/apps returns an array")
+        : fail("AQ3: apps list should be a 200 array", `got ${r.status}`);
+    }
+
+    // ── Cleanup AQ org ────────────────────────────────────────────────────────
+    await pool.query("DELETE FROM orgs WHERE id=$1", [aqOrgId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section("AM: Lockfile drift — package-lock.json vs pnpm-lock.yaml runtime dep versions");
   // ════════════════════════════════════════════════════════════════════════════
   {
