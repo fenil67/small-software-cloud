@@ -19,7 +19,7 @@ Post-upgrade state: vitest 4.1.12 installed; all 6 vitest/tinypool/mocker adviso
 | Patched in | `glob >= 14.0.2` |
 | Dep path | `archiver@7.0.1 → archiver-utils@5.0.2 → glob@10.5.0` |
 | Consumers | `packages/client`, `packages/cli` (`@utir/ssc`), `packages/mcp` (`@utir/ssc-mcp`), `apps/api` |
-| Ships in production | Railway API server (via `@ssc/client`); published npm packages `@utir/ssc` and `@utir/ssc-mcp` (archiver is an external runtime dep in both bundles) |
+| Ships in production | Published npm packages `@utir/ssc` and `@utir/ssc-mcp` (archiver is bundled as an external runtime dep in both). **Not in the Railway API image**: archiver is a `devDependency` in `apps/api/package-lock.json` and is excluded by `npm ci --omit=dev` at build time. |
 
 **Why not reachable:**
 The advisory fires when a caller passes an `AbortSignal` to `glob()` and relies on it to cancel in-flight filesystem traversal after a timeout. `archiver-utils` calls `glob()` only when the archive's `.glob()` or `.directory()` methods are invoked by the caller.
@@ -41,7 +41,7 @@ This codebase never calls those methods. The only use of archiver is in `package
 | Patched in | `minimatch >= 11.0.1` |
 | Dep path | `archiver@7.0.1 → archiver-utils@5.0.2 → glob@10.5.0 → minimatch@9.0.9` |
 | Consumers | Same as above: `packages/client`, `packages/cli`, `packages/mcp`, `apps/api` |
-| Ships in production | Yes — same as glob finding above |
+| Ships in production | Same as glob finding above: `@utir/ssc` and `@utir/ssc-mcp` npm packages only; not in the Railway API image. |
 
 **Why not reachable:**
 The exploit requires a crafted glob pattern containing exponentially branching `{a,b,c,...}` constructs to be passed to `minimatch`. minimatch is only reached here as a dependency of `archiver-utils`' glob, which is only called by archiver's `.glob()` / `.directory()` methods — neither of which is ever called (see finding 1 above). Even if the code path were reached, the patterns would be internal archiver constants, not user-controlled input.

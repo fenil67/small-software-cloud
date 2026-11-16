@@ -66,7 +66,7 @@ import path from "path";
 import fs from "fs";
 import express, { Request, Response, NextFunction } from "express";
 import { healthRouter } from "../src/routes/health";
-import { appsRouter } from "../src/routes/apps";
+// appsRouter loaded via require() after requireAuth patch (see below)
 import { deploymentsRouter } from "../src/routes/deployments";
 import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
@@ -350,6 +350,7 @@ flyModule.destroyFlyApp = async (appName: string) => {
 
 // Load routers that depend on requireAuth AFTER the patch above.
 // Must use require() here — import statements are hoisted before this body runs.
+const { appsRouter } = require("../src/routes/apps") as typeof import("../src/routes/apps");
 const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
 const { appAccessRouter } = require("../src/routes/appAccess") as typeof import("../src/routes/appAccess");
 const { apiKeysRouter } = require("../src/routes/apiKeys") as typeof import("../src/routes/apiKeys");

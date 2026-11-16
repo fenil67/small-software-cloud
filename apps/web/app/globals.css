@@ -20,6 +20,7 @@
   --red: #ff6961;
   --orange: #ffb340;
   --blue: #64d2ff;
+  --danger-line: #3a2020;
   color-scheme: dark;
 }
 
@@ -41,6 +42,7 @@
   --red: #ff6961;
   --orange: #ffb340;
   --blue: #64d2ff;
+  --danger-line: #3a2020;
   color-scheme: dark;
 }
 
@@ -61,6 +63,7 @@
   --red: #c9001a;
   --orange: #a84b00;
   --blue: #0062c4;
+  --danger-line: #f2c4c1;
   color-scheme: light;
 }
 
@@ -82,6 +85,7 @@
     --red: #c9001a;
     --orange: #a84b00;
     --blue: #0062c4;
+    --danger-line: #f2c4c1;
     color-scheme: light;
   }
 }
@@ -107,6 +111,14 @@
   --color-red: var(--red);
   --color-orange: var(--orange);
   --color-blue: var(--blue);
+  --color-danger-line: var(--danger-line);
+}
+
+/* ─── Shared animations ─────────────────────────────────────────────────────── */
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
 /* ─── Base styles ───────────────────────────────────────────────────────────── */

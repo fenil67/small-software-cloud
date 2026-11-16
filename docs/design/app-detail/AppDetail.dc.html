@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Utir: invoice-helper</title>
+<script src="./vendor/react.js"></script>
+<script src="./vendor/react-dom.js"></script>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.t-dark,.t-system{--bg:#000000;--surface:#181818;--surface-2:#1F1F1F;--surface-3:#272727;--surface-4:#313131;--line:#272727;--line-strong:#313131;--fg:#F5F5F7;--fg-2:#A1A1A6;--fg-3:#8E8E93;--btn-bg:#F5F5F7;--btn-fg:#000000;--chart:#C7C7CC;--green:#30D158;--red:#FF6961;--orange:#FFB340;--blue:#64D2FF;--danger-line:#3A2020;color-scheme:dark}
+.t-light{--bg:#F5F5F7;--surface:#FFFFFF;--surface-2:#F2F2F4;--surface-3:#E8E8ED;--surface-4:#DCDCE1;--line:#E5E5EA;--line-strong:#D2D2D7;--fg:#1D1D1F;--fg-2:#515154;--fg-3:#6E6E73;--btn-bg:#1D1D1F;--btn-fg:#FFFFFF;--chart:#8E8E93;--green:#1A7F37;--red:#C9001A;--orange:#A84B00;--blue:#0062C4;--danger-line:#F2C4C1;color-scheme:light}
+@media (prefers-color-scheme: light){.t-system{--bg:#F5F5F7;--surface:#FFFFFF;--surface-2:#F2F2F4;--surface-3:#E8E8ED;--surface-4:#DCDCE1;--line:#E5E5EA;--line-strong:#D2D2D7;--fg:#1D1D1F;--fg-2:#515154;--fg-3:#6E6E73;--btn-bg:#1D1D1F;--btn-fg:#FFFFFF;--chart:#8E8E93;--green:#1A7F37;--red:#C9001A;--orange:#A84B00;--blue:#0062C4;--danger-line:#F2C4C1;color-scheme:light}}
+.logo-light{display:none}.t-light .logo-dark{display:none}.t-light .logo-light{display:block}
+@media (prefers-color-scheme: light){.t-system .logo-dark{display:none}.t-system .logo-light{display:block}}
+
+a{color:var(--fg);text-decoration:none}a:hover{opacity:.8}
+.nav{transition:background-color 300ms cubic-bezier(0.22,1,0.36,1),color 300ms cubic-bezier(0.22,1,0.36,1)}
+.nav:hover{background:var(--surface);color:var(--fg)}
+.btn{cursor:pointer;transition:transform 300ms cubic-bezier(0.22,1,0.36,1),opacity 300ms cubic-bezier(0.22,1,0.36,1)}
+.btn:hover{opacity:.88}.btn:active{transform:scale(.98)}
+.btn:focus-visible,.nav:focus-visible,.field:focus-visible,a:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+.field::placeholder{color:var(--fg-3)}
+@media (prefers-reduced-motion: reduce){.btn,.nav{transition:none}}
+</style>
+</helmet>
+<div class="{{themeClass}}" style="min-height: 100vh; box-sizing: border-box; background: var(--bg); color: var(--fg); font-family: Geist, system-ui, sans-serif; display: flex; flex-wrap: wrap">
+
+  <nav aria-label="Main" style="flex: 1 1 232px; box-sizing: border-box; padding: 24px 16px; display: flex; flex-direction: column; gap: 32px">
+    <a href="AppsList.dc.html" style="display: flex; padding: 0 8px"><img class="logo-dark" src="./assets/314e2e750f0551a6a57b030ba132d194.svg" alt="Utir" style="height: 28px; width: auto"><img class="logo-light" src="./assets/4c03c898973e66979b997f421da99055.svg" alt="Utir" style="height: 28px; width: auto"></a>
+    <div style="display: flex; flex-direction: column; gap: 4px">
+      <a class="nav" href="AppsList.dc.html" aria-current="page" style="display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: 10px; background: var(--surface-3); color: var(--fg); font-size: 14px; font-weight: 500">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"></rect><rect x="13" y="4" width="7" height="7" rx="1.5"></rect><rect x="4" y="13" width="7" height="7" rx="1.5"></rect><rect x="13" y="13" width="7" height="7" rx="1.5"></rect></svg>
+        Apps
+      </a>
+      <a class="nav" href="ApiKeys.dc.html" style="display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: 10px; color: var(--fg-2); font-size: 14px; font-weight: 500">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="M11 12l9-9M17 6l3 3"></path></svg>
+        API keys
+      </a>
+      <a class="nav" href="#settings" style="display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: 10px; color: var(--fg-2); font-size: 14px; font-weight: 500">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"></path></svg>
+        Settings
+      </a>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px">
+      <span style="padding: 0 12px 8px; font-size: 12px; line-height: 16px; font-weight: 500; color: var(--fg-3)">Admin</span>
+      <a class="nav" href="AdminOverview.dc.html" style="display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: 10px; color: var(--fg-2); font-size: 14px; font-weight: 500">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3Z"></path></svg>
+        Overview
+      </a>
+      <a class="nav" href="AdminActivity.dc.html" style="display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: 10px; color: var(--fg-2); font-size: 14px; font-weight: 500">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"></path></svg>
+        Activity
+      </a>
+    </div>
+    <div role="group" aria-label="Appearance" style="margin-top: auto; display: flex; gap: 4px; padding: 4px; border-radius: 10px; background: var(--surface)"><button class="btn" type="button" aria-pressed="{{darkPressed}}" onClick="{{pickDark}}" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0; background: {{darkBg}}; color: {{darkFg}}; font: 500 12px/16px Geist, system-ui, sans-serif"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"></path></svg>Dark</button><button class="btn" type="button" aria-pressed="{{lightPressed}}" onClick="{{pickLight}}" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0; background: {{lightBg}}; color: {{lightFg}}; font: 500 12px/16px Geist, system-ui, sans-serif"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>Light</button><button class="btn" type="button" aria-pressed="{{systemPressed}}" onClick="{{pickSystem}}" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0; background: {{systemBg}}; color: {{systemFg}}; font: 500 12px/16px Geist, system-ui, sans-serif"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg>System</button></div>
+    <div style="display: flex; align-items: center; gap: 12px; padding: 8px">
+      <span aria-hidden="true" style="width: 32px; height: 32px; border-radius: 999px; background: var(--surface-3); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600">FP</span>
+      <span style="display: flex; flex-direction: column"><span style="font-size: 14px; line-height: 20px; font-weight: 500">Fenil Patel</span><span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Personal workspace</span></span>
+    </div>
+  </nav>
+
+  <main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 32px 48px 64px; display: flex; flex-direction: column; gap: 32px">
+    <nav aria-label="Breadcrumb" style="display: flex; align-items: center; gap: 8px; font-size: 13px; line-height: 16px; color: var(--fg-3)">
+      <a href="AppsList.dc.html" style="color: var(--fg-2)">Apps</a><span aria-hidden="true">/</span><span aria-current="page" style="color: var(--fg)">invoice-helper</span>
+    </nav>
+
+    <header style="display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 24px">
+      <div style="display: flex; flex-direction: column; gap: 8px; min-width: 0">
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+          <h1 style="margin: 0; font-size: 30px; line-height: 36px; font-weight: 600; letter-spacing: -0.02em">invoice-helper</h1>
+          <span style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 12px; border-radius: 999px; background: var(--surface-2); font-size: 13px; font-weight: 500"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 999px; background: var(--green)"></span>Live</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px">
+          <a href="https://ssc-7f3k2m9q.fly.dev" style="font-family: 'Geist Mono', ui-monospace, monospace; font-size: 13px; line-height: 20px; color: var(--fg-2)">https://ssc-7f3k2m9q.fly.dev</a>
+          <button class="btn" type="button" aria-label="Copy link" style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 8px; border: 0; background: transparent; color: var(--fg-3)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a1 1 0 0 1 1-1h9"></path></svg>
+          </button>
+        </div>
+      </div>
+      <div style="display: flex; gap: 12px; flex-wrap: wrap">
+        <a class="btn" href="https://ssc-7f3k2m9q.fly.dev" style="display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 16px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line-strong); box-sizing: border-box; color: var(--fg); font-size: 14px; font-weight: 500">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"></path></svg>
+          Open app
+        </a>
+        <button class="btn" type="button" style="display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 16px; border-radius: 10px; border: 0; background: var(--btn-bg); color: var(--btn-fg); font: 600 14px/20px Geist, system-ui, sans-serif">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"></circle><path d="M2.5 20c.8-3.5 3.4-5.5 6.5-5.5s5.7 2 6.5 5.5M19 8v6M16 11h6"></path></svg>
+          Share
+        </button>
+      </div>
+    </header>
+
+    <section aria-label="Summary" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px">
+      <div style="padding: 20px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px">
+        <span style="font-size: 13px; line-height: 16px; color: var(--fg-2)">Visits, last 7 days</span>
+        <span style="font-size: 28px; line-height: 32px; font-weight: 600; font-variant-numeric: tabular-nums">214</span>
+        <span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">From 3 people</span>
+      </div>
+      <div style="padding: 20px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px">
+        <span style="font-size: 13px; line-height: 16px; color: var(--fg-2)">People with access</span>
+        <span style="font-size: 28px; line-height: 32px; font-weight: 600; font-variant-numeric: tabular-nums">3</span>
+        <span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">1 invite waiting</span>
+      </div>
+      <div style="padding: 20px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px">
+        <span style="font-size: 13px; line-height: 16px; color: var(--fg-2)">Last deploy</span>
+        <span style="font-size: 28px; line-height: 32px; font-weight: 600">12 min ago</span>
+        <span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Built in 41 s</span>
+      </div>
+      <div style="padding: 20px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px">
+        <span style="font-size: 13px; line-height: 16px; color: var(--fg-2)">Health check</span>
+        <span style="font-size: 28px; line-height: 32px; font-weight: 600">Private</span>
+        <span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Sign in required · checked 1 min ago</span>
+      </div>
+    </section>
+
+    <div style="display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start">
+
+      <section aria-labelledby="deploys-h" style="flex: 2 1 520px; min-width: 0; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); overflow: hidden">
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 20px 24px">
+          <h2 id="deploys-h" style="margin: 0; font-size: 16px; line-height: 24px; font-weight: 600">Deployments</h2>
+          <span style="font-size: 13px; color: var(--fg-3)">14 total</span>
+        </div>
+
+        <div style="display: flex; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--line)">
+          <span aria-hidden="true" style="margin-top: 6px; width: 8px; height: 8px; flex: none; border-radius: 999px; background: var(--green)"></span>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px">
+            <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline"><span style="font-size: 14px; font-weight: 500">Version 14</span><span style="font-size: 13px; color: var(--fg)">Live</span></div>
+            <span style="font-size: 13px; line-height: 20px; color: var(--fg-3)">12 min ago · from the terminal · built in 41 s</span>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--line)">
+          <span aria-hidden="true" style="margin-top: 6px; width: 8px; height: 8px; flex: none; border-radius: 999px; background: transparent; border: 1.5px solid var(--fg-3); box-sizing: border-box"></span>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px">
+            <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline"><span style="font-size: 14px; font-weight: 500">Version 13</span><span style="font-size: 13px; color: var(--fg-3)">Replaced</span></div>
+            <span style="font-size: 13px; line-height: 20px; color: var(--fg-3)">2 hours ago · from Claude · built in 38 s</span>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--line)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" aria-hidden="true" style="stroke: var(--red); margin-top: 3px; flex: none"><circle cx="12" cy="12" r="9"></circle><path d="M9 9l6 6M15 9l-6 6"></path></svg>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px">
+            <div style="display: flex; flex-direction: column; gap: 4px">
+              <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline"><span style="font-size: 14px; font-weight: 500">Version 12</span><span style="font-size: 13px; color: var(--red)">Failed</span></div>
+              <span style="font-size: 13px; line-height: 20px; color: var(--fg-3)">Yesterday at 9:47 PM · from the terminal</span>
+            </div>
+            <div style="padding: 16px; border-radius: 12px; background: var(--bg); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px">
+              <span style="font-size: 14px; line-height: 20px; font-weight: 500">Your app did not start in time</span>
+              <span style="font-size: 13px; line-height: 20px; color: var(--fg-2)">It built fine, but nothing answered on the expected port within 60 seconds. Make sure your server listens on the port in the PORT variable, then deploy again.</span>
+              <a href="#logs" style="align-self: flex-start; font-size: 13px; font-weight: 500; color: var(--fg); text-decoration: underline; text-underline-offset: 3px">View build log</a>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--line)">
+          <span aria-hidden="true" style="margin-top: 6px; width: 8px; height: 8px; flex: none; border-radius: 999px; border: 1.5px solid var(--fg-3); box-sizing: border-box"></span>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px">
+            <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline"><span style="font-size: 14px; font-weight: 500">Version 11</span><span style="font-size: 13px; color: var(--fg-3)">Replaced</span></div>
+            <span style="font-size: 13px; line-height: 20px; color: var(--fg-3)">Nov 12 · from the terminal · built in 44 s</span>
+          </div>
+        </div>
+        <div style="padding: 12px 24px 20px; border-top: 1px solid var(--line)">
+          <button class="btn" type="button" style="height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--fg-2); font: 500 13px/16px Geist, system-ui, sans-serif">Show all 14</button>
+        </div>
+      </section>
+
+      <div style="flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 24px">
+        <section aria-labelledby="access-h" style="border-radius: 16px; background: var(--surface); border: 1px solid var(--line); padding: 20px 24px 24px; display: flex; flex-direction: column; gap: 16px">
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <h2 id="access-h" style="margin: 0; font-size: 16px; line-height: 24px; font-weight: 600">Who can open it</h2>
+            <p style="margin: 0; font-size: 13px; line-height: 20px; color: var(--fg-3)">Only people on this list get in. They sign in with the email you add.</p>
+          </div>
+          <form style="display: flex; gap: 8px; margin: 0">
+            <label for="invite" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Email to share with</label>
+            <input class="field" id="invite" type="email" placeholder="name@example.com" style="flex: 1; min-width: 0; height: 40px; box-sizing: border-box; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--bg); color: var(--fg); padding: 0 12px; font: 400 14px/20px Geist, system-ui, sans-serif">
+            <button class="btn" type="submit" style="height: 40px; padding: 0 16px; border-radius: 10px; border: 0; background: var(--btn-bg); color: var(--btn-fg); font: 600 14px/20px Geist, system-ui, sans-serif">Add</button>
+          </form>
+          <ul style="list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column">
+            <li style="display: flex; align-items: center; gap: 12px; padding: 12px 0">
+              <span aria-hidden="true" style="width: 32px; height: 32px; flex: none; border-radius: 999px; background: var(--surface-3); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600">M</span>
+              <span style="flex: 1; min-width: 0; display: flex; flex-direction: column"><span style="font-size: 14px; line-height: 20px">maya@example.com</span><span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Opened 3 hours ago</span></span>
+              <button class="btn" type="button" aria-label="Remove maya@example.com" style="width: 32px; height: 32px; border-radius: 8px; border: 0; background: transparent; color: var(--fg-3); display: flex; align-items: center; justify-content: center"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
+            </li>
+            <li style="display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line)">
+              <span aria-hidden="true" style="width: 32px; height: 32px; flex: none; border-radius: 999px; background: var(--surface-3); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600">J</span>
+              <span style="flex: 1; min-width: 0; display: flex; flex-direction: column"><span style="font-size: 14px; line-height: 20px">jordan@example.com</span><span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Opened yesterday</span></span>
+              <button class="btn" type="button" aria-label="Remove jordan@example.com" style="width: 32px; height: 32px; border-radius: 8px; border: 0; background: transparent; color: var(--fg-3); display: flex; align-items: center; justify-content: center"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
+            </li>
+            <li style="display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line)">
+              <span aria-hidden="true" style="width: 32px; height: 32px; flex: none; border-radius: 999px; border: 1px dashed var(--fg-3); box-sizing: border-box; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: var(--fg-2)">S</span>
+              <span style="flex: 1; min-width: 0; display: flex; flex-direction: column"><span style="font-size: 14px; line-height: 20px">sam@example.com</span><span style="font-size: 12px; line-height: 16px; color: var(--fg-3)">Invited, has not signed in yet</span></span>
+              <button class="btn" type="button" aria-label="Cancel invite for sam@example.com" style="width: 32px; height: 32px; border-radius: 8px; border: 0; background: transparent; color: var(--fg-3); display: flex; align-items: center; justify-content: center"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
+            </li>
+          </ul>
+        </section>
+
+        <section aria-labelledby="act-h" style="border-radius: 16px; background: var(--surface); border: 1px solid var(--line); padding: 20px 24px 24px; display: flex; flex-direction: column; gap: 16px">
+          <h2 id="act-h" style="margin: 0; font-size: 16px; line-height: 24px; font-weight: 600">Recent activity</h2>
+          <ol style="list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 16px">
+            <li style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px; line-height: 20px"><span>maya@example.com opened the app</span><span style="color: var(--fg-3); white-space: nowrap">3 h</span></li>
+            <li style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px; line-height: 20px"><span>You deployed version 14</span><span style="color: var(--fg-3); white-space: nowrap">12 min</span></li>
+            <li style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px; line-height: 20px"><span>You invited sam@example.com</span><span style="color: var(--fg-3); white-space: nowrap">1 d</span></li>
+            <li style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px; line-height: 20px"><span style="color: var(--orange)">Blocked a sign in from a person not on the list</span><span style="color: var(--fg-3); white-space: nowrap">2 d</span></li>
+          </ol>
+        </section>
+      </div>
+    </div>
+
+    <section aria-labelledby="danger-h" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 24px; border-radius: 16px; background: var(--surface); border: 1px solid var(--danger-line)">
+      <div style="display: flex; flex-direction: column; gap: 4px">
+        <h2 id="danger-h" style="margin: 0; font-size: 16px; line-height: 24px; font-weight: 600">Delete this app</h2>
+        <p style="margin: 0; font-size: 14px; line-height: 20px; color: var(--fg-2)">Removes the app, its link and every deployment. This cannot be undone.</p>
+      </div>
+      <button class="btn" type="button" style="height: 40px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--red); background: transparent; color: var(--red); font: 600 14px/20px Geist, system-ui, sans-serif">Delete app</button>
+    </section>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light","system"],"default":"dark"},"$preview":{"width":1440,"height":1560}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const theme = (this.state && this.state.theme) || this.props.theme || 'dark';
+    const pick = (t) => () => this.setState({ theme: t });
+    const v = {};
+    ['dark', 'light', 'system'].forEach((t) => {
+      v[t + 'Bg'] = theme === t ? 'var(--surface-4)' : 'transparent';
+      v[t + 'Fg'] = theme === t ? 'var(--fg)' : 'var(--fg-2)';
+      v[t + 'Pressed'] = theme === t ? 'true' : 'false';
+    });
+    return Object.assign(v, { themeClass: 't-' + theme, pickDark: pick('dark'), pickLight: pick('light'), pickSystem: pick('system') });
+  }
+}
+</script>
+</body>
+</html>

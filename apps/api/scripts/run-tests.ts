@@ -9183,6 +9183,414 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AL: Dashboard endpoints — apps status fields + deployments list + delete security");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // ── Seed: insert a test app + two deployments under org A ─────────────────
+    const alAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, status)
+       VALUES ($1, $2, 'AL Test App', 'al-test-app', 'running') RETURNING id`,
+      [orgAId, userId],
+    );
+    const alAppId = alAppRow.rows[0].id;
+
+    // Older deployment (failed)
+    await pool.query(
+      `INSERT INTO deployments (app_id, version, status, started_at, finished_at, failure_stage, failure_message)
+       VALUES ($1, 1, 'failed', now() - interval '10 minutes', now() - interval '5 minutes', 'build', 'Build error: missing dependency')`,
+      [alAppId],
+    );
+    // Newer deployment (success) — this becomes latest_deployment_status
+    await pool.query(
+      `INSERT INTO deployments (app_id, version, status, started_at, finished_at)
+       VALUES ($1, 2, 'success', now() - interval '2 minutes', now() - interval '1 minute')`,
+      [alAppId],
+    );
+
+    // Create a Clerk admin and member for AL tests
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email) VALUES ($1,$2),($3,$4) ON CONFLICT (clerk_user_id) DO NOTHING",
+      ["clerk_al_admin", "al-admin@test.local", "clerk_al_member", "al-member@test.local"],
+    );
+
+    // Create fresh keys for AL tests. keyA and keyB may have been revoked by the
+    // AI5c reconciliation (seed user has no configured Clerk membership in the stub).
+    const alReadKeyData = generateApiKey();
+    const alDeployKeyData = generateApiKey();
+    const alManageKeyData = generateApiKey();
+    const alOrgBKeyData = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'al-read-key',$3,$4,'{read,deploy,manage}'),
+              ($1,$2,'al-deploy-key',$5,$6,'{deploy}'),
+              ($1,$2,'al-manage-key',$7,$8,'{read,deploy,manage}')`,
+      [orgAId, userId,
+       alReadKeyData.keyPrefix, alReadKeyData.keyHash,
+       alDeployKeyData.keyPrefix, alDeployKeyData.keyHash,
+       alManageKeyData.keyPrefix, alManageKeyData.keyHash],
+    );
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'al-orgb-key',$3,$4,'{read,deploy,manage}')`,
+      [orgBId, userId, alOrgBKeyData.keyPrefix, alOrgBKeyData.keyHash],
+    );
+    const alReadKey = alReadKeyData.fullKey;
+    const alDeployKey = alDeployKeyData.fullKey;
+    const alManageKey = alManageKeyData.fullKey;
+    const alOrgBKey = alOrgBKeyData.fullKey;
+
+    // AL1: GET /v1/apps returns status, latest_deployment_status, last_deployed_at
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(alReadKey) });
+      r.status === 200
+        ? ok("AL1: GET /v1/apps → 200")
+        : fail("AL1: GET /v1/apps should 200", `got ${r.status}`);
+      const apps = r.body as Array<Record<string, unknown>>;
+      const alApp = apps.find((a) => a.id === alAppId);
+      alApp
+        ? ok("AL1: test app present in list")
+        : fail("AL1: test app missing from list");
+      if (alApp) {
+        "status" in alApp
+          ? ok("AL1: app.status field present")
+          : fail("AL1: app.status missing from list response");
+        "latest_deployment_status" in alApp
+          ? ok("AL1: app.latest_deployment_status field present")
+          : fail("AL1: app.latest_deployment_status missing");
+        "last_deployed_at" in alApp
+          ? ok("AL1: app.last_deployed_at field present")
+          : fail("AL1: app.last_deployed_at missing");
+        alApp.latest_deployment_status === "success"
+          ? ok("AL1: latest_deployment_status = 'success' (newest deploy wins)")
+          : fail("AL1: wrong latest_deployment_status", String(alApp.latest_deployment_status));
+        alApp.last_deployed_at !== null
+          ? ok("AL1: last_deployed_at is non-null")
+          : fail("AL1: last_deployed_at should not be null");
+      }
+    }
+
+    // AL2: GET /v1/apps/:id returns same new fields
+    {
+      const r = await request("GET", `/v1/apps/${alAppId}`, { headers: authHeaders(alReadKey) });
+      r.status === 200
+        ? ok("AL2: GET /v1/apps/:id → 200")
+        : fail("AL2: should 200", `got ${r.status}`);
+      const app = r.body as Record<string, unknown>;
+      "status" in app && "latest_deployment_status" in app && "last_deployed_at" in app
+        ? ok("AL2: status/latest_deployment_status/last_deployed_at present in single-app response")
+        : fail("AL2: missing fields in single-app response", JSON.stringify(Object.keys(app)));
+    }
+
+    // AL3: GET /v1/apps/:id/deployments returns list newest-first
+    {
+      const r = await request("GET", `/v1/apps/${alAppId}/deployments`, { headers: authHeaders(alReadKey) });
+      r.status === 200
+        ? ok("AL3: GET /v1/apps/:id/deployments → 200")
+        : fail("AL3: should 200", `got ${r.status}`);
+      const deps = r.body as Array<Record<string, unknown>>;
+      deps.length === 2
+        ? ok("AL3: 2 deployments returned")
+        : fail("AL3: expected 2 deployments", `got ${deps.length}`);
+      deps[0]?.status === "success"
+        ? ok("AL3: first item is newest (success)")
+        : fail("AL3: deployments not ordered newest-first", String(deps[0]?.status));
+      "failure_stage" in (deps[1] ?? {}) && "failure_message" in (deps[1] ?? {})
+        ? ok("AL3: failure_stage/failure_message present on deployment rows")
+        : fail("AL3: failure_stage or failure_message missing");
+    }
+
+    // AL4: GET /v1/apps/:id/deployments — cross-org returns 404
+    {
+      const r = await request("GET", `/v1/apps/${alAppId}/deployments`, { headers: authHeaders(alOrgBKey) });
+      r.status === 404
+        ? ok("AL4: cross-org deployments list → 404")
+        : fail("AL4: cross-org should 404", `got ${r.status}`);
+    }
+
+    // AL5: GET /v1/apps/:id/deployments — unauthenticated → 401
+    {
+      const r = await request("GET", `/v1/apps/${alAppId}/deployments`);
+      r.status === 401
+        ? ok("AL5: unauthenticated deployments list → 401")
+        : fail("AL5: should 401", `got ${r.status}`);
+    }
+
+    // AL6: DELETE security — Clerk member → 403 (org_admin_required)
+    {
+      const r = await request("DELETE", `/v1/apps/${alAppId}`, {
+        headers: {
+          "x-test-clerk-user-id": "clerk_al_member",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:member",
+        },
+      });
+      r.status === 403
+        ? ok("AL6: Clerk member DELETE app → 403")
+        : fail("AL6: member should 403", `got ${r.status} ${JSON.stringify(r.body)}`);
+      (r.body as Record<string, unknown>).error === "org_admin_required"
+        ? ok("AL6: error = org_admin_required")
+        : fail("AL6: wrong error code", JSON.stringify(r.body));
+    }
+
+    // AL7: DELETE security — deploy-only API key → 403 (insufficient scope)
+    {
+      const r = await request("DELETE", `/v1/apps/${alAppId}`, {
+        headers: authHeaders(alDeployKey),
+      });
+      r.status === 403
+        ? ok("AL7: deploy-only key DELETE app → 403")
+        : fail("AL7: deploy-only key should 403", `got ${r.status}`);
+    }
+
+    // AL8: DELETE security — manage API key → 200
+    {
+      // First create another app to delete so the main alAppId stays intact for AL9
+      const delAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, status)
+         VALUES ($1, $2, 'AL Delete App', 'al-delete-app', 'running') RETURNING id`,
+        [orgAId, userId],
+      );
+      const delAppId = delAppRow.rows[0].id;
+
+      const r = await request("DELETE", `/v1/apps/${delAppId}`, {
+        headers: authHeaders(alManageKey),
+      });
+      r.status === 200
+        ? ok("AL8: manage key DELETE app → 200")
+        : fail("AL8: manage key should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AL9: DELETE security — Clerk admin → 200
+    {
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: "clerk_al_admin", email: "al-admin@test.local", verified: true },
+      });
+      const r = await request("DELETE", `/v1/apps/${alAppId}`, {
+        headers: {
+          "x-test-clerk-user-id": "clerk_al_admin",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      r.status === 200
+        ? ok("AL9: Clerk admin DELETE app → 200")
+        : fail("AL9: admin should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AL10: M7 — after Clerk member delete attempt is blocked, app still exists
+    {
+      // Create another app then try member delete → app must still exist
+      const guardAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, status)
+         VALUES ($1, $2, 'AL Guard App', 'al-guard-app', 'running') RETURNING id`,
+        [orgAId, userId],
+      );
+      const guardAppId = guardAppRow.rows[0].id;
+
+      await request("DELETE", `/v1/apps/${guardAppId}`, {
+        headers: {
+          "x-test-clerk-user-id": "clerk_al_member",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:member",
+        },
+      });
+
+      const check = await pool.query<{ deleted_at: string | null }>(
+        "SELECT deleted_at FROM apps WHERE id = $1",
+        [guardAppId],
+      );
+      check.rows[0]?.deleted_at === null
+        ? ok("AL10 (M7): member-blocked delete — app not soft-deleted")
+        : fail("AL10 (M7): app was deleted despite 403");
+
+      // cleanup
+      await pool.query("DELETE FROM apps WHERE id = $1", [guardAppId]);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AN: Mutation killing — M1 (apps list org isolation), M2 (API key → key routes 403), M4 (key list no hash)");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // Create a fresh org A key for AN tests (keyA may be revoked by AI5c reconciliation)
+    const anOrgAKeyData = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'an-orga-key',$3,$4,'{read,deploy,manage}')`,
+      [orgAId, userId, anOrgAKeyData.keyPrefix, anOrgAKeyData.keyHash],
+    );
+    const anOrgAKey = anOrgAKeyData.fullKey;
+
+    // ── Seed: app owned by org B to verify it never leaks into org A list ────
+    const anBAppRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, status)
+       VALUES ($1, $2, 'AN OrgB App', 'an-orgb-app', 'running') RETURNING id`,
+      [orgBId, userId],
+    );
+    const anBAppId = anBAppRow.rows[0].id;
+
+    // AN1 (M1 killer): GET /v1/apps with org A key must NOT return org B's app
+    {
+      const r = await request("GET", "/v1/apps", { headers: authHeaders(anOrgAKey) });
+      r.status === 200
+        ? ok("AN1 (M1): GET /v1/apps → 200")
+        : fail("AN1 (M1): GET /v1/apps should 200", `got ${r.status}`);
+      const apps = r.body as Array<Record<string, unknown>>;
+      !apps.some((a) => a.id === anBAppId)
+        ? ok("AN1 (M1): org B app absent from org A list")
+        : fail("AN1 (M1): org B app leaked into org A list — M1 mutation not killed");
+    }
+
+    // AN2 (M1 killer): GET /v1/apps/:id/deployments cross-org with org A key → 404
+    {
+      const r = await request("GET", `/v1/apps/${anBAppId}/deployments`, { headers: authHeaders(anOrgAKey) });
+      r.status === 404
+        ? ok("AN2 (M1): GET /v1/apps/:id/deployments cross-org → 404")
+        : fail("AN2 (M1): cross-org deployments should 404", `got ${r.status}`);
+    }
+
+    // cleanup org B app
+    await pool.query("DELETE FROM apps WHERE id = $1", [anBAppId]);
+
+    // ── Seed: a read-scope and manage-scope key for M2 killing tests ─────────
+    const anReadKeyData = generateApiKey();
+    const anManageKeyData = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'an-read-key',$3,$4,'{read}'), ($1,$2,'an-manage-key',$5,$6,'{read,deploy,manage}')`,
+      [orgAId, userId, anReadKeyData.keyPrefix, anReadKeyData.keyHash, anManageKeyData.keyPrefix, anManageKeyData.keyHash],
+    );
+    const anReadKey = anReadKeyData.fullKey;
+    const anManageKey = anManageKeyData.fullKey;
+
+    // AN3 (M2 killer): read-scope API key → POST /v1/api-keys → 403 clerk_session_required
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: authHeaders(anReadKey),
+        body: { name: "should-fail" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "clerk_session_required"
+        ? ok("AN3 (M2): read-scope key → POST /v1/api-keys → 403 clerk_session_required")
+        : fail("AN3 (M2): read-scope key on key-create should 403", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AN4 (M2 killer): manage-scope API key → POST /v1/api-keys → 403 clerk_session_required
+    // (all API key types are blocked; only Clerk admin sessions may manage keys)
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: authHeaders(anManageKey),
+        body: { name: "should-fail" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "clerk_session_required"
+        ? ok("AN4 (M2): manage-scope key → POST /v1/api-keys → 403 clerk_session_required")
+        : fail("AN4 (M2): manage-scope key on key-create should 403", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AN5 (M2 killer): read-scope API key → DELETE /v1/api-keys/:id → 403 clerk_session_required
+    {
+      // Use a fake UUID — auth check fires before the resource lookup
+      const fakeKeyId = crypto.randomUUID();
+      const r = await request("DELETE", `/v1/api-keys/${fakeKeyId}`, {
+        headers: authHeaders(anReadKey),
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "clerk_session_required"
+        ? ok("AN5 (M2): read-scope key → DELETE /v1/api-keys/:id → 403 clerk_session_required")
+        : fail("AN5 (M2): read-scope key on key-delete should 403", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AN6 (M4 killer): GET /v1/api-keys response does not expose key_hash
+    // Uses Clerk admin session via x-test-clerk-* headers (the route requires clerk + org:admin)
+    {
+      const anClerkAdminHeaders = {
+        "x-test-clerk-user-id": "clerk_an_admin",
+        "x-test-clerk-org-id": "clerk_org_an",
+        "x-test-clerk-org-role": "org:admin",
+      };
+      // Ensure the user exists so ensureUser doesn't fail
+      await pool.query(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,$2) ON CONFLICT (clerk_user_id) DO NOTHING",
+        ["clerk_an_admin", "an-admin@test.local"],
+      );
+      const r = await request("GET", "/v1/api-keys", { headers: anClerkAdminHeaders });
+      if (r.status !== 200) {
+        fail("AN6 (M4): GET /v1/api-keys should 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+      } else {
+        const keys = r.body as Array<Record<string, unknown>>;
+        const hasHash = keys.some((k) => "key_hash" in k);
+        !hasHash
+          ? ok("AN6 (M4): GET /v1/api-keys response does not expose key_hash")
+          : fail("AN6 (M4): key_hash leaked in GET /v1/api-keys response — M4 mutation not killed");
+        const hasFullKey = keys.some((k) => typeof k.key === "string" && (k.key as string).length > 20);
+        !hasFullKey
+          ? ok("AN6 (M4): GET /v1/api-keys response does not expose full key material")
+          : fail("AN6 (M4): full key material in GET /v1/api-keys response");
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AM: Lockfile drift — package-lock.json vs pnpm-lock.yaml runtime dep versions");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    const repoRoot = path.resolve(__dirname, "../../..");
+    const npmLockPath = path.join(repoRoot, "apps/api/package-lock.json");
+    const pnpmLockPath = path.join(repoRoot, "pnpm-lock.yaml");
+
+    if (!fs.existsSync(npmLockPath)) {
+      fail("AM: apps/api/package-lock.json not found — cannot check drift");
+    } else if (!fs.existsSync(pnpmLockPath)) {
+      fail("AM: pnpm-lock.yaml not found — cannot check drift");
+    } else {
+      // Parse npm lockfile v2/v3: packages["node_modules/<name>"].version for non-dev entries
+      const npmLock = JSON.parse(fs.readFileSync(npmLockPath, "utf8")) as {
+        lockfileVersion: number;
+        packages?: Record<string, { version?: string; dev?: boolean; devOptional?: boolean }>;
+      };
+      const npmRuntime = new Map<string, string>();
+      if (npmLock.packages) {
+        for (const [key, entry] of Object.entries(npmLock.packages)) {
+          if (!key.startsWith("node_modules/")) continue;
+          if (entry.dev || entry.devOptional) continue;
+          if (!entry.version) continue;
+          // Strip scoped-package handling: "node_modules/@scope/pkg" → "@scope/pkg"
+          const name = key.slice("node_modules/".length);
+          if (name.includes("node_modules/")) continue; // nested dep, skip
+          npmRuntime.set(name, entry.version);
+        }
+      }
+
+      // Parse pnpm lockfile: look for "/<name>@<version>" or "/name/<version>" lines
+      // pnpm-lock.yaml v6+: "  /<pkg>@<ver>:" or "  /<pkg>/<ver>:"
+      const pnpmText = fs.readFileSync(pnpmLockPath, "utf8");
+      const pnpmVersions = new Map<string, string>();
+      // Match lines like: "  /express@4.18.2:" or "  /@types/node@18.0.0:"
+      const pnpmLineRe = /^  \/((?:@[^/]+\/)?[^@/]+)@([^\s:]+):/gm;
+      let m: RegExpExecArray | null;
+      while ((m = pnpmLineRe.exec(pnpmText)) !== null) {
+        const [, name, ver] = m;
+        if (!pnpmVersions.has(name)) pnpmVersions.set(name, ver);
+      }
+
+      // Check: for every runtime dep in npm lockfile, if pnpm has it, versions must match
+      const drifted: string[] = [];
+      for (const [name, npmVer] of npmRuntime) {
+        const pnpmVer = pnpmVersions.get(name);
+        if (pnpmVer && pnpmVer !== npmVer) {
+          drifted.push(`${name}: npm=${npmVer} pnpm=${pnpmVer}`);
+        }
+      }
+
+      npmRuntime.size > 0
+        ? ok(`AM1: package-lock.json parsed (${npmRuntime.size} runtime deps)`)
+        : fail("AM1: no runtime deps found in package-lock.json");
+
+      drifted.length === 0
+        ? ok("AM2: no runtime dep version drift between package-lock.json and pnpm-lock.yaml")
+        : fail("AM2: lockfile drift detected", drifted.slice(0, 5).join("; "));
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));
