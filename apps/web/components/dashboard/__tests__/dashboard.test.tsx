@@ -7,24 +7,36 @@
  * org:member, failure_message XSS safety + 500-char truncation, workspace
  * switcher (M: switcher), onboarding name validation (M5), no emoji anywhere.
  *
- * M6 (dashboard layout auth check) is verified via static source inspection.
+ * M6 (dashboard layout auth check) is verified via behaviour tests.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
-import fs from "fs";
-import path from "path";
 
 // ── Global mocks ──────────────────────────────────────────────────────────────
 
 const mockRouterRefresh = vi.fn();
 const mockRouterReplace = vi.fn();
+const mockRedirect = vi.fn();
+const mockServerAuth = vi.fn();
+const mockCurrentUser = vi.fn();
+const mockCookies = vi.fn();
 
 vi.mock("next/navigation", () => ({
   useRouter: vi.fn(() => ({ refresh: mockRouterRefresh, replace: mockRouterReplace })),
   usePathname: vi.fn(() => "/apps"),
   useSearchParams: vi.fn(() => ({ get: () => null })),
+  redirect: (url: string) => { mockRedirect(url); throw new Error("NEXT_REDIRECT"); },
+}));
+
+vi.mock("@clerk/nextjs/server", () => ({
+  auth: () => mockServerAuth(),
+  currentUser: () => mockCurrentUser(),
+}));
+
+vi.mock("next/headers", () => ({
+  cookies: () => mockCookies(),
 }));
 
 const mockSetActive = vi.fn();
@@ -98,6 +110,10 @@ vi.mock("../../../app/(dashboard)/keys/actions", () => ({
 beforeEach(() => {
   mockRouterRefresh.mockReset();
   mockRouterReplace.mockReset();
+  mockRedirect.mockReset();
+  mockServerAuth.mockReset().mockResolvedValue({ userId: "user_test", orgId: "org_test" });
+  mockCurrentUser.mockReset().mockResolvedValue({ firstName: null });
+  mockCookies.mockReset().mockResolvedValue({ get: () => undefined });
   mockSetActive.mockReset().mockResolvedValue(undefined);
   mockDeleteApp.mockReset().mockResolvedValue({});
   mockGrantAccess.mockReset().mockResolvedValue({});
@@ -541,6 +557,7 @@ describe("Sidebar – workspace switcher", () => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 import { OnboardingClient } from "../../../app/(onboarding)/onboarding/OnboardingClient";
+import OnboardingPage from "../../../app/(onboarding)/onboarding/page";
 
 describe("OnboardingClient – M5: name validation", () => {
   it("M5: empty name keeps Continue button disabled", () => {
@@ -584,34 +601,34 @@ describe("OnboardingClient – M5: name validation", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// M6 – dashboard layout contains auth check (static source inspection)
+// M6 – DashboardLayout auth guards (behaviour)
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe("M6: dashboard layout auth check (static)", () => {
-  const layoutPath = path.resolve(
-    __dirname,
-    "../../../app/(dashboard)/layout.tsx",
-  );
+import DashboardLayout from "../../../app/(dashboard)/layout";
 
-  it("M6: layout file exists", () => {
-    expect(fs.existsSync(layoutPath)).toBe(true);
+describe("M6: DashboardLayout – auth guards (behaviour)", () => {
+  it("M6: no userId → redirects to /sign-in", async () => {
+    mockServerAuth.mockResolvedValue({ userId: null, orgId: null });
+    await expect(
+      DashboardLayout({ children: React.createElement("div") }),
+    ).rejects.toThrow("NEXT_REDIRECT");
+    expect(mockRedirect).toHaveBeenCalledWith("/sign-in");
   });
 
-  it("M6: layout calls auth()", () => {
-    const src = fs.readFileSync(layoutPath, "utf8");
-    expect(src).toMatch(/await auth\(\)/);
+  it("M6: userId but no orgId → redirects to /onboarding", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: null });
+    await expect(
+      DashboardLayout({ children: React.createElement("div") }),
+    ).rejects.toThrow("NEXT_REDIRECT");
+    expect(mockRedirect).toHaveBeenCalledWith("/onboarding");
   });
 
-  it("M6: layout checks for userId and redirects to /sign-in", () => {
-    const src = fs.readFileSync(layoutPath, "utf8");
-    expect(src).toMatch(/userId/);
-    expect(src).toMatch(/\/sign-in/);
-  });
-
-  it("M6: layout checks for orgId and redirects to /onboarding", () => {
-    const src = fs.readFileSync(layoutPath, "utf8");
-    expect(src).toMatch(/orgId/);
-    expect(src).toMatch(/\/onboarding/);
+  it("M6: userId and orgId → renders children without redirect", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
+    const jsx = await DashboardLayout({ children: React.createElement("div", { "data-testid": "child" }) });
+    render(jsx);
+    expect(screen.getByTestId("child")).toBeInTheDocument();
+    expect(mockRedirect).not.toHaveBeenCalled();
   });
 });
 
@@ -620,6 +637,7 @@ describe("M6: dashboard layout auth check (static)", () => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 import { ThemeSwitch } from "../../theme/ThemeSwitch";
+import SettingsPage from "../../../app/(dashboard)/settings/page";
 
 describe("ThemeSwitch – initialTheme prop (BUG 2)", () => {
   it("initialTheme=light → Light button aria-pressed=true", () => {
@@ -642,14 +660,18 @@ describe("ThemeSwitch – initialTheme prop (BUG 2)", () => {
     expect(screen.getByRole("button", { name: /light/i })).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("Settings page source reads utir-theme cookie and passes initialTheme to ThemeSwitch", () => {
-    const settingsPath = path.resolve(__dirname, "../../../app/(dashboard)/settings/page.tsx");
-    expect(fs.existsSync(settingsPath)).toBe(true);
-    const src = fs.readFileSync(settingsPath, "utf8");
-    expect(src).toMatch(/utir-theme/);
-    expect(src).toMatch(/parseTheme/);
-    // The parsed theme must be passed as a prop to ThemeSwitch, not just declared
-    expect(src).toMatch(/ThemeSwitch[^/]*initialTheme=/s);
+  it("BUG 2: cookie 'light' → SettingsPage passes initialTheme=light to ThemeSwitch", async () => {
+    mockCookies.mockResolvedValue({ get: (key: string) => key === "utir-theme" ? { value: "light" } : undefined });
+    const jsx = await SettingsPage();
+    render(jsx);
+    expect(screen.getByRole("button", { name: /light/i })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("BUG 2: cookie 'system' → SettingsPage passes initialTheme=system to ThemeSwitch", async () => {
+    mockCookies.mockResolvedValue({ get: (key: string) => key === "utir-theme" ? { value: "system" } : undefined });
+    const jsx = await SettingsPage();
+    render(jsx);
+    expect(screen.getByRole("button", { name: /system/i })).toHaveAttribute("aria-pressed", "true");
   });
 });
 
@@ -673,10 +695,21 @@ describe("OnboardingClient – forceNew=true (BUG 3)", () => {
     expect(screen.getByRole("heading", { name: /name your workspace/i })).toBeInTheDocument();
   });
 
-  it("BUG3: Onboarding page source skips redirect when ?new=1", () => {
-    const pagePath = path.resolve(__dirname, "../../../app/(onboarding)/onboarding/page.tsx");
-    const src = fs.readFileSync(pagePath, "utf8");
-    expect(src).toMatch(/forceNew/);
-    expect(src).toMatch(/new.*===.*"1"|"1".*===.*new/);
+  it("BUG3: ?new=1 with orgId → renders without redirect", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
+    mockCurrentUser.mockResolvedValue({ firstName: "Fenil" });
+    const jsx = await OnboardingPage({ searchParams: Promise.resolve({ new: "1" }) });
+    render(jsx);
+    expect(screen.getByRole("heading", { name: /create a workspace/i })).toBeInTheDocument();
+    expect(mockRedirect).not.toHaveBeenCalled();
+  });
+
+  it("BUG3: no ?new=1 with orgId → redirects to /apps", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
+    mockCurrentUser.mockResolvedValue({ firstName: null });
+    await expect(
+      OnboardingPage({ searchParams: Promise.resolve({}) }),
+    ).rejects.toThrow("NEXT_REDIRECT");
+    expect(mockRedirect).toHaveBeenCalledWith("/apps");
   });
 });
