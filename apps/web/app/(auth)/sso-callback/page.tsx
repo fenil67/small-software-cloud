@@ -24,6 +24,7 @@ export default function SsoCallbackPage() {
         signUpUrl="/sign-up"
         signInForceRedirectUrl={destination}
         signUpForceRedirectUrl={destination}
+        continueSignUpUrl="/sign-up"
       />
     </AuthCard>
   );

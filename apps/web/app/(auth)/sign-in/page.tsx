@@ -123,6 +123,14 @@ export default function SignInPage() {
       }
       return;
     }
+    // Guard: only finalize when Clerk has marked the sign-in complete.
+    if (signIn.status !== "complete") {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("[auth] sign in incomplete", signIn.status);
+      }
+      setFormError(authErrorMessage(null).message);
+      return;
+    }
     const { error: finalizeError } = await signIn.finalize();
     if (finalizeError) {
       warnClerkCode(finalizeError);

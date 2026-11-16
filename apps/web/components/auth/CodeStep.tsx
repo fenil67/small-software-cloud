@@ -66,7 +66,7 @@ export function CodeStep({
         We sent a 6 digit code to <span className="text-fg font-medium">{email}</span>
       </p>
       <label className="block text-sm font-medium text-fg-2 mb-1.5" htmlFor="code">
-        Verification code
+        Code
       </label>
       <input
         id="code"

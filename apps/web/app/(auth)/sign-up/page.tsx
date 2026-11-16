@@ -104,6 +104,19 @@ export default function SignUpPage() {
       }
       return;
     }
+    // Guard: only finalize when Clerk has marked the sign-up complete.
+    // Any other status (missing_requirements, abandoned) means requirements are
+    // unmet — calling finalize would throw Clerk's raw error text at the user.
+    if (signUp.status !== "complete") {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("[auth] sign up incomplete", {
+          missing: signUp.missingFields,
+          unverified: signUp.unverifiedFields,
+        });
+      }
+      setFormError(authErrorMessage(null).message);
+      return;
+    }
     const { error: finalizeError } = await signUp.finalize();
     if (finalizeError) {
       warnClerkCode(finalizeError);
