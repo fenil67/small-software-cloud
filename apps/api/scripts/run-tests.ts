@@ -9700,6 +9700,125 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AP: Brand-new Clerk org — lazy orgs row on first request; mutation (.bak)");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    const apClerkUserId = "clerk_ap_user";
+    const apClerkOrgId  = "clerk_org_ap_new"; // intentionally NOT pre-seeded in DB
+    const apClerkHeaders = {
+      "x-test-clerk-user-id": apClerkUserId,
+      "x-test-clerk-org-id":  apClerkOrgId,
+    };
+
+    // AP1: brand-new Clerk org → GET /v1/apps → 200 []
+    {
+      const r = await request("GET", "/v1/apps", { headers: apClerkHeaders });
+      r.status === 200
+        ? ok("AP1: brand-new Clerk org → GET /v1/apps → 200 []")
+        : fail("AP1: should 200 for brand-new org", `got ${r.status} ${JSON.stringify(r.body)}`);
+      if (r.status === 200) {
+        const apps = r.body as unknown[];
+        Array.isArray(apps) && apps.length === 0
+          ? ok("AP1: response body is []")
+          : fail("AP1: expected empty array", JSON.stringify(r.body));
+      }
+    }
+
+    // AP2: second call to same org → still exactly 1 orgs row (upsert is idempotent)
+    {
+      await request("GET", "/v1/apps", { headers: apClerkHeaders });
+      const { rows } = await pool.query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM orgs WHERE clerk_org_id = $1",
+        [apClerkOrgId],
+      );
+      parseInt(rows[0].count, 10) === 1
+        ? ok("AP2: exactly one orgs row after two calls (ON CONFLICT DO UPDATE is idempotent)")
+        : fail("AP2: expected exactly 1 orgs row", `got ${rows[0].count}`);
+    }
+
+    // AP3: Clerk session with no org claim → 400 (lazy create does NOT fire without orgId)
+    {
+      const r = await request("GET", "/v1/apps", {
+        headers: { "x-test-clerk-user-id": apClerkUserId }, // no x-test-clerk-org-id
+      });
+      r.status === 400
+        ? ok("AP3: session with no org claim → 400 no_active_org (lazy create not triggered)")
+        : fail("AP3: expected 400 for missing org claim", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // AP4 (.bak mutation): comment out the lazy ensureOrg → AP1 scenario now returns 400
+    {
+      const appsRoutePath = path.resolve(__dirname, "../src/routes/apps.ts");
+      const bakPath = appsRoutePath + ".bak";
+      const originalSrc = fs.readFileSync(appsRoutePath, "utf8");
+
+      const ORIGINAL_LINE = "  return await ensureOrg(sscAuth.clerkOrgId);";
+      const MUTATED_LINE  = "  return null; // MUTATED — lazy create removed";
+      const mutatedSrc = originalSrc.replace(ORIGINAL_LINE, MUTATED_LINE);
+
+      if (mutatedSrc === originalSrc) {
+        fail("AP4 (.bak): lazy-create pattern not found in apps.ts — cannot apply mutation");
+      } else {
+        const { execSync, spawn } = require("child_process") as typeof import("child_process");
+
+        const killPort4099 = () => {
+          try {
+            execSync(
+              `for p in $(lsof -nP -tiTCP:4099 -sTCP:LISTEN 2>/dev/null); do` +
+              ` ps -p "$p" -o command= 2>/dev/null | grep -q test-server && kill "$p" 2>/dev/null || true; done`,
+              { shell: "/bin/bash" },
+            );
+          } catch {}
+        };
+
+        const startServer = () => {
+          const child = spawn(
+            "npx",
+            ["ts-node", "--project", "tsconfig.json", "scripts/test-server.ts"],
+            {
+              cwd: path.resolve(__dirname, ".."),
+              env: { ...process.env, TEST_PORT: "4099", DATABASE_URL: process.env.DATABASE_URL! },
+              stdio: "ignore",
+              detached: true,
+            },
+          );
+          child.unref();
+        };
+
+        try {
+          fs.writeFileSync(bakPath, originalSrc);
+          fs.writeFileSync(appsRoutePath, mutatedSrc);
+
+          killPort4099();
+          await new Promise<void>((r) => setTimeout(r, 1500));
+          startServer();
+          await waitForServer(60);
+
+          // Brand-new org_id that doesn't exist in DB
+          const apMutOrgId = "clerk_org_ap_mutated";
+          const r = await request("GET", "/v1/apps", {
+            headers: { "x-test-clerk-user-id": "clerk_ap_mut", "x-test-clerk-org-id": apMutOrgId },
+          });
+          r.status === 400
+            ? ok('AP4 (.bak): mutated server returns 400 → "AP1: brand-new Clerk org → GET /v1/apps → 200" FAILS — mutation killed')
+            : fail("AP4 (.bak): expected mutated server to return 400 for brand-new org", `got ${r.status}`);
+        } finally {
+          killPort4099();
+          await new Promise<void>((r) => setTimeout(r, 1500));
+          fs.writeFileSync(appsRoutePath, originalSrc);
+          fs.unlinkSync(bakPath);
+          startServer();
+          await waitForServer(60);
+          // Re-register stubs needed by remaining sections (AM)
+          await request("POST", "/test/set-clerk-user", {
+            body: { clerkUserId: "clerk_ao_admin", email: "ao-admin@test.local", verified: true },
+          });
+        }
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section("AM: Lockfile drift — package-lock.json vs pnpm-lock.yaml runtime dep versions");
   // ════════════════════════════════════════════════════════════════════════════
   {

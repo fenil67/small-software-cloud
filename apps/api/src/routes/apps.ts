@@ -5,6 +5,7 @@ import { pool } from "../db";
 import { destroyFlyApp } from "../services/flyClient";
 import { asyncHandler } from "../lib/asyncHandler";
 import { safeErr } from "../lib/safeErr";
+import { ensureOrg } from "../lib/clerkSync";
 
 export const appsRouter = Router();
 appsRouter.use(requireAuth);
@@ -14,11 +15,16 @@ async function getOrgId(req: Request): Promise<string | null> {
   const sscAuth = req.sscAuth!;
   if (sscAuth.type === "api_key") return sscAuth.internalOrgId!;
   if (!sscAuth.clerkOrgId) return null;
+
   const { rows } = await pool.query<{ id: string }>(
     "SELECT id FROM orgs WHERE clerk_org_id = $1",
     [sscAuth.clerkOrgId],
   );
-  return rows[0]?.id ?? null;
+  if (rows[0]) return rows[0].id;
+
+  // Lazy-create: brand-new workspace — token arrives before our orgs row is seeded.
+  // clerkOrgId is from the verified Clerk session token, never from user input.
+  return await ensureOrg(sscAuth.clerkOrgId);
 }
 
 appsRouter.get("/", requireScope("read"), asyncHandler(async (req: Request, res: Response) => {

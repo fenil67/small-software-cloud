@@ -1,6 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 import { notFound } from "next/navigation";
 import Link from "next/link";
+import { ErrorCard } from "../../../../components/dashboard/ErrorCard";
 import { apiFetch } from "../../../../lib/api";
 import type { App, AppAccess } from "../../../../lib/api-types";
 import type { Deployment } from "../../../../lib/api-types";
@@ -24,12 +25,23 @@ export default async function AppDetailPage({ params }: PageProps) {
 
   const isAdmin = orgRole === "org:admin";
 
-  let app: App;
+  let app: App | null = null;
+  let appError: string | null = null;
   try {
     app = await apiFetch<App>(`/v1/apps/${id}`, { token });
   } catch (e: unknown) {
     if ((e as { status?: number }).status === 404) notFound();
-    throw e;
+    const status = (e as { status?: number }).status ?? 0;
+    console.error(`[apps/${id}] GET /v1/apps/${id} failed with status ${status}`);
+    appError = "We could not load this app. Try again in a moment.";
+  }
+
+  if (appError || !app) {
+    return (
+      <div style={{ padding: "32px 40px" }}>
+        <ErrorCard message={appError ?? "We could not load this app. Try again in a moment."} />
+      </div>
+    );
   }
 
   const [deployments, accessList] = await Promise.all([

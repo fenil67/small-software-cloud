@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { useOrganizationList } from "@clerk/nextjs";
+import { useOrganizationList, useClerk } from "@clerk/nextjs";
 import { Logo } from "../../../components/brand/Logo";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
 
@@ -13,6 +13,7 @@ interface Props {
 
 export function OnboardingClient({ firstName, forceNew = false }: Props) {
   const router = useRouter();
+  const clerk = useClerk();
   const { createOrganization, setActive, userInvitations } = useOrganizationList({
     userInvitations: { pageSize: 10 },
   });
@@ -33,8 +34,13 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
     setLoading(true);
     try {
       const org = await createOrganization?.({ name: trimmed });
-      if (org) await setActive?.({ organization: org.id });
-      router.replace("/apps");
+      if (org) {
+        await setActive?.({ organization: org.id });
+        // Confirm session reflects new org (SignedInSessionResource.lastActiveOrganizationId)
+        if (clerk.session?.lastActiveOrganizationId === org.id) {
+          window.location.assign("/apps");
+        }
+      }
     } catch {
       setError("Something went wrong. Please try again.");
     } finally {
@@ -48,7 +54,10 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
       const inv = userInvitations?.data?.find((i) => i.id === invitationId);
       if (inv) await inv.accept();
       await setActive?.({ organization: orgId });
-      router.replace("/apps");
+      // Confirm session reflects new org (SignedInSessionResource.lastActiveOrganizationId)
+      if (clerk.session?.lastActiveOrganizationId === orgId) {
+        window.location.assign("/apps");
+      }
     } catch {
       setJoiningId(null);
     }

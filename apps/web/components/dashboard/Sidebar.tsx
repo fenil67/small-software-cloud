@@ -9,7 +9,8 @@ import { Logo } from "../brand/Logo";
 export function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
-  const { signOut } = useClerk();
+  const clerk = useClerk();
+  const { signOut } = clerk;
   const { user } = useUser();
   const { organization } = useOrganization();
   const { userMemberships, setActive } = useOrganizationList({
@@ -65,7 +66,12 @@ export function Sidebar() {
         }))}
         onSwitch={async (orgId) => {
           await setActive?.({ organization: orgId });
-          router.refresh();
+          // Confirm session reflects new org before full-page navigation.
+          // clerk.session is SignedInSessionResource from @clerk/nextjs;
+          // lastActiveOrganizationId should equal orgId since setActive has resolved.
+          if (clerk.session?.lastActiveOrganizationId === orgId) {
+            window.location.assign("/apps");
+          }
         }}
       />
 
@@ -209,7 +215,8 @@ function WorkspaceSwitcher({
         type="button"
         aria-expanded={open}
         aria-haspopup="listbox"
-        aria-label={`Current workspace: ${currentOrgName ?? "None"}. Switch workspace`}
+        aria-label={switching ? "Switching workspace…" : `Current workspace: ${currentOrgName ?? "None"}. Switch workspace`}
+        disabled={switching !== null}
         onClick={() => setOpen((v) => !v)}
         style={{
           width: "100%",
@@ -222,7 +229,7 @@ function WorkspaceSwitcher({
           background: open ? "var(--surface-3)" : "transparent",
           color: "var(--fg-2)",
           fontSize: "12px",
-          cursor: "pointer",
+          cursor: switching !== null ? "wait" : "pointer",
           textAlign: "left",
         }}
       >
@@ -234,9 +241,9 @@ function WorkspaceSwitcher({
             whiteSpace: "nowrap",
           }}
         >
-          {currentOrgName ?? "No workspace"}
+          {switching !== null ? "Switching\u2026" : (currentOrgName ?? "No workspace")}
         </span>
-        <ChevronIcon open={open} />
+        {switching === null && <ChevronIcon open={open} />}
       </button>
 
       {open && (

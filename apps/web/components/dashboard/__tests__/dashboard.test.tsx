@@ -42,6 +42,9 @@ vi.mock("next/headers", () => ({
 const mockSetActive = vi.fn();
 const mockSignOut = vi.fn();
 const mockCreateOrganization = vi.fn();
+// _mockSessionOrgId is read by the useClerk().session getter — update it in tests
+// to simulate clerk.session (SignedInSessionResource.lastActiveOrganizationId) changing.
+let _mockSessionOrgId: string | null = "org_aaa";
 
 vi.mock("@clerk/nextjs", () => ({
   useOrganization: vi.fn(() => ({
@@ -65,7 +68,10 @@ vi.mock("@clerk/nextjs", () => ({
       primaryEmailAddress: { emailAddress: "alice@example.com" },
     },
   })),
-  useClerk: vi.fn(() => ({ signOut: mockSignOut })),
+  useClerk: vi.fn(() => ({
+    signOut: mockSignOut,
+    get session() { return { lastActiveOrganizationId: _mockSessionOrgId }; },
+  })),
 }));
 
 vi.mock("next/image", () => ({
@@ -111,6 +117,7 @@ beforeEach(() => {
   mockRouterRefresh.mockReset();
   mockRouterReplace.mockReset();
   mockRedirect.mockReset();
+  _mockSessionOrgId = "org_aaa";
   mockServerAuth.mockReset().mockResolvedValue({ userId: "user_test", orgId: "org_test" });
   mockCurrentUser.mockReset().mockResolvedValue({ firstName: null });
   mockCookies.mockReset().mockResolvedValue({ get: () => undefined });
@@ -528,13 +535,21 @@ describe("Sidebar – workspace switcher", () => {
     expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb" });
   });
 
-  it("calls router.refresh() after switching workspace", async () => {
+  it("navigates to /apps after switching workspace (session confirms new org)", async () => {
+    const mockAssign = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { assign: mockAssign, replace: vi.fn(), href: "/" },
+      writable: true,
+      configurable: true,
+    });
+    // Session reflects new org immediately (setActive resolves synchronously in mock)
+    _mockSessionOrgId = "org_bbb";
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: /acme corp/i }));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
     });
-    await waitFor(() => expect(mockRouterRefresh).toHaveBeenCalled());
+    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
   });
 
   it("Escape key closes the listbox and returns focus to trigger", () => {
@@ -711,5 +726,86 @@ describe("OnboardingClient – forceNew=true (BUG 3)", () => {
       OnboardingPage({ searchParams: Promise.resolve({}) }),
     ).rejects.toThrow("NEXT_REDIRECT");
     expect(mockRedirect).toHaveBeenCalledWith("/apps");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Sidebar – workspace switch flow
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("Sidebar – workspace switch flow", () => {
+  let mockAssign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockAssign = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { assign: mockAssign, replace: vi.fn(), href: "/" },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  it("awaits setActive before navigating (mutation: navigate before setActive → test fails)", async () => {
+    let resolveSwitch!: () => void;
+    mockSetActive.mockReturnValue(new Promise<void>((r) => { resolveSwitch = r; }));
+
+    render(<Sidebar />);
+
+    // Open the workspace switcher
+    fireEvent.click(screen.getByRole("button", { name: /switch workspace/i }));
+
+    // Click Beta Inc (org_bbb ≠ current org_aaa)
+    fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
+
+    // setActive must have been called with the target org
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb" });
+
+    // navigate must NOT happen while setActive is still pending
+    expect(mockAssign).not.toHaveBeenCalled();
+
+    // Simulate session update + resolve setActive
+    _mockSessionOrgId = "org_bbb";
+    act(() => { resolveSwitch(); });
+
+    await waitFor(() => {
+      expect(mockAssign).toHaveBeenCalledWith("/apps");
+    });
+  });
+
+  it("trigger button shows Switching… and is disabled while in progress", async () => {
+    let resolveSwitch!: () => void;
+    mockSetActive.mockReturnValue(new Promise<void>((r) => { resolveSwitch = r; }));
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: /switch workspace/i }));
+    fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
+
+    // Trigger button should now show Switching… and be disabled
+    expect(screen.getByRole("button", { name: /switching/i })).toBeDisabled();
+
+    _mockSessionOrgId = "org_bbb";
+    act(() => { resolveSwitch(); });
+    await waitFor(() => expect(mockAssign).toHaveBeenCalled());
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ErrorCard – Try again button
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { ErrorCard } from "../ErrorCard";
+
+describe("ErrorCard – Try again", () => {
+  it("displays the message and a Try again button", () => {
+    render(<ErrorCard message="We could not load your apps. Try again in a moment." />);
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText("We could not load your apps. Try again in a moment.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /try again/i })).toBeInTheDocument();
+  });
+
+  it("Try again calls router.refresh()", () => {
+    render(<ErrorCard message="We could not load your apps. Try again in a moment." />);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(mockRouterRefresh).toHaveBeenCalledTimes(1);
   });
 });
