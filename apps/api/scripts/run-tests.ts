@@ -9529,6 +9529,177 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("AO: GET /v1/api-keys returns scopes; mutation (.bak): key_hash exposure kills test");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    const aoClerkHeaders = {
+      "x-test-clerk-user-id": "clerk_ao_admin",
+      "x-test-clerk-org-id": "clerk_org_ao",
+      "x-test-clerk-org-role": "org:admin",
+    };
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email) VALUES ($1,$2) ON CONFLICT (clerk_user_id) DO NOTHING",
+      ["clerk_ao_admin", "ao-admin@test.local"],
+    );
+    // Register user stub so ensureUser (called by POST /v1/api-keys) can resolve the Clerk user
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: "clerk_ao_admin", email: "ao-admin@test.local", verified: true },
+    });
+
+    // AO1: key created with ["read","deploy","manage"] → GET lists exactly those scopes
+    let aoFullKeyId: string | null = null;
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: aoClerkHeaders,
+        body: { name: "ao-full-scopes", scopes: ["read", "deploy", "manage"] },
+      });
+      r.status === 201
+        ? ok("AO1: POST full scopes → 201")
+        : fail("AO1: should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+      aoFullKeyId = (r.body as { id?: string }).id ?? null;
+    }
+    {
+      const r = await request("GET", "/v1/api-keys", { headers: aoClerkHeaders });
+      if (r.status === 200) {
+        const keys = r.body as Array<{ id: string; scopes?: string[] }>;
+        const k = keys.find((e) => e.id === aoFullKeyId);
+        const scopes = new Set(k?.scopes ?? []);
+        scopes.size === 3 && scopes.has("read") && scopes.has("deploy") && scopes.has("manage")
+          ? ok("AO1: GET lists scopes=[read,deploy,manage] exactly")
+          : fail("AO1: wrong scopes in list", JSON.stringify(k?.scopes));
+      } else {
+        fail("AO1: GET should 200", `got ${r.status}`);
+      }
+    }
+
+    // AO2: default key (no scopes) → GET lists ["read","deploy"]
+    let aoDefaultKeyId: string | null = null;
+    {
+      const r = await request("POST", "/v1/api-keys", {
+        headers: aoClerkHeaders,
+        body: { name: "ao-default-scopes" },
+      });
+      r.status === 201
+        ? ok("AO2: POST default scopes → 201")
+        : fail("AO2: should 201", `got ${r.status} ${JSON.stringify(r.body)}`);
+      aoDefaultKeyId = (r.body as { id?: string }).id ?? null;
+    }
+    {
+      const r = await request("GET", "/v1/api-keys", { headers: aoClerkHeaders });
+      if (r.status === 200) {
+        const keys = r.body as Array<{ id: string; scopes?: string[] }>;
+        const k = keys.find((e) => e.id === aoDefaultKeyId);
+        const scopes = new Set(k?.scopes ?? []);
+        scopes.size === 2 && scopes.has("read") && scopes.has("deploy")
+          ? ok("AO2: GET lists default scopes=[read,deploy]")
+          : fail("AO2: wrong default scopes", JSON.stringify(k?.scopes));
+      } else {
+        fail("AO2: GET should 200", `got ${r.status}`);
+      }
+    }
+
+    // AO3: GET response contains no key material (no key_hash, no full key string)
+    {
+      const r = await request("GET", "/v1/api-keys", { headers: aoClerkHeaders });
+      if (r.status === 200) {
+        const keys = r.body as Array<Record<string, unknown>>;
+        const hasHash = keys.some((k) => "key_hash" in k);
+        !hasHash
+          ? ok("AO3: GET response contains no key_hash")
+          : fail("AO3: key_hash leaked in GET /v1/api-keys");
+        const hasFullKey = keys.some((k) => typeof k.key === "string" && (k.key as string).length > 20);
+        !hasFullKey
+          ? ok("AO3: GET response contains no full key material")
+          : fail("AO3: full key material leaked in GET /v1/api-keys");
+      } else {
+        fail("AO3: GET should 200", `got ${r.status}`);
+      }
+    }
+
+    // AO4 (.bak mutation): add key_hash to GET SELECT → AO3 "no key_hash" assertion would FAIL
+    // Mutate src, restart server, verify key_hash IS in response, restore, restart clean server.
+    {
+      const apiKeysPath = path.resolve(__dirname, "../src/routes/apiKeys.ts");
+      const bakPath = apiKeysPath + ".bak";
+      const originalSrc = fs.readFileSync(apiKeysPath, "utf8");
+
+      const ORIGINAL_SELECT = "SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at";
+      const MUTATED_SELECT  = "SELECT id, name, key_prefix, key_hash, scopes, created_at, last_used_at, revoked_at";
+      const mutatedSrc = originalSrc.replace(ORIGINAL_SELECT, MUTATED_SELECT);
+
+      if (mutatedSrc === originalSrc) {
+        fail("AO4 (.bak): SQL pattern not found — cannot apply key_hash mutation");
+      } else {
+        fs.writeFileSync(bakPath, originalSrc);
+        fs.writeFileSync(apiKeysPath, mutatedSrc);
+
+        const { execSync, spawn } = require("child_process") as typeof import("child_process");
+
+        const killPort4099 = () => {
+          try {
+            execSync(
+              `for p in $(lsof -nP -tiTCP:4099 -sTCP:LISTEN 2>/dev/null); do` +
+              ` ps -p "$p" -o command= 2>/dev/null | grep -q test-server && kill "$p" 2>/dev/null || true; done`,
+              { shell: "/bin/bash" },
+            );
+          } catch {}
+        };
+
+        const startServer = () => {
+          const child = spawn(
+            "npx",
+            ["ts-node", "--project", "tsconfig.json", "scripts/test-server.ts"],
+            {
+              cwd: path.resolve(__dirname, ".."),
+              env: { ...process.env, TEST_PORT: "4099", DATABASE_URL: process.env.DATABASE_URL! },
+              stdio: "ignore",
+              detached: true,
+            },
+          );
+          child.unref();
+        };
+
+        try {
+          // Kill original server, start mutated server
+          killPort4099();
+          await new Promise<void>((r) => setTimeout(r, 1500));
+          startServer();
+          await waitForServer(60);
+
+          // Re-register user stub (server restart clears in-memory stubs)
+          await request("POST", "/test/set-clerk-user", {
+            body: { clerkUserId: "clerk_ao_admin", email: "ao-admin@test.local", verified: true },
+          });
+
+          // AO3-style check against mutated server
+          const r = await request("GET", "/v1/api-keys", { headers: aoClerkHeaders });
+          if (r.status === 200) {
+            const keys = r.body as Array<Record<string, unknown>>;
+            const hasHash = keys.some((k) => "key_hash" in k);
+            hasHash
+              ? ok('AO4 (.bak): mutated server exposes key_hash → "AO3: GET response contains no key_hash" FAILS — mutation killed')
+              : fail("AO4 (.bak): mutated server did not return key_hash as expected");
+          } else {
+            fail("AO4 (.bak): mutated server GET should 200", `got ${r.status}`);
+          }
+        } finally {
+          // Restore: kill mutated server, restore source, start clean server
+          killPort4099();
+          await new Promise<void>((r) => setTimeout(r, 1500));
+          fs.writeFileSync(apiKeysPath, originalSrc);
+          fs.unlinkSync(bakPath);
+          startServer();
+          await waitForServer(60);
+          // Re-register stubs needed by remaining sections after clean restart
+          await request("POST", "/test/set-clerk-user", {
+            body: { clerkUserId: "clerk_ao_admin", email: "ao-admin@test.local", verified: true },
+          });
+        }
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section("AM: Lockfile drift — package-lock.json vs pnpm-lock.yaml runtime dep versions");
   // ════════════════════════════════════════════════════════════════════════════
   {

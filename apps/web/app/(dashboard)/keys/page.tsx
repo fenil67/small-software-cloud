@@ -23,12 +23,15 @@ export default async function KeysPage() {
   }
 
   return (
-    <div style={{ padding: "32px 40px", maxWidth: "900px" }}>
-      <div style={{ marginBottom: "24px" }}>
-        <h1 style={{ margin: 0, fontSize: "20px", fontWeight: 600, letterSpacing: "-0.01em" }}>
+    <div style={{ padding: "40px 48px 64px", maxWidth: "1200px", display: "flex", flexDirection: "column", gap: "32px" }}>
+      <header style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+        <h1 style={{ margin: 0, fontSize: "30px", lineHeight: "36px", fontWeight: 600, letterSpacing: "-0.02em" }}>
           API keys
         </h1>
-      </div>
+        <p style={{ margin: 0, fontSize: "14px", lineHeight: "20px", color: "var(--fg-2)" }}>
+          Keys let the Utir command line and your AI assistant deploy for you.
+        </p>
+      </header>
 
       {error ? (
         <p role="alert" style={{ color: "var(--red)", fontSize: "14px" }}>{error}</p>

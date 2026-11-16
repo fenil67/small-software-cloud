@@ -81,7 +81,7 @@ apiKeysRouter.get("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, r
   const orgId = await ensureOrg(sscAuth.clerkOrgId!);
 
   const { rows } = await pool.query(
-    `SELECT id, name, key_prefix, created_at, last_used_at, revoked_at
+    `SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at
      FROM api_keys WHERE org_id = $1 ORDER BY created_at DESC`,
     [orgId],
   );

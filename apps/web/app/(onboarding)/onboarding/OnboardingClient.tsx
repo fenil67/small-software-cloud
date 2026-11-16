@@ -8,15 +8,16 @@ import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
 
 interface Props {
   firstName: string | null;
+  forceNew?: boolean;
 }
 
-export function OnboardingClient({ firstName }: Props) {
+export function OnboardingClient({ firstName, forceNew = false }: Props) {
   const router = useRouter();
   const { createOrganization, setActive, userInvitations } = useOrganizationList({
     userInvitations: { pageSize: 10 },
   });
 
-  const defaultName = firstName ? `${firstName}'s workspace` : "";
+  const defaultName = forceNew ? "" : (firstName ? `${firstName}'s workspace` : "");
   const [name, setName] = useState(defaultName);
   const [error, setError] = useState<string | undefined>();
   const [loading, setLoading] = useState(false);
@@ -53,7 +54,7 @@ export function OnboardingClient({ firstName }: Props) {
     }
   }
 
-  const invitations = userInvitations?.data ?? [];
+  const invitations = forceNew ? [] : (userInvitations?.data ?? []);
 
   return (
     <main
@@ -89,7 +90,7 @@ export function OnboardingClient({ firstName }: Props) {
       >
         <div style={{ display: "flex", flexDirection: "column", gap: "8px", textAlign: "center" }}>
           <h1 style={{ margin: 0, fontSize: "24px", lineHeight: "32px", fontWeight: 600, letterSpacing: "-0.01em" }}>
-            Name your workspace
+            {forceNew ? "Create a workspace" : "Name your workspace"}
           </h1>
           <p style={{ margin: 0, fontSize: "14px", lineHeight: "20px", color: "var(--fg-2)" }}>
             Your apps, keys and the people you share with live here. You can rename it later.

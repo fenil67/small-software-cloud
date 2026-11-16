@@ -169,7 +169,7 @@ describe("AppsTable – filter All", () => {
 describe("AppsTable – filter Live", () => {
   it("Live tab shows only Live apps", () => {
     render(<AppsTable apps={allApps} />);
-    fireEvent.click(screen.getByRole("tab", { name: "Live" }));
+    fireEvent.click(screen.getByRole("tab", { name: /^live/i }));
     expect(screen.getByText("My Live App")).toBeInTheDocument();
     expect(screen.queryByText("Failed App")).not.toBeInTheDocument();
     expect(screen.queryByText("Suspended App")).not.toBeInTheDocument();
@@ -180,7 +180,7 @@ describe("AppsTable – filter Live", () => {
 describe("AppsTable – filter Needs attention", () => {
   it("shows Failed and Suspended only", () => {
     render(<AppsTable apps={allApps} />);
-    fireEvent.click(screen.getByRole("tab", { name: "Needs attention" }));
+    fireEvent.click(screen.getByRole("tab", { name: /needs attention/i }));
     expect(screen.getByText("Failed App")).toBeInTheDocument();
     expect(screen.getByText("Suspended App")).toBeInTheDocument();
     expect(screen.queryByText("My Live App")).not.toBeInTheDocument();
@@ -494,11 +494,11 @@ describe("Sidebar – workspace switcher", () => {
     expect(listbox.textContent).toContain("Beta Inc");
   });
 
-  it("includes 'Create workspace' link pointing to /onboarding", () => {
+  it("includes 'Create workspace' link pointing to /onboarding?new=1", () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: /acme corp/i }));
     const link = screen.getByRole("link", { name: /create workspace/i });
-    expect(link).toHaveAttribute("href", "/onboarding");
+    expect(link).toHaveAttribute("href", "/onboarding?new=1");
   });
 
   it("calls setActive with correct orgId when switching", async () => {
@@ -612,5 +612,71 @@ describe("M6: dashboard layout auth check (static)", () => {
     const src = fs.readFileSync(layoutPath, "utf8");
     expect(src).toMatch(/orgId/);
     expect(src).toMatch(/\/onboarding/);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ThemeSwitch – initialTheme prop (BUG 2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { ThemeSwitch } from "../../theme/ThemeSwitch";
+
+describe("ThemeSwitch – initialTheme prop (BUG 2)", () => {
+  it("initialTheme=light → Light button aria-pressed=true", () => {
+    render(<ThemeSwitch initialTheme="light" />);
+    expect(screen.getByRole("button", { name: /light/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /dark/i })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /system/i })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("initialTheme=system → System button aria-pressed=true", () => {
+    render(<ThemeSwitch initialTheme="system" />);
+    expect(screen.getByRole("button", { name: /system/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /dark/i })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /light/i })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("M2: drop initialTheme (default dark) → Dark pressed, not Light", () => {
+    render(<ThemeSwitch />);
+    expect(screen.getByRole("button", { name: /dark/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /light/i })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("Settings page source reads utir-theme cookie and passes initialTheme to ThemeSwitch", () => {
+    const settingsPath = path.resolve(__dirname, "../../../app/(dashboard)/settings/page.tsx");
+    expect(fs.existsSync(settingsPath)).toBe(true);
+    const src = fs.readFileSync(settingsPath, "utf8");
+    expect(src).toMatch(/utir-theme/);
+    expect(src).toMatch(/parseTheme/);
+    // The parsed theme must be passed as a prop to ThemeSwitch, not just declared
+    expect(src).toMatch(/ThemeSwitch[^/]*initialTheme=/s);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OnboardingClient – forceNew (BUG 3)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("OnboardingClient – forceNew=true (BUG 3)", () => {
+  it("forceNew=true shows 'Create a workspace' title", () => {
+    render(<OnboardingClient firstName="Fenil" forceNew />);
+    expect(screen.getByRole("heading", { name: /create a workspace/i })).toBeInTheDocument();
+  });
+
+  it("forceNew=true starts with empty name field (not prefilled)", () => {
+    render(<OnboardingClient firstName="Fenil" forceNew />);
+    expect((screen.getByRole("textbox") as HTMLInputElement).value).toBe("");
+  });
+
+  it("forceNew=false shows 'Name your workspace' title", () => {
+    render(<OnboardingClient firstName={null} forceNew={false} />);
+    expect(screen.getByRole("heading", { name: /name your workspace/i })).toBeInTheDocument();
+  });
+
+  it("BUG3: Onboarding page source skips redirect when ?new=1", () => {
+    const pagePath = path.resolve(__dirname, "../../../app/(onboarding)/onboarding/page.tsx");
+    const src = fs.readFileSync(pagePath, "utf8");
+    expect(src).toMatch(/forceNew/);
+    expect(src).toMatch(/new.*===.*"1"|"1".*===.*new/);
   });
 });
