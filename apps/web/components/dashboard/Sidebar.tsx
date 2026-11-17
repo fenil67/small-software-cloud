@@ -5,7 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useClerk, useUser, useOrganization, useOrganizationList } from "@clerk/nextjs";
 import { Logo } from "../brand/Logo";
-import { navigateHard } from "../../lib/navigate";
+import { navigateHard, pollSession } from "../../lib/navigate";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -66,11 +66,10 @@ export function Sidebar() {
           name: m.organization.name,
         }))}
         onSwitch={async (orgId) => {
-          await setActive?.({ organization: orgId });
-          // Confirm session reflects new org before full-page navigation.
-          // clerk.session is SignedInSessionResource from @clerk/nextjs;
-          // lastActiveOrganizationId should equal orgId since setActive has resolved.
-          if (clerk.session?.lastActiveOrganizationId === orgId) {
+          try {
+            await setActive?.({ organization: orgId });
+            await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
+          } finally {
             navigateHard("/apps");
           }
         }}

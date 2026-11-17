@@ -935,3 +935,121 @@ describe("Contract: access fixture shape", () => {
     }
   });
 });
+
+import appsListFixture from "../../../../api/scripts/fixtures/apps-list.json";
+import appDetailFixture from "../../../../api/scripts/fixtures/app-detail.json";
+import type { App as AppType } from "../../../lib/api-types";
+import { appUrl } from "../../../lib/app-url";
+
+describe("Contract: apps-list fixture shape", () => {
+  it("is an array with valid app objects (mutation: change to object → Array.isArray fails)", () => {
+    expect(Array.isArray(appsListFixture)).toBe(true);
+    const apps = appsListFixture as unknown as AppType[];
+    for (const app of apps) {
+      expect(app).toHaveProperty("id");
+      expect(app).toHaveProperty("name");
+      expect(app).toHaveProperty("subdomain");
+    }
+  });
+
+  it("appUrl(subdomain) returns a valid URL for fixture apps (no double-scheme)", () => {
+    const apps = appsListFixture as unknown as AppType[];
+    for (const app of apps) {
+      if (app.subdomain) {
+        const url = appUrl(app.subdomain);
+        expect(url).not.toBeNull();
+        expect(url).toMatch(/^https:\/\/[^/]+\.fly\.dev$/);
+        // Must not contain double-scheme
+        expect(url).not.toContain("https://https://");
+      }
+    }
+  });
+
+  it("AppsTable renders without crashing with fixture data", () => {
+    render(<AppsTable apps={appsListFixture as unknown as AppType[]} />);
+    const apps = appsListFixture as unknown as AppType[];
+    for (const app of apps) {
+      expect(screen.getByText(app.name)).toBeInTheDocument();
+    }
+  });
+});
+
+describe("Contract: app-detail fixture shape", () => {
+  it("is an object with {id, name, subdomain}", () => {
+    const app = appDetailFixture as unknown as AppType;
+    expect(typeof app.id).toBe("string");
+    expect(typeof app.name).toBe("string");
+    expect("subdomain" in app).toBe(true);
+  });
+
+  it("appUrl(subdomain) normalises the fixture URL correctly (no double-scheme)", () => {
+    const app = appDetailFixture as unknown as AppType;
+    if (app.subdomain) {
+      const url = appUrl(app.subdomain);
+      expect(url).not.toBeNull();
+      expect(url).toMatch(/^https:\/\/[^/]+\.fly\.dev$/);
+      expect(url).not.toContain("https://https://");
+    }
+  });
+});
+
+// ── BUG B – workspace creation try/finally guarantees navigation ─────────────
+
+describe("OnboardingClient – BUG B v2: setActive/session errors do not block navigation", () => {
+  let mockAssign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockAssign = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { assign: mockAssign, replace: vi.fn(), href: "/" },
+      writable: true,
+      configurable: true,
+    });
+    _mockSessionOrgId = null;
+  });
+
+  it("setActive throws → still navigates to /apps (try/finally)", async () => {
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    mockSetActive.mockRejectedValue(new Error("clerk_set_active_failed"));
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    // Mutation: remove the inner try/finally → navigateHard moves inside try → setActive throw
+    // propagates to outer catch → error shown, navigation skipped → this assertion fails.
+    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+  });
+
+  it("session polling throws → still navigates to /apps (try/finally)", async () => {
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    // setActive succeeds but then session polling would throw if pollSession itself threw.
+    // We simulate this by making setActive succeed then the session never updates (timeout path).
+    // The try/finally ensures navigation regardless.
+    mockSetActive.mockResolvedValue(undefined);
+    _mockSessionOrgId = null; // session never updates
+    vi.useFakeTimers();
+    try {
+      render(<OnboardingClient firstName={null} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(mockAssign).toHaveBeenCalledWith("/apps");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("createOrganization throws → error shown, does NOT navigate", async () => {
+    mockCreateOrganization.mockRejectedValue(new Error("clerk_error"));
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(mockAssign).not.toHaveBeenCalled();
+  });
+});

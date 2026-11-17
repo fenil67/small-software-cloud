@@ -9840,8 +9840,8 @@ async function main(): Promise<void> {
 
     // Create an app + deployment directly in DB for shape testing
     const { rows: aqAppRows } = await pool.query<{ id: string }>(
-      "INSERT INTO apps (org_id, name, slug, status) VALUES ($1,'AQ App','aq-app','running') RETURNING id",
-      [aqOrgId],
+      "INSERT INTO apps (org_id, owner_id, name, slug, status) VALUES ($1,$2,'AQ App','aq-app','running') RETURNING id",
+      [aqOrgId, userId],
     );
     const aqAppId = aqAppRows[0].id;
     await pool.query(
@@ -9904,13 +9904,40 @@ async function main(): Promise<void> {
       }
     }
 
-    // ── AQ3: GET /v1/apps → verify array shape ────────────────────────────────
+    // ── AQ3: GET /v1/apps → verify array shape + save fixture ─────────────────
     {
       const r = await request("GET", "/v1/apps", { headers: authHeaders(aqKey) });
       console.log(`  AQ3: GET /v1/apps → ${r.status} (${Array.isArray(r.body) ? (r.body as unknown[]).length : "not array"} apps)`);
-      r.status === 200 && Array.isArray(r.body)
-        ? ok("AQ3: GET /v1/apps returns an array")
-        : fail("AQ3: apps list should be a 200 array", `got ${r.status}`);
+      if (r.status === 200 && Array.isArray(r.body)) {
+        ok("AQ3: GET /v1/apps returns an array");
+        fs.writeFileSync(
+          path.join(fixturesDir, "apps-list.json"),
+          JSON.stringify(r.body, null, 2),
+        );
+        ok("AQ3: apps-list.json saved");
+      } else {
+        fail("AQ3: apps list should be a 200 array", `got ${r.status}`);
+      }
+    }
+
+    // ── AQ4: GET /v1/apps/:id → verify object shape + save fixture ────────────
+    {
+      const r = await request("GET", `/v1/apps/${aqAppId}`, { headers: authHeaders(aqKey) });
+      console.log(`  AQ4: GET /v1/apps/${aqAppId.slice(0, 8)}.../detail → ${r.status}`);
+      if (r.status === 200) {
+        const b = r.body as Record<string, unknown>;
+        const hasShape = typeof b.id === "string" && typeof b.name === "string" && "subdomain" in b;
+        hasShape
+          ? ok("AQ4: app detail has {id, name, subdomain}")
+          : fail("AQ4: app detail shape mismatch", JSON.stringify(Object.keys(b)));
+        fs.writeFileSync(
+          path.join(fixturesDir, "app-detail.json"),
+          JSON.stringify(r.body, null, 2),
+        );
+        ok("AQ4: app-detail.json saved");
+      } else {
+        fail("AQ4: app detail should return 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
     }
 
     // ── Cleanup AQ org ────────────────────────────────────────────────────────

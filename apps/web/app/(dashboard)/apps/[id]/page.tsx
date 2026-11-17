@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ErrorCard } from "../../../../components/dashboard/ErrorCard";
 import { apiFetch, isAppAccessResponse, isDeploymentArray } from "../../../../lib/api";
+import { appUrl as normalizeAppUrl } from "../../../../lib/app-url";
 import type { App, AppAccess, AppAccessResponse } from "../../../../lib/api-types";
 import type { Deployment } from "../../../../lib/api-types";
 import { resolveAppStatus } from "../../../../lib/status";
@@ -72,7 +73,7 @@ export default async function AppDetailPage({ params }: PageProps) {
   }
 
   const resolved = resolveAppStatus(app.suspended, app.status, app.latest_deployment_status);
-  const appUrl = app.subdomain ? `https://${app.subdomain}` : null;
+  const appUrl = normalizeAppUrl(app.subdomain);
 
   return (
     <div style={{ padding: "32px 40px", maxWidth: "1100px" }}>

@@ -5,25 +5,11 @@ import { useRouter } from "next/navigation";
 import { useOrganizationList, useClerk } from "@clerk/nextjs";
 import { Logo } from "../../../components/brand/Logo";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
-import { navigateHard } from "../../../lib/navigate";
+import { navigateHard, pollSession } from "../../../lib/navigate";
 
 interface Props {
   firstName: string | null;
   forceNew?: boolean;
-}
-
-// Polls until the Clerk session reflects the new active org or the timeout elapses.
-// Defined outside the component so Date.now() is not flagged by react-hooks/purity.
-async function pollSession(
-  getActiveOrgId: () => string | null | undefined,
-  targetOrgId: string,
-  timeoutMs: number,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (getActiveOrgId() === targetOrgId) return;
-    await new Promise<void>((r) => setTimeout(r, 100));
-  }
 }
 
 export function OnboardingClient({ firstName, forceNew = false }: Props) {
@@ -48,11 +34,19 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
     setError(undefined);
     setLoading(true);
     try {
+      console.info("[workspace] create start");
       const org = await createOrganization?.({ name: trimmed });
-      if (org) {
+      if (!org) throw new Error("create_failed");
+      console.info("[workspace] created");
+      try {
         await setActive?.({ organization: org.id });
-        // Poll for ≤5 seconds for session to reflect new org, then navigate regardless
+        console.info("[workspace] setActive done");
         await pollSession(() => clerk.session?.lastActiveOrganizationId, org.id, 5000);
+        const confirmed = clerk.session?.lastActiveOrganizationId === org.id;
+        console.info(confirmed ? "[workspace] session confirmed" : "[workspace] session wait timed out");
+      } finally {
+        // Navigates regardless of whether setActive or session polling succeeded.
+        console.info("[workspace] navigating");
         navigateHard("/apps");
       }
     } catch {
@@ -65,12 +59,20 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
   async function handleJoin(invitationId: string, orgId: string) {
     setJoiningId(invitationId);
     try {
+      console.info("[workspace] create start");
       const inv = userInvitations?.data?.find((i) => i.id === invitationId);
       if (inv) await inv.accept();
-      await setActive?.({ organization: orgId });
-      // Poll for ≤5 seconds for session to reflect new org, then navigate regardless
-      await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
-      navigateHard("/apps");
+      console.info("[workspace] created");
+      try {
+        await setActive?.({ organization: orgId });
+        console.info("[workspace] setActive done");
+        await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
+        const confirmed = clerk.session?.lastActiveOrganizationId === orgId;
+        console.info(confirmed ? "[workspace] session confirmed" : "[workspace] session wait timed out");
+      } finally {
+        console.info("[workspace] navigating");
+        navigateHard("/apps");
+      }
     } catch {
       setJoiningId(null);
     }

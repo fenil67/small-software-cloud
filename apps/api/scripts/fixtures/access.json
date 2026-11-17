@@ -1,15 +1,9 @@
 {
-  "users": [
-    {
-      "user_id": "user-fixture-1",
-      "email": "alice@example.com",
-      "granted_at": "2026-01-01T00:00:00.000Z"
-    }
-  ],
+  "users": [],
   "pending": [
     {
-      "email": "bob@example.com",
-      "granted_at": "2026-01-01T00:00:30.000Z"
+      "email": "aq-fixture@example.com",
+      "granted_at": "2026-11-17T04:58:04.090Z"
     }
   ]
 }

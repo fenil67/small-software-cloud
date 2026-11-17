@@ -1,10 +1,10 @@
 [
   {
-    "id": "dep-fixture-1",
+    "id": "ccd67682-9fc3-4a61-b4b7-55bcbf429010",
     "status": "success",
     "version": 1,
-    "started_at": "2026-01-01T00:00:00.000Z",
-    "finished_at": "2026-01-01T00:01:00.000Z",
+    "started_at": "2026-11-17T04:57:04.085Z",
+    "finished_at": "2026-11-17T04:58:04.085Z",
     "failure_stage": null,
     "failure_message": null
   }

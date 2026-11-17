@@ -5,6 +5,7 @@ import Link from "next/link";
 import type { App } from "../../lib/api-types";
 import { resolveAppStatus, type ResolvedStatus } from "../../lib/status";
 import { AppStatusBadge } from "./AppStatusBadge";
+import { appUrl } from "../../lib/app-url";
 
 type FilterKey = "All" | "Live" | "Needs attention";
 
@@ -351,7 +352,7 @@ function AppRow({ app, resolved }: AppRowProps) {
           >
             {app.name}
           </Link>
-          {app.subdomain && (
+          {appUrl(app.subdomain) && (
             <span
               style={{
                 fontFamily: "var(--font-mono, monospace)",
@@ -363,7 +364,7 @@ function AppRow({ app, resolved }: AppRowProps) {
                 whiteSpace: "nowrap",
               }}
             >
-              {app.subdomain}
+              {appUrl(app.subdomain)}
             </span>
           )}
         </div>

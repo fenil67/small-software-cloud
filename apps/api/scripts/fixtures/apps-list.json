@@ -1,0 +1,16 @@
+[
+  {
+    "id": "593ad56f-33ee-419d-acf3-18b2ff10a1e5",
+    "name": "AQ App",
+    "slug": "aq-app",
+    "source_type": null,
+    "source_ref": null,
+    "fly_app_id": null,
+    "subdomain": null,
+    "created_at": "2026-11-17T04:58:04.085Z",
+    "suspended": false,
+    "status": "running",
+    "latest_deployment_status": "success",
+    "last_deployed_at": "2026-11-17T04:58:04.085Z"
+  }
+]
