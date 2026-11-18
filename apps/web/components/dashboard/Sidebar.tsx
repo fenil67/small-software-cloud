@@ -5,7 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useClerk, useUser, useOrganization, useOrganizationList } from "@clerk/nextjs";
 import { Logo } from "../brand/Logo";
-import { navigateHard, pollSession } from "../../lib/navigate";
+import { navigateHard } from "../../lib/navigate";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -67,9 +67,8 @@ export function Sidebar() {
         }))}
         onSwitch={async (orgId) => {
           try {
-            await setActive?.({ organization: orgId });
-            await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
-          } finally {
+            await setActive?.({ organization: orgId, redirectUrl: "/apps" });
+          } catch {
             navigateHard("/apps");
           }
         }}
@@ -316,9 +315,10 @@ function WorkspaceSwitcher({
           })}
 
           <li role="option" aria-selected={false} style={{ borderTop: memberships.length > 0 ? "1px solid var(--line)" : "none", marginTop: memberships.length > 0 ? "4px" : 0, paddingTop: memberships.length > 0 ? "4px" : 0 }}>
-            <Link
+            {/* Plain <a> so this triggers a full page load, not a client navigation that
+                could prefetch stale RSC data while a workspace switch is in progress. */}
+            <a
               href="/onboarding?new=1"
-              onClick={() => setOpen(false)}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -348,7 +348,7 @@ function WorkspaceSwitcher({
                 +
               </span>
               Create workspace
-            </Link>
+            </a>
           </li>
         </ul>
       )}
@@ -369,6 +369,7 @@ function NavItem({ href, active, icon, label }: NavItemProps) {
   return (
     <Link
       href={href}
+      prefetch={false}
       aria-current={active ? "page" : undefined}
       style={{
         display: "flex",

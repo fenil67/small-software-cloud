@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useOrganizationList, useClerk } from "@clerk/nextjs";
 import { Logo } from "../../../components/brand/Logo";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
-import { navigateHard, pollSession } from "../../../lib/navigate";
+import { navigateHard } from "../../../lib/navigate";
 
 interface Props {
   firstName: string | null;
@@ -39,14 +39,13 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
       if (!org) throw new Error("create_failed");
       console.info("[workspace] created");
       try {
-        await setActive?.({ organization: org.id });
-        console.info("[workspace] setActive done");
-        await pollSession(() => clerk.session?.lastActiveOrganizationId, org.id, 5000);
-        const confirmed = clerk.session?.lastActiveOrganizationId === org.id;
-        console.info(confirmed ? "[workspace] session confirmed" : "[workspace] session wait timed out");
-      } finally {
-        // Navigates regardless of whether setActive or session polling succeeded.
-        console.info("[workspace] navigating");
+        // redirectUrl tells Clerk to call routerPush("/apps") as part of the switch.
+        // __internal_onAfterSetActive then calls router.refresh() on /apps, not the old page.
+        await setActive?.({ organization: org.id, redirectUrl: "/apps" });
+        console.info("[workspace] setActive done (Clerk navigating to /apps)");
+      } catch {
+        // setActive failed — Clerk did not navigate; fall back to hard navigation.
+        console.info("[workspace] setActive failed, navigating fallback");
         navigateHard("/apps");
       }
     } catch {
@@ -64,13 +63,10 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
       if (inv) await inv.accept();
       console.info("[workspace] created");
       try {
-        await setActive?.({ organization: orgId });
-        console.info("[workspace] setActive done");
-        await pollSession(() => clerk.session?.lastActiveOrganizationId, orgId, 5000);
-        const confirmed = clerk.session?.lastActiveOrganizationId === orgId;
-        console.info(confirmed ? "[workspace] session confirmed" : "[workspace] session wait timed out");
-      } finally {
-        console.info("[workspace] navigating");
+        await setActive?.({ organization: orgId, redirectUrl: "/apps" });
+        console.info("[workspace] setActive done (Clerk navigating to /apps)");
+      } catch {
+        console.info("[workspace] setActive failed, navigating fallback");
         navigateHard("/apps");
       }
     } catch {

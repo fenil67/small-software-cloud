@@ -524,32 +524,32 @@ describe("Sidebar – workspace switcher", () => {
     expect(link).toHaveAttribute("href", "/onboarding?new=1");
   });
 
-  it("calls setActive with correct orgId when switching", async () => {
+  it("calls setActive with redirectUrl: '/apps' when switching (mutation: remove redirectUrl → Clerk won't navigate)", async () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: /acme corp/i }));
     await act(async () => {
-      // Beta Inc button is inside the listbox
       const betaBtn = screen.getByRole("button", { name: /beta inc/i });
       fireEvent.click(betaBtn);
     });
-    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb" });
+    // Clerk navigates via routerPush internally using redirectUrl — no separate navigateHard on success.
+    // Mutation: remove redirectUrl → this assertion fails and the 499/race returns.
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb", redirectUrl: "/apps" });
   });
 
-  it("navigates to /apps after switching workspace (session confirms new org)", async () => {
+  it("does NOT call navigateHard when setActive succeeds (Clerk handles navigation via redirectUrl)", async () => {
     const mockAssign = vi.fn();
     Object.defineProperty(window, "location", {
       value: { assign: mockAssign, replace: vi.fn(), href: "/" },
       writable: true,
       configurable: true,
     });
-    // Session reflects new org immediately (setActive resolves synchronously in mock)
-    _mockSessionOrgId = "org_bbb";
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: /acme corp/i }));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
     });
-    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+    // navigateHard must NOT fire — it would race with Clerk's __internal_onAfterSetActive router.refresh()
+    expect(mockAssign).not.toHaveBeenCalled();
   });
 
   it("Escape key closes the listbox and returns focus to trigger", () => {
@@ -745,31 +745,27 @@ describe("Sidebar – workspace switch flow", () => {
     });
   });
 
-  it("awaits setActive before navigating (mutation: navigate before setActive → test fails)", async () => {
-    let resolveSwitch!: () => void;
-    mockSetActive.mockReturnValue(new Promise<void>((r) => { resolveSwitch = r; }));
-
+  it("setActive called with redirectUrl '/apps'; no navigateHard on success (mutation: remove redirectUrl → test fails)", async () => {
+    // setActive resolves immediately (default vi.fn() returns undefined)
     render(<Sidebar />);
-
-    // Open the workspace switcher
     fireEvent.click(screen.getByRole("button", { name: /switch workspace/i }));
-
-    // Click Beta Inc (org_bbb ≠ current org_aaa)
-    fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
-
-    // setActive must have been called with the target org
-    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb" });
-
-    // navigate must NOT happen while setActive is still pending
-    expect(mockAssign).not.toHaveBeenCalled();
-
-    // Simulate session update + resolve setActive
-    _mockSessionOrgId = "org_bbb";
-    act(() => { resolveSwitch(); });
-
-    await waitFor(() => {
-      expect(mockAssign).toHaveBeenCalledWith("/apps");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
     });
+    // Mutation: remove redirectUrl from setActive → Clerk won't navigate, the 499 race returns.
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb", redirectUrl: "/apps" });
+    // Clerk handles navigation internally via routerPush — we do NOT call navigateHard.
+    expect(mockAssign).not.toHaveBeenCalled();
+  });
+
+  it("setActive throws → navigateHard called as fallback", async () => {
+    mockSetActive.mockRejectedValue(new Error("clerk_set_active_failed"));
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: /switch workspace/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
+    });
+    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
   });
 
   it("trigger button shows Switching… and is disabled while in progress", async () => {
@@ -783,9 +779,9 @@ describe("Sidebar – workspace switch flow", () => {
     // Trigger button should now show Switching… and be disabled
     expect(screen.getByRole("button", { name: /switching/i })).toBeDisabled();
 
-    _mockSessionOrgId = "org_bbb";
-    act(() => { resolveSwitch(); });
-    await waitFor(() => expect(mockAssign).toHaveBeenCalled());
+    // After setActive resolves, setSwitching(null) rerenders the button to its normal state
+    await act(async () => { resolveSwitch(); });
+    await waitFor(() => expect(screen.getByRole("button", { name: /switch workspace/i })).not.toBeDisabled());
   });
 });
 
@@ -838,36 +834,29 @@ describe("OnboardingClient – BUG B: navigation after workspace creation", () =
     expect(mockCreateOrganization).toHaveBeenCalledWith({ name: "My New Workspace" });
   });
 
-  it("navigates to /apps after session confirms new org", async () => {
+  it("setActive called with redirectUrl: '/apps' on create (mutation: remove redirectUrl → Clerk won't navigate)", async () => {
     mockCreateOrganization.mockResolvedValue({ id: "org_new" });
-    _mockSessionOrgId = "org_new"; // session confirms immediately
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    // Mutation: remove redirectUrl → Clerk's __internal_onAfterSetActive refresh lands on the
+    // wrong page (the old org's page) → 404 or stale RSC data.
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_new", redirectUrl: "/apps" });
+    // Clerk handles navigation — we do NOT call navigateHard on success.
+    expect(mockAssign).not.toHaveBeenCalled();
+  });
+
+  it("setActive throws → navigateHard called as fallback (create)", async () => {
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    mockSetActive.mockRejectedValue(new Error("clerk_set_active_failed"));
     render(<OnboardingClient firstName={null} />);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /continue/i }));
     });
     await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
-  });
-
-  it("navigates to /apps after 5-second cap even if session never confirms (mutation: remove fallback → test fails)", async () => {
-    vi.useFakeTimers();
-    try {
-      mockCreateOrganization.mockResolvedValue({ id: "org_new_slow" });
-      _mockSessionOrgId = null; // session never updates (simulates slow Clerk propagation)
-      render(<OnboardingClient firstName={null} />);
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
-      // Trigger the click synchronously — the async handler polls in the background
-      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
-      // Advance past the 5-second polling deadline and flush all pending promises
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(6000);
-      });
-      // The only path to this call is the unconditional navigateHard after pollSession.
-      // Mutation: remove navigateHard("/apps") from handleCreate → this assertion fails.
-      expect(mockAssign).toHaveBeenCalledWith("/apps");
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("failure shows error message and does not navigate", async () => {
@@ -1008,7 +997,7 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     _mockSessionOrgId = null;
   });
 
-  it("setActive throws → still navigates to /apps (try/finally)", async () => {
+  it("setActive throws → navigateHard called (catch fallback)", async () => {
     mockCreateOrganization.mockResolvedValue({ id: "org_new" });
     mockSetActive.mockRejectedValue(new Error("clerk_set_active_failed"));
     render(<OnboardingClient firstName={null} />);
@@ -1016,30 +1005,47 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /continue/i }));
     });
-    // Mutation: remove the inner try/finally → navigateHard moves inside try → setActive throw
-    // propagates to outer catch → error shown, navigation skipped → this assertion fails.
+    // Mutation: remove the catch block → setActive throw propagates to outer catch →
+    // error shown, navigation skipped → this assertion fails.
     await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
   });
 
-  it("session polling throws → still navigates to /apps (try/finally)", async () => {
-    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
-    // setActive succeeds but then session polling would throw if pollSession itself threw.
-    // We simulate this by making setActive succeed then the session never updates (timeout path).
-    // The try/finally ensures navigation regardless.
-    mockSetActive.mockResolvedValue(undefined);
-    _mockSessionOrgId = null; // session never updates
-    vi.useFakeTimers();
-    try {
-      render(<OnboardingClient firstName={null} />);
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
-      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(6000);
-      });
-      expect(mockAssign).toHaveBeenCalledWith("/apps");
-    } finally {
-      vi.useRealTimers();
-    }
+  it("handleJoin: setActive called with redirectUrl: '/apps' (mutation: remove option → test fails)", async () => {
+    // Supply a pending invitation in the mock
+    const mockAccept = vi.fn().mockResolvedValue(undefined);
+    const { useOrganizationList } = await import("@clerk/nextjs");
+    (useOrganizationList as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      userMemberships: { data: [] },
+      userInvitations: {
+        data: [{ id: "inv_1", accept: mockAccept, publicOrganizationData: { id: "org_ccc", name: "Gamma LLC" } }],
+      },
+      setActive: mockSetActive,
+      createOrganization: mockCreateOrganization,
+    });
+    render(<OnboardingClient firstName={null} />);
+    const joinBtn = screen.getByRole("button", { name: /join/i });
+    await act(async () => { fireEvent.click(joinBtn); });
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_ccc", redirectUrl: "/apps" });
+    // Clerk handles navigation — no navigateHard on success.
+    expect(mockAssign).not.toHaveBeenCalled();
+  });
+
+  it("handleJoin: setActive throws → navigateHard called as fallback", async () => {
+    const mockAccept = vi.fn().mockResolvedValue(undefined);
+    const { useOrganizationList } = await import("@clerk/nextjs");
+    (useOrganizationList as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      userMemberships: { data: [] },
+      userInvitations: {
+        data: [{ id: "inv_1", accept: mockAccept, publicOrganizationData: { id: "org_ccc", name: "Gamma LLC" } }],
+      },
+      setActive: mockSetActive,
+      createOrganization: mockCreateOrganization,
+    });
+    mockSetActive.mockRejectedValue(new Error("clerk_error"));
+    render(<OnboardingClient firstName={null} />);
+    const joinBtn = screen.getByRole("button", { name: /join/i });
+    await act(async () => { fireEvent.click(joinBtn); });
+    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
   });
 
   it("createOrganization throws → error shown, does NOT navigate", async () => {
