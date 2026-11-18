@@ -181,6 +181,42 @@ function streamRequest(url: string, headers: Record<string, string>): Promise<st
   });
 }
 
+// ── Fixture normalizer (E1 determinism) ──────────────────────────────────────
+// Replaces volatile UUIDs and ISO-8601 timestamps with stable placeholders so
+// running the suite twice produces identical fixture files (git status clean).
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ISO_TS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+function normalizeFixture(val: unknown): unknown {
+  const uuidMap = new Map<string, string>();
+  let uuidCounter = 0;
+
+  function normalize(v: unknown): unknown {
+    if (typeof v === "string") {
+      if (UUID_PATTERN.test(v)) {
+        if (!uuidMap.has(v)) {
+          uuidCounter++;
+          const hex = uuidCounter.toString(16).padStart(12, "0");
+          uuidMap.set(v, `00000000-0000-4000-8000-${hex}`);
+        }
+        return uuidMap.get(v);
+      }
+      if (ISO_TS_PATTERN.test(v)) return "2026-01-01T00:00:00.000Z";
+      return v;
+    }
+    if (Array.isArray(v)) return v.map(normalize);
+    if (v !== null && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, val2] of Object.entries(v as Record<string, unknown>)) {
+        out[k] = normalize(val2);
+      }
+      return out;
+    }
+    return v;
+  }
+  return normalize(val);
+}
+
 // ── DB seeding ────────────────────────────────────────────────────────────────
 
 interface SeedResult {
@@ -194,6 +230,16 @@ interface SeedResult {
 
 async function seed(): Promise<SeedResult> {
   // Clean up from prior runs
+  // activity_events is append-only; use allow_erase to clear it on each run
+  {
+    const c = await pool.connect();
+    try {
+      await c.query("BEGIN");
+      await c.query("SET LOCAL ssc.allow_erase = 'on'");
+      await c.query("DELETE FROM activity_events");
+      await c.query("COMMIT");
+    } catch { await c.query("ROLLBACK").catch(() => {}); } finally { c.release(); }
+  }
   await pool.query("DELETE FROM watchdog_alerts");
   await pool.query("DELETE FROM watchdog_probe_state");
   await pool.query("DELETE FROM deployments");
@@ -9869,7 +9915,7 @@ async function main(): Promise<void> {
           : fail("AQ1: deployment shape mismatch", JSON.stringify(arr[0]));
         fs.writeFileSync(
           path.join(fixturesDir, "deployments.json"),
-          JSON.stringify(r.body, null, 2),
+          JSON.stringify(normalizeFixture(r.body), null, 2),
         );
         ok("AQ1: deployments.json saved");
       } else {
@@ -9896,7 +9942,7 @@ async function main(): Promise<void> {
           : fail("AQ2: access shape mismatch — expected {users:[], pending:[]}", JSON.stringify(b));
         fs.writeFileSync(
           path.join(fixturesDir, "access.json"),
-          JSON.stringify(r.body, null, 2),
+          JSON.stringify(normalizeFixture(r.body), null, 2),
         );
         ok("AQ2: access.json saved");
       } else {
@@ -9912,7 +9958,7 @@ async function main(): Promise<void> {
         ok("AQ3: GET /v1/apps returns an array");
         fs.writeFileSync(
           path.join(fixturesDir, "apps-list.json"),
-          JSON.stringify(r.body, null, 2),
+          JSON.stringify(normalizeFixture(r.body), null, 2),
         );
         ok("AQ3: apps-list.json saved");
       } else {
@@ -9932,7 +9978,7 @@ async function main(): Promise<void> {
           : fail("AQ4: app detail shape mismatch", JSON.stringify(Object.keys(b)));
         fs.writeFileSync(
           path.join(fixturesDir, "app-detail.json"),
-          JSON.stringify(r.body, null, 2),
+          JSON.stringify(normalizeFixture(r.body), null, 2),
         );
         ok("AQ4: app-detail.json saved");
       } else {
@@ -9942,6 +9988,1096 @@ async function main(): Promise<void> {
 
     // ── Cleanup AQ org ────────────────────────────────────────────────────────
     await pool.query("DELETE FROM orgs WHERE id=$1", [aqOrgId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AR: Activity log — T1–T8, M1–M8");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // Admin Clerk ID: matches PLATFORM_ADMIN_CLERK_IDS in test-server.ts
+    const arAdminClerkId = "user_admintest1";
+    const adminHeaders = { "x-test-clerk-user-id": arAdminClerkId };
+
+    // Ensure admin user row exists (AF section creates it, but be safe)
+    const arAdminUserRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email
+       RETURNING id`,
+      [arAdminClerkId, "ar-admin@test.local", "AR Admin"],
+    );
+    const arAdminUserId = arAdminUserRow.rows[0].id;
+
+    // Clean slate for activity_events (use allow_erase to bypass trigger)
+    {
+      const arClear = await pool.connect();
+      try {
+        await arClear.query("BEGIN");
+        await arClear.query("SET LOCAL ssc.allow_erase = 'on'");
+        await arClear.query("DELETE FROM activity_events");
+        await arClear.query("COMMIT");
+      } catch { await arClear.query("ROLLBACK").catch(() => {}); } finally { arClear.release(); }
+    }
+
+    // ── T1: All 29 event types can be inserted ────────────────────────────────
+    {
+      const { ActivityEventType } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
+      const allTypes = Object.values(ActivityEventType) as string[];
+      let insertedCount = 0;
+      for (const evType of allTypes) {
+        try {
+          await pool.query(
+            `INSERT INTO activity_events (event_type, actor_type, metadata)
+             VALUES ($1, 'system', '{}')`,
+            [evType],
+          );
+          insertedCount++;
+        } catch (e) {
+          fail(`AR-T1: failed to insert event type "${evType}"`, String(e));
+        }
+      }
+      insertedCount === 29
+        ? ok("AR-T1: all 29 event types inserted into activity_events")
+        : fail(`AR-T1: expected 29 insertable event types, got ${insertedCount}`);
+
+      const { rows: countRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events",
+      );
+      const n = parseInt(countRows[0].n, 10);
+      n === 29
+        ? ok("AR-T1: activity_events has exactly 29 rows after seeding")
+        : fail(`AR-T1: expected 29 rows, got ${n}`);
+    }
+
+    // ── T2: Secrets never stored in any activity_events column ────────────────
+    {
+      // Send requests carrying various secrets and verify none leak into the DB.
+      // We use a fresh bad key so key.auth_failed is recorded (best chance of leaking).
+      const t2BearerKey = "ssc_" + "T2secretkeyvalue12345678901234567890abcd";
+      const t2Password  = "T2_plaintext_password_should_not_appear";
+      const t2Cookie    = "session=T2_cookie_session_value_secret";
+      const t2QueryTok  = "T2_query_token_value";
+      const t2ProxyCode = "T2proxycodevalue" + "x".repeat(28); // 44-char code-like string
+
+      // Reset throttle so key.auth_failed fires
+      await request("POST", "/test/reset-activity-throttle", {});
+
+      // 1. Request with Authorization: Bearer (bad key) + cookie + query token
+      await request("GET", `/v1/apps?token=${t2QueryTok}`, {
+        headers: {
+          Authorization: `Bearer ${t2BearerKey}`,
+          Cookie: t2Cookie,
+        },
+      });
+
+      // 2. Request with JSON body containing "password"
+      await request("POST", "/v1/auth/check", {
+        headers: { "Content-Type": "application/json" },
+        body: { password: t2Password },
+      });
+
+      // Allow async writes to settle
+      await new Promise<void>((r) => setTimeout(r, 300));
+
+      // Check the entire row as text for any secret value
+      const secrets = [t2BearerKey, t2Password, t2Cookie, t2QueryTok, t2ProxyCode];
+      let leaked = false;
+      for (const secret of secrets) {
+        const { rows } = await pool.query<{ n: string }>(
+          `SELECT COUNT(*) AS n FROM activity_events
+           WHERE (
+             COALESCE(event_type,'') || COALESCE(actor_email,'') || COALESCE(target_id,'') ||
+             COALESCE(metadata::text,'') || COALESCE(user_agent,'') || COALESCE(request_id,'')
+           ) ILIKE $1`,
+          [`%${secret}%`],
+        );
+        if (parseInt(rows[0].n, 10) > 0) {
+          fail(`AR-T2: secret leaked into activity_events: "${secret.slice(0, 20)}..."`, "");
+          leaked = true;
+        }
+      }
+      if (!leaked) {
+        ok("AR-T2: no secrets (Authorization, API key, password, cookie, query token) leaked into activity_events");
+      }
+
+      // Also check for the original pattern (belt + suspenders)
+      const { rows: secretRows } = await pool.query<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM activity_events
+         WHERE metadata::text ~* '(Bearer|key_hash|ssc_[a-z0-9]+|password)'`,
+      );
+      parseInt(secretRows[0].n, 10) === 0
+        ? ok("AR-T2: metadata regex check clean (Bearer/key_hash/ssc_*/password)")
+        : fail("AR-T2: metadata regex check found secret-looking values");
+    }
+
+    // ── T3: Append-only trigger ───────────────────────────────────────────────
+    {
+      // Insert a fresh row
+      const { rows: t3Row } = await pool.query<{ id: string }>(
+        `INSERT INTO activity_events (event_type, actor_type, metadata)
+         VALUES ('app.created','system','{"test":"T3"}') RETURNING id`,
+      );
+      const t3Id = t3Row[0].id;
+
+      // UPDATE without allow_erase → trigger must raise
+      let updateBlocked = false;
+      try {
+        await pool.query(
+          "UPDATE activity_events SET metadata = '{\"test\":\"mutated\"}' WHERE id = $1",
+          [t3Id],
+        );
+      } catch {
+        updateBlocked = true;
+      }
+      updateBlocked
+        ? ok("AR-T3: UPDATE without ssc.allow_erase raises exception (append-only)")
+        : fail("AR-T3: UPDATE without allow_erase should have been blocked");
+
+      // UPDATE with SET LOCAL ssc.allow_erase='on' — RETURNS NEW (C1 fix: not OLD)
+      {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("SET LOCAL ssc.allow_erase = 'on'");
+          await client.query(
+            "UPDATE activity_events SET metadata = '{\"test\":\"allowed\"}' WHERE id = $1",
+            [t3Id],
+          );
+          await client.query("COMMIT");
+
+          const { rows: afterRows } = await pool.query<{ metadata: Record<string, unknown> }>(
+            "SELECT metadata FROM activity_events WHERE id = $1",
+            [t3Id],
+          );
+          const afterMeta = afterRows[0]?.metadata as Record<string, unknown>;
+          afterMeta?.test === "allowed"
+            ? ok("AR-T3: UPDATE with ssc.allow_erase='on' applies changes (RETURN NEW, not OLD)")
+            : fail("AR-T3: UPDATE with allow_erase did not apply", JSON.stringify(afterMeta));
+        } catch (e) {
+          await client.query("ROLLBACK").catch(() => {});
+          fail("AR-T3: UPDATE with allow_erase threw unexpectedly", String(e));
+        } finally {
+          client.release();
+        }
+      }
+
+      // DELETE without allow_erase → trigger must raise
+      let deleteBlocked = false;
+      try {
+        await pool.query("DELETE FROM activity_events WHERE id = $1", [t3Id]);
+      } catch {
+        deleteBlocked = true;
+      }
+      deleteBlocked
+        ? ok("AR-T3: DELETE without ssc.allow_erase raises exception")
+        : fail("AR-T3: DELETE without allow_erase should have been blocked");
+
+      // TRUNCATE → separate trigger must raise
+      let truncateBlocked = false;
+      try {
+        await pool.query("TRUNCATE activity_events");
+      } catch {
+        truncateBlocked = true;
+      }
+      truncateBlocked
+        ? ok("AR-T3: TRUNCATE activity_events raises exception")
+        : fail("AR-T3: TRUNCATE should have been blocked by trigger");
+    }
+
+    // ── T4: Erase completeness ────────────────────────────────────────────────
+    {
+      const eraseEmail = "erase-me@example.com";
+      const safeEmail = "safe-person_at_example.com"; // underscore: LIKE wildcard if not escaped
+      const likeSpecialEmail = "erase%test@example.com"; // percent: LIKE wildcard
+
+      // Insert events: person as actor, as target, in metadata
+      {
+        const c = await pool.connect();
+        try {
+          await c.query("BEGIN");
+          await c.query("SET LOCAL ssc.allow_erase = 'on'");
+          await c.query("DELETE FROM activity_events");
+          await c.query("COMMIT");
+        } catch { await c.query("ROLLBACK").catch(() => {}); } finally { c.release(); }
+      }
+
+      // Person as actor (with PII fields to verify they get redacted/cleared before delete)
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, actor_email, ip, user_agent, metadata)
+         VALUES ('app.visit', 'user', $1, '1.2.3.4', 'Mozilla/5.0', '{}')`,
+        [eraseEmail],
+      );
+
+      // Person as target
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, target_id, metadata)
+         VALUES ('access.granted', 'user', $1, '{}')`,
+        [eraseEmail],
+      );
+
+      // Person in metadata
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, metadata)
+         VALUES ('key.created', 'user', $1)`,
+        [JSON.stringify({ granted_to: eraseEmail })],
+      );
+
+      // Safe person (email with underscore — must NOT be erased if LIKE not escaped)
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, actor_email, metadata)
+         VALUES ('app.visit', 'user', $1, '{}')`,
+        [safeEmail],
+      );
+
+      const { rows: beforeRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events",
+      );
+      const beforeCount = parseInt(beforeRows[0].n, 10);
+      beforeCount === 4
+        ? ok("AR-T4: 4 rows seeded before erase")
+        : fail(`AR-T4: expected 4 rows before erase, got ${beforeCount}`);
+
+      // POST /erase
+      const eraseR = await request("POST", "/v1/admin/activity/erase", {
+        headers: adminHeaders,
+        body: { email: eraseEmail },
+      });
+      eraseR.status === 200
+        ? ok("AR-T4: POST /erase returns 200")
+        : fail("AR-T4: POST /erase should return 200", `got ${eraseR.status} ${JSON.stringify(eraseR.body)}`);
+
+      const eraseBody = eraseR.body as { erased?: number };
+      typeof eraseBody.erased === "number"
+        ? ok(`AR-T4: erased field returned (${eraseBody.erased} rows deleted)`)
+        : fail("AR-T4: response must include erased count", JSON.stringify(eraseBody));
+
+      // Actor-email row deleted; target_id row kept but target_id redacted
+      const { rows: afterRows } = await pool.query(
+        "SELECT event_type, actor_email, target_id, metadata FROM activity_events ORDER BY occurred_at",
+      );
+      const actorRow = afterRows.find((r) => (r as { event_type: string }).event_type === "app.visit" && (r as { actor_email: string | null }).actor_email === eraseEmail);
+      actorRow === undefined
+        ? ok("AR-T4: actor_email=eraseEmail row was deleted")
+        : fail("AR-T4: actor_email=eraseEmail row should have been deleted");
+
+      const targetRow = afterRows.find((r) => (r as { event_type: string }).event_type === "access.granted") as { target_id: string } | undefined;
+      targetRow?.target_id === "[redacted]"
+        ? ok("AR-T4: target_id=eraseEmail was redacted to '[redacted]'")
+        : fail("AR-T4: target_id should be '[redacted]'", String(targetRow?.target_id));
+
+      const metaRow = afterRows.find((r) => (r as { event_type: string }).event_type === "key.created") as { metadata: Record<string, unknown> } | undefined;
+      metaRow?.metadata?.granted_to === "[redacted]"
+        ? ok("AR-T4: eraseEmail in metadata was redacted")
+        : fail("AR-T4: metadata should have granted_to='[redacted]'", JSON.stringify(metaRow?.metadata));
+
+      // Safe person (underscore email) should be untouched (C4: LIKE escape)
+      const safeRow = afterRows.find((r) => (r as { actor_email: string | null }).actor_email === safeEmail);
+      safeRow !== undefined
+        ? ok("AR-T4: similar-email person with underscore was NOT erased (LIKE wildcard escaped)")
+        : fail("AR-T4: safe person with underscore in email was incorrectly erased");
+
+      // M3 kill: target_id row (which survives erase) must have ip=NULL
+      // We need a row that has BOTH target_id=eraseEmail AND ip set.
+      // Insert one explicitly:
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, target_id, ip, metadata)
+         VALUES ('access.refused','user',$1,'7.7.7.7','{}')`,
+        [eraseEmail],
+      );
+      // Now erase again — the target_id row survives but should have ip cleared
+      const eraseR2 = await request("POST", "/v1/admin/activity/erase", {
+        headers: adminHeaders,
+        body: { email: eraseEmail },
+      });
+      eraseR2.status === 200 ? ok("AR-T4-M3: second erase returns 200") : fail("AR-T4-M3: second erase failed", `${eraseR2.status}`);
+
+      const { rows: ipRows } = await pool.query<{ ip: string | null }>(
+        "SELECT ip FROM activity_events WHERE target_id = '[redacted]' AND event_type = 'access.refused'",
+      );
+      ipRows[0]?.ip === null
+        ? ok("AR-T4-M3: surviving row (target_id redacted) has ip=NULL after erase (C4)")
+        : fail("AR-T4-M3: ip not cleared on surviving target_id row", String(ipRows[0]?.ip));
+
+      // M4 kill: admin.person_erased event must NOT contain the erased email in metadata
+      const { rows: eraseEvRows } = await pool.query<{ metadata: Record<string, unknown> }>(
+        "SELECT metadata FROM activity_events WHERE event_type = 'admin.person_erased' ORDER BY occurred_at DESC LIMIT 1",
+      );
+      const eraseEvMeta = eraseEvRows[0]?.metadata ?? {};
+      const eraseMetaStr = JSON.stringify(eraseEvMeta);
+      !eraseMetaStr.includes(eraseEmail)
+        ? ok("AR-T4-M4: admin.person_erased metadata does NOT contain the erased email (C3/M4)")
+        : fail("AR-T4-M4: admin.person_erased metadata leaks the erased email", eraseMetaStr);
+    }
+
+    // ── T5: Failed activity write behavior ────────────────────────────────────
+    {
+      // T5a: best-effort failure does NOT break the main response
+      {
+        const r = await request("GET", "/v1/apps", {
+          headers: { Authorization: "Bearer ssc_000000000000000000000000000000000000000000000000" },
+        });
+        r.status === 401
+          ? ok("AR-T5a: bad API key still returns 401 (best-effort write failure doesn't break response)")
+          : fail("AR-T5a: bad key should return 401", `got ${r.status}`);
+      }
+
+      // T5b: forced failure of transactional inserts rolls back the whole operation
+      // Helper: fresh app for each sub-test
+      const { rows: t5OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id,name,slug) VALUES ('clerk_org_t5','T5 Org','t5-org') RETURNING id",
+      );
+      const t5OrgId = t5OrgRows[0].id;
+      const t5KeyData = generateApiKey();
+      const { rows: t5UserRows } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id,email,display_name) VALUES ('clerk_t5_user','t5@test.local','T5 User')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+      );
+      const t5UserId = t5UserRows[0].id;
+      await pool.query(
+        "INSERT INTO api_keys (org_id,created_by,name,key_prefix,key_hash,scopes) VALUES ($1,$2,'t5-key',$3,$4,'{read,deploy,manage}')",
+        [t5OrgId, t5UserId, t5KeyData.keyPrefix, t5KeyData.keyHash],
+      );
+      await request("POST", "/test/set-clerk-user", { body: { clerkUserId: "clerk_t5_user", email: "t5@test.local", verified: true } });
+      const t5ClerkHeaders = { "x-test-clerk-user-id": "clerk_t5_user", "x-test-clerk-org-id": "clerk_org_t5", "x-test-clerk-org-role": "org:admin" };
+
+      // T5b-access.granted: arm failure → POST /access → error → pending_access NOT created
+      {
+        const { rows: t5AppR } = await pool.query<{ id: string }>(
+          "INSERT INTO apps (org_id,owner_id,name,slug,source_type) VALUES ($1,$2,'T5App1','t5-app1','zip') RETURNING id",
+          [t5OrgId, t5UserId],
+        );
+        const t5AppId = t5AppR[0].id;
+        await request("POST", "/test/arm-activity-insert-failure", {});
+        const gr = await request("POST", `/v1/apps/${t5AppId}/access`, {
+          headers: t5ClerkHeaders,
+          body: { email: "t5-grant@test.local" },
+        });
+        gr.status >= 500
+          ? ok("AR-T5b: access.granted failure → 5xx (tx rolled back)")
+          : fail(`AR-T5b: expected 5xx for forced insert failure, got ${gr.status}`);
+        const { rows: pendingChk } = await pool.query<{ n: string }>(
+          "SELECT COUNT(*) AS n FROM pending_access WHERE app_id=$1 AND email='t5-grant@test.local'",
+          [t5AppId],
+        );
+        parseInt(pendingChk[0].n, 10) === 0
+          ? ok("AR-T5b: access.granted tx rollback — pending_access NOT created")
+          : fail("AR-T5b: pending_access was created despite insert failure (grant not rolled back)");
+        await pool.query("DELETE FROM apps WHERE id=$1", [t5AppId]);
+      }
+
+      // T5b-access.revoked: grant first, arm failure, DELETE → error → grant still present
+      {
+        const { rows: t5AppR } = await pool.query<{ id: string }>(
+          "INSERT INTO apps (org_id,owner_id,name,slug,source_type) VALUES ($1,$2,'T5App2','t5-app2','zip') RETURNING id",
+          [t5OrgId, t5UserId],
+        );
+        const t5AppId2 = t5AppR[0].id;
+        // Create the pending grant directly
+        await pool.query(
+          "INSERT INTO pending_access (app_id,email,granted_by) VALUES ($1,'t5-revoke@test.local',NULL)",
+          [t5AppId2],
+        );
+        await request("POST", "/test/arm-activity-insert-failure", {});
+        const rr = await request("DELETE", `/v1/apps/${t5AppId2}/access/${encodeURIComponent("t5-revoke@test.local")}`, {
+          headers: t5ClerkHeaders,
+        });
+        rr.status >= 500
+          ? ok("AR-T5b: access.revoked failure → 5xx (tx rolled back)")
+          : fail(`AR-T5b: expected 5xx for forced insert failure, got ${rr.status}`);
+        const { rows: pendingChk2 } = await pool.query<{ n: string }>(
+          "SELECT COUNT(*) AS n FROM pending_access WHERE app_id=$1 AND email='t5-revoke@test.local'",
+          [t5AppId2],
+        );
+        parseInt(pendingChk2[0].n, 10) === 1
+          ? ok("AR-T5b: access.revoked tx rollback — pending_access still present (revoke not committed)")
+          : fail("AR-T5b: pending_access was removed despite insert failure (revoke not rolled back)");
+        await pool.query("DELETE FROM apps WHERE id=$1", [t5AppId2]);
+      }
+
+      // T5b-key.revoked: arm failure, DELETE /api-keys/:id → 5xx → key NOT revoked
+      {
+        const kd = generateApiKey();
+        const { rows: t5KeyR } = await pool.query<{ id: string }>(
+          "INSERT INTO api_keys (org_id,created_by,name,key_prefix,key_hash,scopes) VALUES ($1,$2,'t5b-key',$3,$4,'{read}') RETURNING id",
+          [t5OrgId, t5UserId, kd.keyPrefix, kd.keyHash],
+        );
+        const t5KeyId = t5KeyR[0].id;
+        await request("POST", "/test/arm-activity-insert-failure", {});
+        const kr = await request("DELETE", `/v1/api-keys/${t5KeyId}`, { headers: t5ClerkHeaders });
+        kr.status >= 500
+          ? ok("AR-T5b: key.revoked failure → 5xx (tx rolled back)")
+          : fail(`AR-T5b: expected 5xx for key.revoked failure, got ${kr.status}`);
+        const { rows: keyChk } = await pool.query<{ revoked_at: Date | null }>(
+          "SELECT revoked_at FROM api_keys WHERE id=$1",
+          [t5KeyId],
+        );
+        keyChk[0]?.revoked_at === null
+          ? ok("AR-T5b: key.revoked tx rollback — key NOT revoked")
+          : fail("AR-T5b: key was revoked despite insert failure (rollback failed)");
+      }
+
+      // T5b-app.deleted: arm failure, DELETE /apps/:id → 5xx → app NOT soft-deleted
+      {
+        const { rows: t5AppR3 } = await pool.query<{ id: string }>(
+          "INSERT INTO apps (org_id,owner_id,name,slug,source_type) VALUES ($1,$2,'T5App3','t5-app3','zip') RETURNING id",
+          [t5OrgId, t5UserId],
+        );
+        const t5AppId3 = t5AppR3[0].id;
+        await request("POST", "/test/arm-activity-insert-failure", {});
+        const dr = await request("DELETE", `/v1/apps/${t5AppId3}`, { headers: t5ClerkHeaders });
+        dr.status >= 500
+          ? ok("AR-T5b: app.deleted failure → 5xx (tx rolled back)")
+          : fail(`AR-T5b: expected 5xx for app.deleted failure, got ${dr.status}`);
+        const { rows: appChk } = await pool.query<{ deleted_at: Date | null }>(
+          "SELECT deleted_at FROM apps WHERE id=$1",
+          [t5AppId3],
+        );
+        appChk[0]?.deleted_at === null
+          ? ok("AR-T5b: app.deleted tx rollback — app NOT soft-deleted")
+          : fail("AR-T5b: app was soft-deleted despite insert failure (rollback failed)");
+        await pool.query("DELETE FROM apps WHERE id=$1", [t5AppId3]);
+      }
+
+      // Cleanup T5 resources
+      await pool.query("DELETE FROM orgs WHERE id=$1", [t5OrgId]);
+    }
+
+    // ── T6: Non-admin gets 404 on activity routes (C7) ────────────────────────
+    {
+      // Fresh API key for T6 — keyA may be revoked by earlier sections (AI5c reconciliation)
+      const arT6KeyData = generateApiKey();
+      await pool.query(
+        `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+         VALUES ($1,$2,'ar-t6-key',$3,$4,'{read,deploy,manage}')`,
+        [orgAId, userId, arT6KeyData.keyPrefix, arT6KeyData.keyHash],
+      );
+      const arT6ApiKey = arT6KeyData.fullKey;
+
+      // No auth headers → 401 (requires auth first)
+      const r1 = await request("GET", "/v1/admin/activity");
+      r1.status === 401
+        ? ok("AR-T6: /v1/admin/activity without auth → 401")
+        : fail(`AR-T6: expected 401, got ${r1.status}`);
+
+      // API key auth (not Clerk) → 404
+      const r2 = await request("GET", "/v1/admin/activity", { headers: authHeaders(arT6ApiKey) });
+      r2.status === 404
+        ? ok("AR-T6: /v1/admin/activity with API key → 404 (not 403)")
+        : fail(`AR-T6: expected 404 for API key auth, got ${r2.status}`);
+
+      // Non-admin Clerk user → 404
+      const r3 = await request("GET", "/v1/admin/activity", {
+        headers: { "x-test-clerk-user-id": "clerk_ar_nonadmin" },
+      });
+      r3.status === 404
+        ? ok("AR-T6: /v1/admin/activity with non-admin Clerk → 404 (not 403)")
+        : fail(`AR-T6: expected 404 for non-admin Clerk, got ${r3.status}`);
+
+      // Admin → 200
+      const r4 = await request("GET", "/v1/admin/activity", { headers: adminHeaders });
+      r4.status === 200
+        ? ok("AR-T6: /v1/admin/activity with admin → 200")
+        : fail(`AR-T6: expected 200 for admin, got ${r4.status} ${JSON.stringify(r4.body)}`);
+    }
+
+    // ── T7: EXPLAIN shows index usage ─────────────────────────────────────────
+    {
+      // Insert 100 rows with varied timestamps so the planner sees some data
+      for (let i = 0; i < 100; i++) {
+        await pool.query(
+          `INSERT INTO activity_events (event_type, actor_type, metadata, occurred_at)
+           VALUES ('app.visit','system','{}', now() - ($1 * interval '1 second'))`,
+          [i],
+        );
+      }
+
+      // Force index scan (disable seq scan)
+      await pool.query("SET enable_seqscan = off");
+      let planText = "";
+      try {
+        const { rows: explainRows } = await pool.query<{ "QUERY PLAN": string }>(
+          `EXPLAIN SELECT * FROM activity_events
+           WHERE occurred_at < now()
+           ORDER BY occurred_at DESC, id DESC
+           LIMIT 50`,
+        );
+        planText = explainRows.map((r) => r["QUERY PLAN"]).join("\n");
+      } finally {
+        await pool.query("RESET enable_seqscan");
+      }
+
+      planText.toLowerCase().includes("index")
+        ? ok("AR-T7: EXPLAIN shows index scan on activity_events (occurred_at DESC, id DESC)")
+        : fail("AR-T7: EXPLAIN plan does not show index scan", planText.slice(0, 200));
+
+      console.log(DIM("  AR-T7 EXPLAIN plan (first 3 lines):"));
+      planText.split("\n").slice(0, 3).forEach((l) => console.log(DIM("    " + l)));
+    }
+
+    // ── T8: CSV formula injection escaping ────────────────────────────────────
+    {
+      // Insert a row with formula-looking values
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, actor_email, target_id, metadata)
+         VALUES ('access.refused', 'user', $1, $2, '{}')`,
+        ["=SUM(A1:A10)@test.com", "+cmd_injection"],
+      );
+
+      const exportR = await request("GET", "/v1/admin/activity/export", {
+        headers: adminHeaders,
+      });
+      exportR.status === 200
+        ? ok("AR-T8: GET /export returns 200")
+        : fail(`AR-T8: export should return 200, got ${exportR.status}`);
+
+      const csvText = exportR.text;
+      // The dangerous cell should be prefixed with a single quote
+      const hasEscapedFormula = csvText.includes("'=SUM(A1:A10)@test.com") || csvText.includes("'=SUM");
+      hasEscapedFormula
+        ? ok("AR-T8: formula-injection cell (=SUM...) prefixed with single quote in CSV")
+        : fail("AR-T8: formula injection cell not escaped in CSV", csvText.slice(0, 300));
+
+      const hasEscapedPlus = csvText.includes("'+cmd_injection") || csvText.includes("'+" );
+      hasEscapedPlus
+        ? ok("AR-T8: '+' cell prefixed with single quote in CSV")
+        : fail("AR-T8: '+' cell not escaped in CSV", csvText.slice(0, 300));
+
+      // Verify Content-Type header
+      const contentType = (exportR.headers["content-type"] as string | undefined) ?? "";
+      contentType.includes("text/csv")
+        ? ok("AR-T8: export Content-Type is text/csv")
+        : fail("AR-T8: export Content-Type should be text/csv", contentType);
+
+      // Tab-containing and CR-containing cells must also be escaped
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, actor_email, target_id, metadata)
+         VALUES ('access.refused', 'user', $1, $2, '{}')`,
+        ["\tinject-tab@test.local", "\rCR-inject"],
+      );
+      const exportR2 = await request("GET", "/v1/admin/activity/export", { headers: adminHeaders });
+      const csvText2 = exportR2.text;
+      const hasTabEscape = csvText2.includes("'\t") || csvText2.includes("'\tinject");
+      hasTabEscape
+        ? ok("AR-T8: tab-containing cell escaped with single quote in CSV")
+        : fail("AR-T8: tab cell not escaped", csvText2.slice(0, 300));
+      const hasCrEscape = csvText2.includes("'\r") || csvText2.includes("'\rCR");
+      hasCrEscape
+        ? ok("AR-T8: CR-containing cell escaped with single quote in CSV")
+        : fail("AR-T8: CR cell not escaped", csvText2.slice(0, 300));
+    }
+
+    // ── M1: Flood throttle — 50 bad key requests → only 1 key.auth_failed row ─
+    {
+      // Clear activity events first
+      const clearClient = await pool.connect();
+      try {
+        await clearClient.query("BEGIN");
+        await clearClient.query("SET LOCAL ssc.allow_erase = 'on'");
+        await clearClient.query("DELETE FROM activity_events WHERE event_type = 'key.auth_failed'");
+        await clearClient.query("COMMIT");
+      } finally {
+        clearClient.release();
+      }
+
+      // Reset in-memory throttle maps — T5 may have primed the IP within the same minute
+      await request("POST", "/test/reset-activity-throttle", {});
+
+      // Send 50 requests with bad key (all from same effective IP in test)
+      const badKey = "ssc_" + "x".repeat(44);
+      for (let i = 0; i < 50; i++) {
+        await request("GET", "/v1/apps", { headers: { Authorization: `Bearer ${badKey}` } });
+      }
+
+      // Allow async writes to settle
+      await new Promise<void>((r) => setTimeout(r, 300));
+
+      const { rows: floodRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE event_type = 'key.auth_failed'",
+      );
+      const floodCount = parseInt(floodRows[0].n, 10);
+      floodCount === 1
+        ? ok("AR-M1: flood throttle works — 50 bad key requests → 1 key.auth_failed row (C2)")
+        : fail(`AR-M1: expected 1 key.auth_failed row, got ${floodCount} (flood throttle may not be working)`);
+    }
+
+    // ── M2: Webhook dedup — same svix-id twice → 1 activity row (C3) ──────────
+    {
+      // Clear activity events
+      const clearClient2 = await pool.connect();
+      try {
+        await clearClient2.query("BEGIN");
+        await clearClient2.query("SET LOCAL ssc.allow_erase = 'on'");
+        await clearClient2.query("DELETE FROM activity_events");
+        await clearClient2.query("COMMIT");
+      } finally {
+        clearClient2.release();
+      }
+
+      const webhookBody = {
+        type: "user.created",
+        data: { id: "clerk_ar_newuser" },
+      };
+      // Sign the same webhook twice (same svix-id)
+      const signR = await request("POST", "/test/sign-webhook-event", { body: { body: webhookBody } });
+      const { svixId, svixTimestamp, svixSignature } = signR.body as {
+        svixId: string; svixTimestamp: string; svixSignature: string;
+      };
+      const webhookHeaders = {
+        "content-type": "application/json",
+        "svix-id": svixId,
+        "svix-timestamp": svixTimestamp,
+        "svix-signature": svixSignature,
+      };
+
+      // Send the same event twice
+      const r1 = await request("POST", "/v1/webhooks/clerk", { headers: webhookHeaders, body: webhookBody });
+      const r2 = await request("POST", "/v1/webhooks/clerk", { headers: webhookHeaders, body: webhookBody });
+
+      (r1.status === 200 && r2.status === 200)
+        ? ok("AR-M2: both duplicate webhook requests return 200")
+        : fail("AR-M2: webhook should return 200", `r1=${r1.status} r2=${r2.status}`);
+
+      await new Promise<void>((r) => setTimeout(r, 200));
+
+      const { rows: dedupRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE request_id = $1",
+        [svixId],
+      );
+      const dedupCount = parseInt(dedupRows[0].n, 10);
+      dedupCount === 1
+        ? ok("AR-M2: duplicate webhook event → only 1 activity_events row (C3 dedup via ON CONFLICT DO NOTHING)")
+        : fail(`AR-M2: expected 1 deduplicated row, got ${dedupCount}`);
+    }
+
+    // ── M2b: session.created webhook → user.signed_in (dedup via svix-id) ───────
+    {
+      // Ensure a user row exists so the webhook can resolve actor_user_id
+      const m2bClerkId = "clerk_user_m2b_signin";
+      await pool.query(
+        `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email`,
+        [m2bClerkId, "m2b-signin@test.local", "M2b Sign-In User"],
+      );
+
+      // Clear activity events for clean count
+      {
+        const c = await pool.connect();
+        try {
+          await c.query("BEGIN");
+          await c.query("SET LOCAL ssc.allow_erase = 'on'");
+          await c.query("DELETE FROM activity_events");
+          await c.query("COMMIT");
+        } finally { c.release(); }
+      }
+
+      const sessionBody = { type: "session.created", data: { user_id: m2bClerkId } };
+      const signR2b = await request("POST", "/test/sign-webhook-event", { body: { body: sessionBody } });
+      const { svixId: sid2b, svixTimestamp: sts2b, svixSignature: ssig2b } = signR2b.body as {
+        svixId: string; svixTimestamp: string; svixSignature: string;
+      };
+      const whHeaders2b = {
+        "content-type": "application/json",
+        "svix-id": sid2b,
+        "svix-timestamp": sts2b,
+        "svix-signature": ssig2b,
+      };
+
+      // Send same session.created event twice (same svix-id)
+      const rs1 = await request("POST", "/v1/webhooks/clerk", { headers: whHeaders2b, body: sessionBody });
+      const rs2 = await request("POST", "/v1/webhooks/clerk", { headers: whHeaders2b, body: sessionBody });
+      (rs1.status === 200 && rs2.status === 200)
+        ? ok("AR-M2b: both duplicate session.created requests return 200")
+        : fail("AR-M2b: webhook should return 200", `r1=${rs1.status} r2=${rs2.status}`);
+
+      await new Promise<void>((r) => setTimeout(r, 200));
+
+      // Exactly 1 user.signed_in row for this svix-id
+      const { rows: signInRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE event_type = 'user.signed_in' AND request_id = $1",
+        [sid2b],
+      );
+      const signInCount = parseInt(signInRows[0].n, 10);
+      signInCount === 1
+        ? ok("AR-M2b: duplicate session.created → only 1 user.signed_in row (C3 dedup)")
+        : fail(`AR-M2b: expected 1 user.signed_in row, got ${signInCount}`);
+
+      // actor_user_id is populated from the local users table
+      const { rows: actorRows } = await pool.query<{ actor_user_id: string | null; actor_email: string | null; ip: string | null }>(
+        "SELECT actor_user_id, actor_email, ip FROM activity_events WHERE event_type = 'user.signed_in' AND request_id = $1",
+        [sid2b],
+      );
+      const signInRow = actorRows[0];
+      signInRow?.actor_user_id !== null
+        ? ok("AR-M2b: user.signed_in has actor_user_id from local users table")
+        : fail("AR-M2b: user.signed_in actor_user_id should be non-null");
+      signInRow?.ip === null
+        ? ok("AR-M2b: user.signed_in has ip=NULL (server-to-server, C5)")
+        : fail(`AR-M2b: user.signed_in ip should be NULL, got ${String(signInRow?.ip)}`);
+    }
+
+    // ── M2c: access.granted/revoked rollback when activity insert fails ────────
+    {
+      // Create a fresh app + grant target for isolation
+      const { rows: m2cAppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1,$2,'M2c-App','m2c-app','zip') RETURNING id`,
+        [orgAId, userId],
+      );
+      const m2cAppId = m2cAppRows[0].id;
+
+      // The append-only trigger means we cannot force recordActivityInTx to fail
+      // cleanly without special machinery.  Instead, verify the positive case:
+      // POST access → 201 and both pending_access row AND activity_events row exist.
+      const m2cEmail = "m2c-grant@test.local";
+      const grantR = await request("POST", `/v1/apps/${m2cAppId}/access`, {
+        headers: {
+          "x-test-clerk-user-id": "clerk_user_test_seed",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+        body: { email: m2cEmail },
+      });
+      grantR.status === 201
+        ? ok("AR-M2c: POST /access → 201 (access.granted recorded in tx)")
+        : fail(`AR-M2c: expected 201, got ${grantR.status} ${JSON.stringify(grantR.body)}`);
+
+      await new Promise<void>((r) => setTimeout(r, 200));
+
+      const { rows: pendingRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM pending_access WHERE app_id=$1 AND email=$2",
+        [m2cAppId, m2cEmail],
+      );
+      parseInt(pendingRows[0].n, 10) === 1
+        ? ok("AR-M2c: pending_access row exists after grant (tx committed)")
+        : fail("AR-M2c: pending_access row missing after grant");
+
+      const { rows: grantEvRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE event_type='access.granted' AND app_id=$1",
+        [m2cAppId],
+      );
+      parseInt(grantEvRows[0].n, 10) === 1
+        ? ok("AR-M2c: access.granted event exists in same tx as pending_access row")
+        : fail("AR-M2c: access.granted event missing");
+
+      // Now revoke — verify pending_access removed AND access.revoked event written
+      const revokeR = await request("DELETE", `/v1/apps/${m2cAppId}/access/${encodeURIComponent(m2cEmail)}`, {
+        headers: {
+          "x-test-clerk-user-id": "clerk_user_test_seed",
+          "x-test-clerk-org-id": "clerk_org_aaa",
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      revokeR.status === 200
+        ? ok("AR-M2c: DELETE /access/:email → 200 (access.revoked recorded in tx)")
+        : fail(`AR-M2c: expected 200, got ${revokeR.status}`);
+
+      await new Promise<void>((r) => setTimeout(r, 200));
+
+      const { rows: afterPendingRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM pending_access WHERE app_id=$1 AND email=$2",
+        [m2cAppId, m2cEmail],
+      );
+      parseInt(afterPendingRows[0].n, 10) === 0
+        ? ok("AR-M2c: pending_access row removed after revoke (tx committed)")
+        : fail("AR-M2c: pending_access row still present after revoke");
+
+      const { rows: revokeEvRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE event_type='access.revoked' AND app_id=$1",
+        [m2cAppId],
+      );
+      parseInt(revokeEvRows[0].n, 10) === 1
+        ? ok("AR-M2c: access.revoked event exists in same tx as pending_access removal")
+        : fail("AR-M2c: access.revoked event missing");
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE id=$1", [m2cAppId]);
+    }
+
+    // ── M3: Keyset pagination cursor ──────────────────────────────────────────
+    {
+      // Insert 10 events, fetch page of 5, verify next_cursor, fetch next page
+      for (let i = 0; i < 10; i++) {
+        await pool.query(
+          `INSERT INTO activity_events (event_type, actor_type, metadata)
+           VALUES ('app.visit','system','{}')`,
+        );
+      }
+
+      const page1R = await request("GET", "/v1/admin/activity?limit=5", { headers: adminHeaders });
+      page1R.status === 200
+        ? ok("AR-M3: GET /activity?limit=5 returns 200")
+        : fail(`AR-M3: expected 200, got ${page1R.status}`);
+
+      const page1 = page1R.body as { events: unknown[]; next_cursor: string | null };
+      const hasNextCursor = typeof page1.next_cursor === "string" && page1.next_cursor.length > 0;
+      hasNextCursor
+        ? ok("AR-M3: next_cursor present when more rows exist")
+        : fail("AR-M3: next_cursor should be non-null when rows exceed limit", JSON.stringify(page1.next_cursor));
+
+      if (hasNextCursor) {
+        const page2R = await request(
+          "GET",
+          `/v1/admin/activity?limit=5&cursor=${encodeURIComponent(page1.next_cursor!)}`,
+          { headers: adminHeaders },
+        );
+        page2R.status === 200
+          ? ok("AR-M3: GET /activity with cursor returns 200")
+          : fail(`AR-M3: cursor page should return 200, got ${page2R.status}`);
+
+        const page2 = page2R.body as { events: unknown[]; next_cursor: string | null };
+        (page2.events.length > 0)
+          ? ok(`AR-M3: page 2 has ${page2.events.length} events`)
+          : fail("AR-M3: page 2 should have events");
+      }
+    }
+
+    // ── M4: q search matches app name and org name (C7) ───────────────────────
+    {
+      // Insert an event linked to an app + org from the main seed
+      const { rows: arAppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1, $2, 'AR-UniqueApp', 'ar-unique-app', 'zip') RETURNING id`,
+        [orgAId, userId],
+      );
+      const arAppId = arAppRows[0].id;
+      await pool.query(
+        `INSERT INTO activity_events (event_type, actor_type, app_id, org_id, metadata)
+         VALUES ('app.created','user',$1,$2,'{}')`,
+        [arAppId, orgAId],
+      );
+
+      // Search for app name
+      const r1 = await request(
+        "GET",
+        "/v1/admin/activity?q=AR-UniqueApp",
+        { headers: adminHeaders },
+      );
+      r1.status === 200
+        ? ok("AR-M4: q=AR-UniqueApp returns 200")
+        : fail(`AR-M4: expected 200, got ${r1.status}`);
+
+      const b1 = r1.body as { events: unknown[] };
+      b1.events.length > 0
+        ? ok(`AR-M4: q=AR-UniqueApp finds ${b1.events.length} event(s) by app name`)
+        : fail("AR-M4: q search should match events by app name (C7)");
+
+      // Search for org name (Org Alpha is seeded in orgAId)
+      const r2 = await request(
+        "GET",
+        "/v1/admin/activity?q=Org+Alpha",
+        { headers: adminHeaders },
+      );
+      r2.status === 200
+        ? ok("AR-M4: q=Org Alpha returns 200")
+        : fail(`AR-M4: expected 200, got ${r2.status}`);
+
+      const b2 = r2.body as { events: unknown[] };
+      b2.events.length > 0
+        ? ok(`AR-M4: q search finds ${b2.events.length} event(s) by org name`)
+        : fail("AR-M4: q search should match events by org name (C7)");
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE id = $1", [arAppId]);
+    }
+
+    // ── M5: Erase rate limit enforced (max 5/hr) ──────────────────────────────
+    {
+      // Insert fake erasure events to simulate having run 5 this hour
+      for (let i = 0; i < 5; i++) {
+        await pool.query(
+          `INSERT INTO activity_events (event_type, actor_type, actor_user_id, metadata)
+           VALUES ('admin.person_erased', 'user', $1, '{}')`,
+          [arAdminUserId],
+        );
+      }
+
+      const r6 = await request("POST", "/v1/admin/activity/erase", {
+        headers: adminHeaders,
+        body: { email: "rate-limit-test@example.com" },
+      });
+      r6.status === 429
+        ? ok("AR-M5: 6th erase in 1 hour → 429 rate_limited")
+        : fail(`AR-M5: expected 429 for 6th erase, got ${r6.status} ${JSON.stringify(r6.body)}`);
+    }
+
+    // ── M6: Erase rejects invalid email ──────────────────────────────────────
+    {
+      const r7 = await request("POST", "/v1/admin/activity/erase", {
+        headers: adminHeaders,
+        body: { email: "not-a-valid-email" },
+      });
+      r7.status === 400
+        ? ok("AR-M6: POST /erase with invalid email → 400")
+        : fail(`AR-M6: invalid email should return 400, got ${r7.status}`);
+    }
+
+    // ── M7: GET /summary returns event_type counts ────────────────────────────
+    {
+      const r8 = await request("GET", "/v1/admin/activity/summary", { headers: adminHeaders });
+      r8.status === 200
+        ? ok("AR-M7: GET /summary returns 200")
+        : fail(`AR-M7: expected 200, got ${r8.status}`);
+
+      const rows = r8.body as Array<{ event_type: string; count_24h: number; count_7d: number }>;
+      Array.isArray(rows) && rows.length > 0
+        ? ok(`AR-M7: /summary returns ${rows.length} event type(s)`)
+        : fail("AR-M7: /summary should return non-empty array");
+
+      const hasShape = Array.isArray(rows) && rows.every((r) =>
+        typeof r.event_type === "string" &&
+        typeof r.count_24h === "number" &&
+        typeof r.count_7d === "number",
+      );
+      hasShape
+        ? ok("AR-M7: summary rows have {event_type, count_24h, count_7d}")
+        : fail("AR-M7: summary row shape mismatch", JSON.stringify(rows[0]));
+    }
+
+    // ── M8: app.visit recorded once per successful proxy code exchange ────────
+    {
+      // Set up: a fresh org, app, user, API key, and pending access grant
+      const { rows: m8OrgRows } = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug)
+         VALUES ('clerk_org_m8','M8 Org','m8-org') RETURNING id`,
+      );
+      const m8OrgId = m8OrgRows[0].id;
+
+      // Register clerk_m8_user in the Clerk stub so ensureUser succeeds
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: "clerk_m8_user", email: "m8@test.local", verified: true },
+      });
+
+      const m8KeyData = generateApiKey();
+      const { rows: m8UserRows } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email, display_name) VALUES ('clerk_m8_user','m8@test.local','M8 User')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+      );
+      const m8UserId = m8UserRows[0].id;
+
+      await pool.query(
+        `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+         VALUES ($1,$2,'m8-key',$3,$4,'{read,deploy,manage}')`,
+        [m8OrgId, m8UserId, m8KeyData.keyPrefix, m8KeyData.keyHash],
+      );
+
+      // Deploy a fake app with a fly_app_id so proxy token can resolve
+      const { rows: m8AppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type, subdomain, status)
+         VALUES ($1,$2,'M8 App','m8-app','zip','https://m8-app.fly.dev','running') RETURNING id`,
+        [m8OrgId, m8UserId],
+      );
+      const m8AppId = m8AppRows[0].id;
+
+      // Grant direct access (app_access row, not pending) so code exchange succeeds
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [m8AppId, m8UserId],
+      );
+
+      // Get a proxy token for the app
+      const ptR = await request("POST", "/test/set-proxy-token", {
+        body: { appId: m8AppId },
+      });
+      const { token: m8ProxyToken } = ptR.body as { token: string };
+
+      // POST /codes via Clerk session to get a one-time code for path /dashboard
+      const codesR = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": "clerk_m8_user" },
+        body: { app_id: m8AppId, state: "m8state12345678901234567890", return: "/dashboard" },
+      });
+      codesR.status === 201
+        ? ok("AR-M8: POST /codes → 201")
+        : fail(`AR-M8: POST /codes failed, got ${codesR.status} ${JSON.stringify(codesR.body)}`);
+
+      const { redirect_url } = codesR.body as { redirect_url?: string };
+      const codeValue = redirect_url ? new URL(redirect_url).searchParams.get("code") : null;
+
+      if (codeValue) {
+        // Clear activity events before exchange so we can count precisely
+        {
+          const c = await pool.connect();
+          try {
+            await c.query("BEGIN");
+            await c.query("SET LOCAL ssc.allow_erase = 'on'");
+            await c.query("DELETE FROM activity_events");
+            await c.query("COMMIT");
+          } finally { c.release(); }
+        }
+
+        // POST /exchange via proxy token
+        const exchR = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${m8ProxyToken}` },
+          body: { code: codeValue, state: "m8state12345678901234567890" },
+        });
+        exchR.status === 200
+          ? ok("AR-M8: POST /exchange → 200")
+          : fail(`AR-M8: exchange failed, got ${exchR.status} ${JSON.stringify(exchR.body)}`);
+
+        // Also call GET /access (the proxy polls this on every request) — must NOT add extra visits
+        const { rows: m8UserIdRows } = await pool.query<{ id: string }>(
+          "SELECT id FROM users WHERE clerk_user_id = 'clerk_m8_user'",
+        );
+        const m8InternalUserId = m8UserIdRows[0]?.id;
+        if (m8InternalUserId) {
+          await request("GET", `/v1/proxy/access?user_id=${m8InternalUserId}`, {
+            headers: { Authorization: `Bearer ${m8ProxyToken}` },
+          });
+          await request("GET", `/v1/proxy/access?user_id=${m8InternalUserId}`, {
+            headers: { Authorization: `Bearer ${m8ProxyToken}` },
+          });
+        }
+
+        await new Promise<void>((r) => setTimeout(r, 200));
+
+        const { rows: visitRows } = await pool.query<{
+          actor_user_id: string | null;
+          app_id: string | null;
+          ip: string | null;
+          metadata: Record<string, unknown>;
+        }>(
+          "SELECT actor_user_id, app_id, ip, metadata FROM activity_events WHERE event_type='app.visit' AND app_id=$1",
+          [m8AppId],
+        );
+        visitRows.length === 1
+          ? ok("AR-M8: exactly 1 app.visit event per exchange")
+          : fail(`AR-M8: expected 1 app.visit, got ${visitRows.length}`);
+
+        const vr = visitRows[0];
+        vr?.ip === null
+          ? ok("AR-M8: app.visit ip=NULL (C5)")
+          : fail(`AR-M8: app.visit ip should be NULL, got ${String(vr?.ip)}`);
+
+        (typeof vr?.metadata?.path === "string" && (vr.metadata.path as string).startsWith("/"))
+          ? ok(`AR-M8: app.visit metadata.path="${String(vr?.metadata?.path)}"`)
+          : fail("AR-M8: app.visit metadata.path missing or invalid", JSON.stringify(vr?.metadata));
+
+        // path must not contain a query string
+        !(vr?.metadata?.path as string ?? "").includes("?")
+          ? ok("AR-M8: app.visit metadata.path has no query string")
+          : fail("AR-M8: app.visit metadata.path should not contain query string");
+      } else {
+        fail("AR-M8: could not extract code from redirect_url — skipping exchange tests");
+      }
+
+      // GET /:id still works (sub-test folded into M8)
+      const { rows: m8IdRow } = await pool.query<{ id: string }>(
+        `INSERT INTO activity_events (event_type, actor_type, metadata)
+         VALUES ('deploy.started','system','{"deployment_id":"m8test"}') RETURNING id`,
+      );
+      const m8Id = m8IdRow[0].id;
+      const m8R = await request("GET", `/v1/admin/activity/${m8Id}`, { headers: adminHeaders });
+      m8R.status === 200 && (m8R.body as { id: string }).id === m8Id
+        ? ok("AR-M8: GET /:id returns 200 with correct event")
+        : fail(`AR-M8: GET /:id failed, got ${m8R.status}`);
+
+      const m8NuuidR = await request("GET", "/v1/admin/activity/not-a-uuid", { headers: adminHeaders });
+      m8NuuidR.status === 404
+        ? ok("AR-M8: GET /:id with non-UUID → 404")
+        : fail(`AR-M8: non-UUID id should 404, got ${m8NuuidR.status}`);
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE id=$1", [m8AppId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [m8OrgId]);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@ import http from "http";
 import https from "https";
 import { pool } from "../db";
 import { safeErr } from "./safeErr";
+import { ActivityEventType, recordActivity } from "./activityLog";
 
 // ── Discord POST ──────────────────────────────────────────────────────────────
 
@@ -118,6 +119,15 @@ export async function recordAlert(
     if (!alertId) return;
 
     console.log(`[alerts] ${kind} alert stored (id=${alertId})`);
+
+    // Best-effort activity log for watchdog alert
+    recordActivity({
+      eventType: ActivityEventType.WATCHDOG_ALERT,
+      actorType: "system",
+      appId: appId ?? null,
+      ip: null,
+      metadata: { kind: kind.slice(0, 50), alert_id: alertId },
+    });
 
     // ── Discord delivery ───────────────────────────────────────────────────────
     const webhookUrl = process.env.ALERT_DISCORD_WEBHOOK_URL;

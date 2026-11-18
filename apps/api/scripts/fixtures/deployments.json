@@ -1,10 +1,10 @@
 [
   {
-    "id": "b695c587-a19e-4f8f-b157-c9e6b145167b",
+    "id": "00000000-0000-4000-8000-000000000001",
     "status": "success",
     "version": 1,
-    "started_at": "2026-11-17T15:29:13.294Z",
-    "finished_at": "2026-11-17T15:30:13.294Z",
+    "started_at": "2026-01-01T00:00:00.000Z",
+    "finished_at": "2026-01-01T00:00:00.000Z",
     "failure_stage": null,
     "failure_message": null
   }

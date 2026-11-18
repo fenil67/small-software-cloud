@@ -4,6 +4,7 @@ import { pool } from "../db";
 import { generateApiKey } from "../lib/apiKeys";
 import { ensureUser, ensureOrg } from "../lib/clerkSync";
 import { asyncHandler } from "../lib/asyncHandler";
+import { ActivityEventType, recordActivity, recordActivityInTx } from "../lib/activityLog";
 
 export const apiKeysRouter = Router();
 apiKeysRouter.use(requireAuth);
@@ -66,6 +67,20 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, 
     [orgId, userId, name.trim(), keyPrefix, keyHash, scopes],
   );
 
+  // Best-effort activity log for key creation
+  recordActivity({
+    eventType: ActivityEventType.KEY_CREATED,
+    actorType: sscAuth.type === "clerk" ? "user" : "api_key",
+    actorUserId: userId,
+    actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+    orgId,
+    targetId: keyPrefix,
+    metadata: {
+      name: name.trim().slice(0, 100),
+      scopes: scopes.join(","),
+    },
+  });
+
   res.status(201).json({
     id: rows[0].id,
     name: name.trim(),
@@ -99,11 +114,35 @@ apiKeysRouter.delete("/:id", requireClerkOrgAdmin, asyncHandler(async (req: Requ
   const sscAuth = req.sscAuth!;
   const orgId = await ensureOrg(sscAuth.clerkOrgId!);
 
-  const { rowCount } = await pool.query(
-    `UPDATE api_keys SET revoked_at = now()
-     WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL`,
-    [req.params.id, orgId],
-  );
-  if (!rowCount) { res.status(404).json({ error: "key_not_found" }); return; }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rowCount } = await client.query(
+      `UPDATE api_keys SET revoked_at = now()
+       WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL`,
+      [req.params.id, orgId],
+    );
+    if (!rowCount) {
+      await client.query("ROLLBACK");
+      res.status(404).json({ error: "key_not_found" });
+      return;
+    }
+    const userId = await ensureUser(sscAuth.clerkUserId!);
+    await recordActivityInTx(client, {
+      eventType: ActivityEventType.KEY_REVOKED,
+      actorType: "user",
+      actorUserId: userId,
+      orgId,
+      targetId: req.params.id,
+      metadata: {},
+    });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
   res.json({ revoked: true });
 }));

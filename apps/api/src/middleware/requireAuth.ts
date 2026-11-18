@@ -14,6 +14,7 @@ import { getAuth } from "@clerk/express";
 import { pool } from "../db";
 import { hashApiKey, looksLikeApiKey } from "../lib/apiKeys";
 import { safeErr } from "../lib/safeErr";
+import { ActivityEventType, recordActivity, shouldThrottleKeyAuthFailed } from "../lib/activityLog";
 
 export interface SscAuth {
   type: "clerk" | "api_key";
@@ -25,6 +26,8 @@ export interface SscAuth {
   apiKeyCreatedBy?: string;
   /** Scopes granted to this API key (undefined for Clerk sessions) */
   apiKeyScopes?: string[];
+  /** api_keys.id of the authenticated API key (undefined for Clerk sessions) */
+  apiKeyId?: string;
 }
 
 declare global {
@@ -46,10 +49,10 @@ export async function requireAuth(
     const token = authHeader.slice("Bearer ".length).trim();
     if (looksLikeApiKey(token)) {
       const keyHash = hashApiKey(token);
-      let rows: { org_id: string; created_by: string | null; scopes: string[] }[];
+      let rows: { id: string; org_id: string; created_by: string | null; scopes: string[] }[];
       try {
-        ({ rows } = await pool.query<{ org_id: string; created_by: string | null; scopes: string[] }>(
-          `SELECT org_id, created_by, scopes FROM api_keys
+        ({ rows } = await pool.query<{ id: string; org_id: string; created_by: string | null; scopes: string[] }>(
+          `SELECT id, org_id, created_by, scopes FROM api_keys
            WHERE key_hash = $1
              AND revoked_at IS NULL`,
           [keyHash],
@@ -60,6 +63,16 @@ export async function requireAuth(
         return;
       }
       if (rows.length === 0) {
+        // C2 flood throttle: max 1 key.auth_failed per IP per minute
+        const clientIp = req.ip ?? "";
+        if (!shouldThrottleKeyAuthFailed(clientIp)) {
+          recordActivity({
+            eventType: ActivityEventType.KEY_AUTH_FAILED,
+            actorType: "api_key",
+            ip: clientIp,
+            metadata: {},
+          });
+        }
         res.status(401).json({ error: "invalid_api_key" });
         return;
       }
@@ -75,6 +88,7 @@ export async function requireAuth(
         type: "api_key",
         internalOrgId: rows[0].org_id,
         apiKeyScopes: rows[0].scopes,
+        apiKeyId: rows[0].id,
         ...(rows[0].created_by ? { apiKeyCreatedBy: rows[0].created_by } : {}),
       };
       next();

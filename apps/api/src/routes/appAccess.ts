@@ -15,6 +15,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { asyncHandler } from "../lib/asyncHandler";
+import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
 
 export const appAccessRouter = Router({ mergeParams: true });
 appAccessRouter.use(requireAuth);
@@ -31,6 +32,8 @@ interface AuthResult {
   appId: string;
   /** Internal users.id of the granter; null if unknown or unset. */
   granterId: string | null;
+  /** Internal orgs.id; null if unresolved. */
+  orgId: string | null;
 }
 
 async function authorize(req: Request, res: Response): Promise<AuthResult | null> {
@@ -91,7 +94,7 @@ async function authorize(req: Request, res: Response): Promise<AuthResult | null
     return null;
   }
 
-  return { appId: appRows[0].id, granterId };
+  return { appId: appRows[0].id, granterId, orgId };
 }
 
 // ── GET / ─────────────────────────────────────────────────────────────────────
@@ -131,7 +134,7 @@ appAccessRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const auth = await authorize(req, res);
     if (!auth) return;
-    const { appId, granterId } = auth;
+    const { appId, granterId, orgId } = auth;
 
     const rawEmail = ((req.body as { email?: string }).email ?? "").trim().toLowerCase();
     if (!rawEmail || rawEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
@@ -139,15 +142,32 @@ appAccessRouter.post(
       return;
     }
 
-    // Always write to pending_access — /proxy/codes converts to app_access on first
-    // sign-in, using the actual verified Clerk identity of the signing-in user.
-    // This prevents the duplicate-row race where LIMIT 1 on users.email could
-    // resolve to a stale row from an older Clerk instance.
-    await pool.query(
-      `INSERT INTO pending_access (app_id, email, granted_by)
-       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-      [appId, rawEmail, granterId],
-    );
+    // R4: access.granted written in same transaction as the pending_access insert.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO pending_access (app_id, email, granted_by)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [appId, rawEmail, granterId],
+      );
+      await recordActivityInTx(client, {
+        eventType: ActivityEventType.ACCESS_GRANTED,
+        actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
+        actorUserId: granterId,
+        orgId,
+        appId,
+        targetId: rawEmail,
+        metadata: {},
+      });
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+
     res.status(201).json({ status: "granted" });
   }),
 );
@@ -160,24 +180,40 @@ appAccessRouter.delete(
   asyncHandler(async (req: Request, res: Response) => {
     const auth = await authorize(req, res);
     if (!auth) return;
-    const { appId } = auth;
+    const { appId, granterId } = auth;
 
     // Express already percent-decodes route params; do NOT call decodeURIComponent again.
     const email = req.params.email.trim().toLowerCase();
 
-    // Remove app_access for any user with that email
-    await pool.query(
-      `DELETE FROM app_access
-       WHERE app_id = $1
-         AND user_id IN (SELECT id FROM users WHERE lower(email) = $2)`,
-      [appId, email],
-    );
-
-    // Remove pending grant
-    await pool.query(
-      "DELETE FROM pending_access WHERE app_id = $1 AND email = $2",
-      [appId, email],
-    );
+    // R4: access.revoked written in same transaction as the deletions.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DELETE FROM app_access
+         WHERE app_id = $1
+           AND user_id IN (SELECT id FROM users WHERE lower(email) = $2)`,
+        [appId, email],
+      );
+      await client.query(
+        "DELETE FROM pending_access WHERE app_id = $1 AND email = $2",
+        [appId, email],
+      );
+      await recordActivityInTx(client, {
+        eventType: ActivityEventType.ACCESS_REVOKED,
+        actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
+        actorUserId: granterId,
+        appId,
+        targetId: email,
+        metadata: {},
+      });
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
 
     res.json({ removed: true });
   }),

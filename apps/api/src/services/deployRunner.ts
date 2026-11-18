@@ -16,6 +16,7 @@ import { parseGithubUrl, buildCloneArgs, checkDirSize, GithubUrlError } from "..
 import { detectAppType } from "./appDetector";
 import { generateDeployFiles, sniffExposePort } from "./dockerfileGen";
 import { issueProxyToken } from "../lib/proxyCredentials";
+import { ActivityEventType, recordActivity } from "../lib/activityLog";
 
 const execFileP = promisify(execFile);
 
@@ -24,6 +25,9 @@ interface RunDeployArgs {
   appId: string;
   zipBuffer?: Buffer;
   githubUrl?: string;
+  actorUserId?: string | null;
+  actorKeyId?: string | null;
+  orgId?: string | null;
 }
 
 class DeployError extends Error {
@@ -380,12 +384,25 @@ export async function runFlyctlDeploy(
 }
 
 export async function runDeploy(args: RunDeployArgs): Promise<void> {
-  const { deploymentId, appId, zipBuffer, githubUrl } = args;
+  const { deploymentId, appId, zipBuffer, githubUrl, actorUserId, actorKeyId } = args;
 
   let flyAppName: string | null = null;
   let flyAppCreatedThisRun = false;
   let workDir: string | null = null;
-  let orgId: string | null = null; // captured in Step 3 for orphan recording
+  let orgId: string | null = args.orgId ?? null; // captured in Step 3 for orphan recording
+
+  // Best-effort: record deploy.started
+  recordActivity({
+    eventType: ActivityEventType.DEPLOY_STARTED,
+    actorType: actorUserId ? "user" : (actorKeyId ? "api_key" : "system"),
+    actorUserId: actorUserId ?? null,
+    actorKeyId: actorKeyId ?? null,
+    orgId,
+    appId,
+    targetId: deploymentId,
+    ip: null,
+    metadata: { source: zipBuffer ? "zip" : "github" },
+  });
 
   const fail = async (err: DeployError): Promise<void> => {
     console.error(`[deploy] ${deploymentId} failed at ${err.stage}: ${err.message}`);
@@ -393,6 +410,18 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       failure_stage: err.stage,
       failure_message: err.userMessage,
       finished: true,
+    });
+    // Best-effort: record deploy.failed
+    recordActivity({
+      eventType: ActivityEventType.DEPLOY_FAILED,
+      actorType: actorUserId ? "user" : (actorKeyId ? "api_key" : "system"),
+      actorUserId: actorUserId ?? null,
+      actorKeyId: actorKeyId ?? null,
+      orgId,
+      appId,
+      targetId: deploymentId,
+      ip: null,
+      metadata: { stage: err.stage, deployment_id: deploymentId },
     });
     eventBus.emit(deploymentId, { type: "error", stage: err.stage, message: err.userMessage });
     eventBus.emit(deploymentId, { type: "status", status: "failed" });
@@ -612,6 +641,18 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     );
     await updateDeploymentStatus(deploymentId, "success", {
       finished: true,
+    });
+    // Best-effort: record deploy.succeeded
+    recordActivity({
+      eventType: ActivityEventType.DEPLOY_SUCCEEDED,
+      actorType: actorUserId ? "user" : (actorKeyId ? "api_key" : "system"),
+      actorUserId: actorUserId ?? null,
+      actorKeyId: actorKeyId ?? null,
+      orgId,
+      appId,
+      targetId: deploymentId,
+      ip: null,
+      metadata: { deployment_id: deploymentId },
     });
     eventBus.emit(deploymentId, { type: "url", url: appUrl });
     eventBus.emit(deploymentId, { type: "status", status: "success" });

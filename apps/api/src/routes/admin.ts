@@ -15,6 +15,7 @@ import { pool } from "../db";
 import { requireAuth } from "../middleware/requireAuth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { listMachines, destroyMachine } from "../services/flyClient";
+import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
 
 // ── Admin ID registry ─────────────────────────────────────────────────────────
 
@@ -35,6 +36,14 @@ const _adminIds = new Set<string>();
  * is invalid.  Never prints the invalid values themselves.
  * No parsing happens at import time.
  */
+/**
+ * Returns true if clerkUserId is in the admin set.
+ * Used by activityAdmin.ts to avoid importing the private _adminIds set.
+ */
+export function isAdminId(clerkUserId: string): boolean {
+  return _adminIds.has(clerkUserId);
+}
+
 export function validateAdminConfig(): void {
   _adminIds.clear();
   const invalid: string[] = [];
@@ -187,6 +196,14 @@ adminRouter.post(
          VALUES ('suspend', $1, $2, $3, $4)`,
         [appId, actorUserId, clerkUserId, trimmedReason],
       );
+      await recordActivityInTx(client, {
+        orgId: null,
+        appId,
+        eventType: ActivityEventType.APP_SUSPENDED,
+        actorType: "user",
+        actorUserId,
+        metadata: { reason: trimmedReason.slice(0, 100) },
+      });
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -274,6 +291,14 @@ adminRouter.post(
          VALUES ('unsuspend', $1, $2, $3, NULL)`,
         [appId, actorUserId, clerkUserId],
       );
+      await recordActivityInTx(client, {
+        orgId: null,
+        appId,
+        eventType: ActivityEventType.APP_UNSUSPENDED,
+        actorType: "user",
+        actorUserId,
+        metadata: {},
+      });
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});

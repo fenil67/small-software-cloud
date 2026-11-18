@@ -357,6 +357,9 @@ const { apiKeysRouter } = require("../src/routes/apiKeys") as typeof import("../
 const { webhookRouter } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { verifyClerkWebhookSignature } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/routes/admin") as typeof import("../src/routes/admin");
+const { activityAdminRouter } = require("../src/routes/activityAdmin") as typeof import("../src/routes/activityAdmin");
+const { _resetThrottleMapsForTest, _armInsertFailureForTest } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
+const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
 // Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
 // With no-import-time-parsing design, this is the single place that fills _adminIds.
 _validateAdmin();
@@ -476,6 +479,32 @@ app.get("/test/fly-call-log", (_req, res) => {
 app.post("/test/reset-fly-call-log", (_req, res) => {
   _flyCallLog.length = 0;
   res.json({ ok: true });
+});
+
+// POST /test/reset-activity-throttle — clears in-memory flood throttle maps
+// Used by AR-M1 test to ensure a clean slate before the flood test.
+app.post("/test/reset-activity-throttle", (_req, res) => {
+  _resetThrottleMapsForTest();
+  res.json({ ok: true });
+});
+
+// POST /test/arm-activity-insert-failure — causes next recordActivityInTx call to throw
+app.post("/test/arm-activity-insert-failure", (_req, res) => {
+  _armInsertFailureForTest();
+  res.json({ ok: true });
+});
+
+// POST /test/set-proxy-token { appId } — issues a proxy token for the given app
+// and returns it plaintext. Used by AR-M8 to set up proxy code exchange tests.
+app.post("/test/set-proxy-token", async (req, res) => {
+  const { appId } = req.body as { appId?: string };
+  if (!appId) { res.status(400).json({ error: "appId required" }); return; }
+  try {
+    const token = await issueProxyToken(appId);
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // POST /test/set-fly-destroy-failures { times: number }
@@ -761,8 +790,15 @@ app.get("/clerk-stub/users/:id", (req, res) => {
 });
 
 // GET /clerk-stub/organizations/:id — fake Clerk GET /v1/organizations/:id
+// Well-known test orgs return deterministic human-readable names so ensureOrg()
+// doesn't overwrite the seeded "Org Alpha" / "Org Beta" names with the clerk_org_* ID.
+const _knownOrgNames: Record<string, { name: string; slug: string }> = {
+  clerk_org_aaa: { name: "Org Alpha",   slug: "org-alpha"   },
+  clerk_org_bbb: { name: "Org Beta",    slug: "org-beta"    },
+};
 app.get("/clerk-stub/organizations/:id", (req, res) => {
-  res.json({ id: req.params.id, name: req.params.id, slug: req.params.id });
+  const known = _knownOrgNames[req.params.id];
+  res.json({ id: req.params.id, name: known?.name ?? req.params.id, slug: known?.slug ?? req.params.id });
 });
 
 // GET /clerk-stub/organizations/:orgId/memberships?user_id=:userId
@@ -1056,6 +1092,7 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
+app.use("/v1/admin/activity", activityAdminRouter);
 app.use("/v1/admin", adminRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 

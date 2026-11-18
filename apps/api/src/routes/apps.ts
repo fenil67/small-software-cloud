@@ -6,6 +6,7 @@ import { destroyFlyApp } from "../services/flyClient";
 import { asyncHandler } from "../lib/asyncHandler";
 import { safeErr } from "../lib/safeErr";
 import { ensureOrg } from "../lib/clerkSync";
+import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
 
 export const appsRouter = Router();
 appsRouter.use(requireAuth);
@@ -119,6 +120,7 @@ appsRouter.delete("/:id", requireScope("manage"), asyncHandler(async (req: Reque
   if (!rows[0]) { res.status(404).json({ error: "app_not_found" }); return; }
 
   const { fly_app_id } = rows[0];
+  const appId = rows[0].id;
 
   // Destroy on Fly.io (fire-and-forget if it fails)
   if (fly_app_id) {
@@ -129,10 +131,42 @@ appsRouter.delete("/:id", requireScope("manage"), asyncHandler(async (req: Reque
     }
   }
 
-  await pool.query(
-    "UPDATE apps SET deleted_at = now() WHERE id = $1",
-    [req.params.id],
-  );
+  // Resolve actor user ID
+  let actorUserId: string | null = null;
+  if (sscAuth.type === "clerk" && sscAuth.clerkUserId) {
+    const { rows: userRows } = await pool.query<{ id: string }>(
+      "SELECT id FROM users WHERE clerk_user_id = $1",
+      [sscAuth.clerkUserId],
+    );
+    actorUserId = userRows[0]?.id ?? null;
+  } else if (sscAuth.type === "api_key" && sscAuth.apiKeyCreatedBy) {
+    actorUserId = sscAuth.apiKeyCreatedBy;
+  }
+
+  // Wrap soft-delete + activity event in a transaction (R4: security event)
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "UPDATE apps SET deleted_at = now() WHERE id = $1",
+      [appId],
+    );
+    await recordActivityInTx(client, {
+      eventType: ActivityEventType.APP_DELETED,
+      actorType: sscAuth.type === "clerk" ? "user" : "api_key",
+      actorUserId,
+      actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+      orgId,
+      appId,
+      metadata: {},
+    });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 
   res.status(200).json({ deleted: true });
 }));

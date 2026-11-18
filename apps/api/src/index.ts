@@ -102,6 +102,7 @@ import { deployStreamRouter } from "./routes/deployStream";
 import { deploymentsRouter } from "./routes/deployments";
 import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
+import { activityAdminRouter } from "./routes/activityAdmin";
 import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
@@ -118,6 +119,8 @@ validateAdminConfig();
 validateWatchdogConfig();
 
 const app = express();
+// Trust Railway's reverse proxy (rightmost hop)
+app.set("trust proxy", 1);
 // Railway injects PORT; API_PORT is the local-dev fallback
 const PORT = parseInt(process.env.PORT ?? process.env.API_PORT ?? "4000");
 
@@ -153,6 +156,9 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
+// Mount BEFORE /v1/admin so activity routes return 404 to non-admins
+// (the existing adminRouter returns 403, which would leak endpoint existence)
+app.use("/v1/admin/activity", activityAdminRouter);
 app.use("/v1/admin", adminRouter);
 
 // ─── 404 fallback ────────────────────────────────────────────────────────────

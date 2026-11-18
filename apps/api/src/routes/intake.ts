@@ -19,6 +19,7 @@ import { ensureUser, ensureOrg } from "../lib/clerkSync";
 import { runDeploy } from "../services/deployRunner";
 import { asyncHandler } from "../lib/asyncHandler";
 import { safeErr } from "../lib/safeErr";
+import { ActivityEventType, recordActivity } from "../lib/activityLog";
 
 export const intakeRouter = Router();
 intakeRouter.use(requireAuth);
@@ -213,6 +214,8 @@ intakeRouter.post(
       return;
     }
 
+    const sscAuth = req.sscAuth!;
+
     // Compute name early — needed for reuse check before limit check
     const rawName = ((req.body as { app_name?: string }).app_name ?? "").trim();
     const appName = rawName || "app";
@@ -299,10 +302,30 @@ intakeRouter.post(
       );
     }
 
+    // Record app.created for brand-new apps (not redeployment or reuse)
+    if (!effectiveAppId) {
+      recordActivity({
+        eventType: ActivityEventType.APP_CREATED,
+        actorType: sscAuth.type,
+        actorUserId: userId,
+        actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+        orgId,
+        appId,
+        metadata: { name: appName.slice(0, 100), source: "zip" },
+      });
+    }
+
     // Kick off deploy in background
     const zipBuffer = req.file.buffer;
     setImmediate(() => {
-      runDeploy({ deploymentId, appId, zipBuffer }).catch((e) =>
+      runDeploy({
+        deploymentId,
+        appId,
+        zipBuffer,
+        actorUserId: userId,
+        actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+        orgId,
+      }).catch((e) =>
         console.error("[intake] runDeploy error:", safeErr(e)),
       );
     });
@@ -415,9 +438,30 @@ intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Re
     );
   }
 
+  // Record app.created for brand-new apps (not redeployment or reuse)
+  const sscAuth = req.sscAuth!;
+  if (!effectiveAppId) {
+    recordActivity({
+      eventType: ActivityEventType.APP_CREATED,
+      actorType: sscAuth.type,
+      actorUserId: userId,
+      actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+      orgId,
+      appId,
+      metadata: { name: appName.slice(0, 100), source: "github" },
+    });
+  }
+
   // Kick off deploy in background — use the canonical cloneUrl, not raw input
   setImmediate(() => {
-    runDeploy({ deploymentId, appId, githubUrl: parsedGithub.cloneUrl }).catch((e) =>
+    runDeploy({
+      deploymentId,
+      appId,
+      githubUrl: parsedGithub.cloneUrl,
+      actorUserId: userId,
+      actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+      orgId,
+    }).catch((e) =>
       console.error("[intake] runDeploy error:", safeErr(e)),
     );
   });

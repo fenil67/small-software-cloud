@@ -13,6 +13,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { resolveProxyToken } from "../lib/proxyCredentials";
 import { ensureUser } from "../lib/clerkSync";
+import { ActivityEventType, recordActivity, recordActivityInTx, shouldThrottleAccessRefused } from "../lib/activityLog";
 
 export const proxyRouter = Router();
 
@@ -148,12 +149,43 @@ proxyRouter.post(
             "DELETE FROM pending_access WHERE app_id = $1 AND email = $2",
             [body.app_id, storedEmail],
           );
+          // Record pending_claimed event (C5: server-to-server, ip=NULL)
+          recordActivity({
+            eventType: ActivityEventType.ACCESS_PENDING_CLAIMED,
+            actorType: "user",
+            actorUserId: internalUserId,
+            appId: body.app_id,
+            ip: null,
+            metadata: {},
+          });
           // Fall through — user now has access
         } else {
+          // C2 flood throttle + C5 ip=NULL
+          if (!shouldThrottleAccessRefused(body.app_id, internalUserId, "no_access")) {
+            recordActivity({
+              eventType: ActivityEventType.ACCESS_REFUSED,
+              actorType: "user",
+              actorUserId: internalUserId,
+              appId: body.app_id,
+              ip: null,
+              metadata: { reason: "no_access" },
+            });
+          }
           res.status(403).json({ error: "no_access" });
           return;
         }
       } else {
+        // C2 flood throttle + C5 ip=NULL
+        if (!shouldThrottleAccessRefused(body.app_id, internalUserId, "no_access")) {
+          recordActivity({
+            eventType: ActivityEventType.ACCESS_REFUSED,
+            actorType: "user",
+            actorUserId: internalUserId,
+            appId: body.app_id,
+            ip: null,
+            metadata: { reason: "no_access" },
+          });
+        }
         res.status(403).json({ error: "no_access" });
         return;
       }
@@ -212,10 +244,11 @@ proxyRouter.post(
         app_id: string;
         user_id: string;
         state: string;
+        return_path: string | null;
         used_at: Date | null;
         expires_at: Date;
       }>(
-        `SELECT id, app_id, user_id, state, used_at, expires_at
+        `SELECT id, app_id, user_id, state, return_path, used_at, expires_at
          FROM proxy_codes
          WHERE code_hash = $1
          FOR UPDATE`,
@@ -271,6 +304,28 @@ proxyRouter.post(
         "SELECT id, email FROM users WHERE id = $1",
         [row.user_id],
       );
+
+      // app.visit: recorded once per successful code exchange (R4, C5: ip=NULL)
+      // path = return_path stripped of any query string
+      const visitPath = (() => {
+        try {
+          const p = row.return_path ?? "/";
+          // return_path may be URL-encoded; strip query string from path part only
+          const decoded = decodeURIComponent(p);
+          const qIdx = decoded.indexOf("?");
+          return qIdx >= 0 ? decoded.slice(0, qIdx) : decoded;
+        } catch {
+          return "/";
+        }
+      })();
+      await recordActivityInTx(client, {
+        eventType: ActivityEventType.APP_VISIT,
+        actorType: "user",
+        actorUserId: row.user_id,
+        appId,
+        ip: null,
+        metadata: { path: visitPath },
+      });
 
       await client.query("COMMIT");
 

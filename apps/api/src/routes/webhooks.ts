@@ -18,6 +18,7 @@ import { Router, Request, Response } from "express";
 import express from "express";
 import { createHmac, timingSafeEqual } from "crypto";
 import { pool } from "../db";
+import { ActivityEventType, recordActivity } from "../lib/activityLog";
 
 export const webhookRouter = Router();
 
@@ -109,12 +110,108 @@ webhookRouter.post("/clerk", async (req: Request, res: Response): Promise<void> 
       if (userId && clerkOrgId) {
         await revokeKeysByCreator(userId, clerkOrgId, "creator_left_org");
       }
+      recordActivity({
+        eventType: ActivityEventType.CLERK_MEMBERSHIP_DELETED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: {
+          clerk_user_id: userId ?? "",
+          clerk_org_id: clerkOrgId ?? "",
+        },
+      });
     } else if (event.type === "user.deleted") {
       // data.id — the deleted user's Clerk ID
       const userId = event.data.id as string | undefined;
       if (userId) {
         await revokeKeysByCreatorAllOrgs(userId, "creator_deleted");
       }
+      recordActivity({
+        eventType: ActivityEventType.CLERK_USER_DELETED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_user_id: userId ?? "" },
+      });
+    } else if (event.type === "user.created") {
+      const userId = event.data.id as string | undefined;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_USER_CREATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_user_id: userId ?? "" },
+      });
+    } else if (event.type === "user.updated") {
+      const userId = event.data.id as string | undefined;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_USER_UPDATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_user_id: userId ?? "" },
+      });
+    } else if (event.type === "organization.created") {
+      const orgId = event.data.id as string | undefined;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_ORG_CREATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_org_id: orgId ?? "" },
+      });
+    } else if (event.type === "organization.updated") {
+      const orgId = event.data.id as string | undefined;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_ORG_UPDATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_org_id: orgId ?? "" },
+      });
+    } else if (event.type === "organization.deleted") {
+      const orgId = event.data.id as string | undefined;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_ORG_DELETED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_org_id: orgId ?? "" },
+      });
+    } else if (event.type === "organizationMembership.created") {
+      const userId = (event.data.public_user_data as Record<string, string> | undefined)?.user_id;
+      const orgId  = (event.data.organization as Record<string, string> | undefined)?.id;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_MEMBERSHIP_CREATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_user_id: userId ?? "", clerk_org_id: orgId ?? "" },
+      });
+    } else if (event.type === "organizationMembership.updated") {
+      const userId = (event.data.public_user_data as Record<string, string> | undefined)?.user_id;
+      const orgId  = (event.data.organization as Record<string, string> | undefined)?.id;
+      recordActivity({
+        eventType: ActivityEventType.CLERK_MEMBERSHIP_UPDATED,
+        actorType: "clerk",
+        requestId: svixId,
+        metadata: { clerk_user_id: userId ?? "", clerk_org_id: orgId ?? "" },
+      });
+    } else if (event.type === "session.created") {
+      // data.user_id — the Clerk user ID who signed in
+      const clerkUserId = event.data.user_id as string | undefined;
+      // Look up local user record for actor_user_id and actor_email (C5: ip=NULL)
+      let internalUserId: string | null = null;
+      let internalEmail: string | null = null;
+      if (clerkUserId) {
+        const { rows: userRows } = await pool.query<{ id: string; email: string }>(
+          "SELECT id, email FROM users WHERE clerk_user_id = $1 LIMIT 1",
+          [clerkUserId],
+        );
+        internalUserId = userRows[0]?.id ?? null;
+        internalEmail  = userRows[0]?.email ?? null;
+      }
+      recordActivity({
+        eventType: ActivityEventType.USER_SIGNED_IN,
+        actorType: "user",
+        actorUserId: internalUserId,
+        actorEmail:  internalEmail,
+        ip: null,
+        requestId: svixId,
+        metadata: { clerk_user_id: clerkUserId ?? "" },
+      });
     }
   } catch (err) {
     console.error("[webhooks] event handling error:", err);

@@ -18,6 +18,7 @@ import { safeErr } from "./safeErr";
 import { recordAlert } from "./alerts";
 import { queryCpuMetrics, queryEgressMetrics, type MetricSample } from "./flyMetrics";
 import { listMachines, destroyMachine, checkFlyAppExists } from "../services/flyClient";
+import { ActivityEventType, recordActivityInTx } from "./activityLog";
 
 // ── Startup validation ────────────────────────────────────────────────────────
 
@@ -148,6 +149,12 @@ export async function suspendAppByWatchdog(
        VALUES ('suspend', $1, NULL, 'system:watchdog', $2)`,
       [appId, reason],
     );
+    await recordActivityInTx(client, {
+      appId,
+      eventType: ActivityEventType.APP_SUSPENDED,
+      actorType: "system",
+      metadata: { reason: reason.slice(0, 100), source: "watchdog" },
+    });
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
