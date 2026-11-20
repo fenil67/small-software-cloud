@@ -178,6 +178,10 @@ adminStatsRouter.get(
       typeof process.env.ALERT_DISCORD_WEBHOOK_URL === "string" &&
       process.env.ALERT_DISCORD_WEBHOOK_URL.length > 0;
 
+    const email_sending_configured =
+      typeof process.env.RESEND_API_KEY === "string" &&
+      process.env.RESEND_API_KEY.length > 0;
+
     res.json({
       people: peopleRes.rows[0]?.people ?? 0,
       people_joined_this_week: peopleRes.rows[0]?.joined_week ?? 0,
@@ -196,6 +200,7 @@ adminStatsRouter.get(
       refused_today: activityRes.rows[0]?.refused ?? 0,
       watchdog,
       discord_configured,
+      email_sending_configured,
       deploy_series: deploySeriesRes.rows,
       open_alerts: alertsRes.rows.map((r) => ({
         id: r.id,
@@ -429,6 +434,20 @@ activityAdminRouter.post(
         [trimmedEmail],
       );
       deletedCount = rowCount ?? 0;
+
+      // 4b. Delete email_outbox rows for this recipient or actor
+      await client.query(
+        `DELETE FROM email_outbox WHERE lower(to_email) = lower($1)`,
+        [trimmedEmail],
+      );
+      // Also delete by actor_user_id if the user exists
+      await client.query(
+        `DELETE FROM email_outbox
+         WHERE actor_user_id IN (
+           SELECT id FROM users WHERE lower(email) = lower($1)
+         )`,
+        [trimmedEmail],
+      );
 
       // 5. Insert the erasure audit event (inside same transaction)
       await recordActivityInTx(client, {

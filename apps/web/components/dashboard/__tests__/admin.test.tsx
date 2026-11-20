@@ -93,6 +93,7 @@ const mockStats: AdminStats = {
   refused_today: 3,
   watchdog: null,
   discord_configured: false,
+  email_sending_configured: false,
   deploy_series: Array.from({ length: 14 }, (_, i) => ({ date: `2026-11-${String(i + 1).padStart(2, "0")}`, succeeded: i, failed: 0 })),
   open_alerts: [],
 };

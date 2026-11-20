@@ -15,6 +15,7 @@ import { safeErr } from "./safeErr";
 import { destroyFlyApp } from "../services/flyClient";
 import { runProbeRound, runMetricsRound } from "./watchdog";
 import { checkOrgMembership } from "./clerkSync";
+import { runEmailOutboxSender } from "./email/outbox";
 
 const TIMEOUT_MINUTES = 15;
 const INTERVAL_MS = 5 * 60 * 1000;
@@ -139,6 +140,8 @@ export async function reapKeysByMembership(): Promise<number> {
   return revoked;
 }
 
+const EMAIL_OUTBOX_INTERVAL_MS = 30_000; // 30 seconds
+
 const PROBE_INTERVAL_MS = (() => {
   const raw = process.env.WATCHDOG_PROBE_SECONDS;
   if (raw !== undefined) {
@@ -171,6 +174,18 @@ export function startReaper(): void {
       console.error("[reaper] proxy-codes interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
+
+  // Email outbox sender loop (skipped in test mode — tests trigger via /test/run-email-outbox)
+  if (process.env.SSC_TEST !== "1") {
+    runEmailOutboxSender().catch((err) =>
+      console.error("[email-outbox] boot run failed:", safeErr(err)),
+    );
+    setInterval(() => {
+      runEmailOutboxSender().catch((err) =>
+        console.error("[email-outbox] interval run failed:", safeErr(err)),
+      );
+    }, EMAIL_OUTBOX_INTERVAL_MS);
+  }
 
   // Hourly membership reconciliation (skipped in test mode — tests trigger via /test/run-key-reconciliation)
   if (process.env.SSC_TEST !== "1") {

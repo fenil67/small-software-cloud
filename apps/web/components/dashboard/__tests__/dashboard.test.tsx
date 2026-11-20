@@ -403,6 +403,85 @@ describe("AppDetailClient – admin-only controls absent for member", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// AppDetailClient – email invite notice (email_status)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function submitGrant(email: string) {
+  fireEvent.change(screen.getByPlaceholderText(/email/i), { target: { value: email } });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+  });
+}
+
+describe("AppDetailClient – email_status=queued notice", () => {
+  beforeEach(() => {
+    mockGrantAccess.mockResolvedValue({ email_status: "queued" });
+  });
+
+  it('shows "We emailed <email> a link." exactly', async () => {
+    render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl="https://myapp.fly.dev" />);
+    await submitGrant("invite@test.com");
+    expect(await screen.findByText("We emailed invite@test.com a link.")).toBeInTheDocument();
+  });
+
+  it("notice is in aria-live=polite region", async () => {
+    render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl="https://myapp.fly.dev" />);
+    await submitGrant("invite@test.com");
+    const live = await screen.findByText("We emailed invite@test.com a link.");
+    const region = live.closest("[aria-live]");
+    expect(region?.getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("no copy button shown for queued", async () => {
+    render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl="https://myapp.fly.dev" />);
+    await submitGrant("invite@test.com");
+    await screen.findByText("We emailed invite@test.com a link.");
+    expect(screen.queryByRole("button", { name: "Copy link" })).not.toBeInTheDocument();
+  });
+});
+
+describe("AppDetailClient – email_status open-url notices (disabled / rate-limited / already_has_access)", () => {
+  const appUrl = "https://myapp.fly.dev";
+
+  for (const status of ["disabled", "rate_limited_recipient", "rate_limited_sender", "already_has_access"] as const) {
+    it(`email_status=${status} → "They can open it at <url>." with Copy link button`, async () => {
+      mockGrantAccess.mockResolvedValue({ email_status: status });
+      render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl={appUrl} />);
+      await submitGrant("someone@test.com");
+      expect(await screen.findByText(/They can open it at/)).toBeInTheDocument();
+      expect(screen.getByText(/myapp\.fly\.dev/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+    });
+
+    it(`email_status=${status} with no appUrl shows no notice`, async () => {
+      mockGrantAccess.mockResolvedValue({ email_status: status });
+      render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl={null} />);
+      await submitGrant("someone@test.com");
+      await act(async () => { /* let transitions settle */ });
+      expect(screen.queryByText(/They can open it at/)).not.toBeInTheDocument();
+    });
+  }
+
+  it("email_status=invalid_url shows no notice", async () => {
+    mockGrantAccess.mockResolvedValue({ email_status: "invalid_url" });
+    render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl={appUrl} />);
+    await submitGrant("someone@test.com");
+    await act(async () => { /* let transitions settle */ });
+    expect(screen.queryByText(/We emailed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/They can open it at/)).not.toBeInTheDocument();
+  });
+
+  it("notice region is always aria-live=polite", async () => {
+    mockGrantAccess.mockResolvedValue({ email_status: "disabled" });
+    render(<AppDetailClient appId="app-x" appName="App" accessList={[]} isAdmin appUrl={appUrl} />);
+    await submitGrant("someone@test.com");
+    const live = await screen.findByText(/They can open it at/);
+    const region = live.closest("[aria-live]");
+    expect(region?.getAttribute("aria-live")).toBe("polite");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // KeysClient – key reveal lifecycle + admin-only controls + M4
 // ═════════════════════════════════════════════════════════════════════════════
 

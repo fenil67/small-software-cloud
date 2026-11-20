@@ -92,6 +92,14 @@ export interface SharedApp {
   status: 'active' | 'pending';
 }
 
+export type EmailInviteStatus =
+  | "queued"
+  | "disabled"
+  | "rate_limited_recipient"
+  | "rate_limited_sender"
+  | "already_has_access"
+  | "invalid_url";
+
 export interface AdminStats {
   people: number;
   people_joined_this_week: number;
@@ -103,6 +111,7 @@ export interface AdminStats {
   refused_today: number;
   watchdog: { apps_checked: number; last_checked_at: string } | null;
   discord_configured: boolean;
+  email_sending_configured: boolean;
   deploy_series: Array<{ date: string; succeeded: number; failed: number }>;
   open_alerts: Array<{
     id: string;

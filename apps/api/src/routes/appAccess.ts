@@ -16,6 +16,27 @@ import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { asyncHandler } from "../lib/asyncHandler";
 import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
+import { queueInviteEmail } from "../lib/email/outbox";
+import { getEmailSender } from "../lib/email/sender";
+
+// ── URL helper ────────────────────────────────────────────────────────────────
+// Returns a canonical https://<host> URL only when host is a valid *.fly.dev name.
+// null subdomain (app not yet deployed) returns null; callers queue with no button.
+// Non-.fly.dev or structurally invalid subdomain also returns null; callers skip queue.
+
+function appUrl(subdomain: string | null): string | null {
+  if (!subdomain) return null;
+  const s = subdomain.trim();
+  if (!s) return null;
+  // Strip any https:// prefix stored in the field
+  let host = s;
+  while (host.startsWith("https://")) host = host.slice("https://".length);
+  // Must end with .fly.dev and contain no structural tricks
+  if (!host.endsWith(".fly.dev")) return null;
+  if (host.includes("@") || host.includes("/") || host.includes(":") ||
+      host.includes("?") || host.includes("#") || host.startsWith(".")) return null;
+  return `https://${host}`;
+}
 
 export const appAccessRouter = Router({ mergeParams: true });
 appAccessRouter.use(requireAuth);
@@ -142,21 +163,107 @@ appAccessRouter.post(
       return;
     }
 
-    // R4: access.granted written in same transaction as the pending_access insert.
+    // Fetch granter info (display_name + email) for all actor types
     let granterEmail: string | null = null;
-    if (req.sscAuth!.type === "clerk" && granterId) {
-      const { rows: ge } = await pool.query<{ email: string }>(
-        "SELECT email FROM users WHERE id = $1", [granterId]);
-      granterEmail = ge[0]?.email ?? null;
+    let granterName = "Someone";
+    if (granterId) {
+      const { rows: ge } = await pool.query<{ email: string; display_name: string | null }>(
+        "SELECT email, display_name FROM users WHERE id = $1", [granterId]);
+      if (ge[0]) {
+        granterEmail = ge[0].email;
+        granterName = ge[0].display_name?.trim() || ge[0].email || "Someone";
+      }
     }
+
+    // Fetch app name + subdomain before the transaction
+    const { rows: appRows } = await pool.query<{ name: string; subdomain: string | null }>(
+      "SELECT name, subdomain FROM apps WHERE id = $1", [appId],
+    );
+    const appName = appRows[0]?.name ?? "an app";
+    const appSubdomain = appRows[0]?.subdomain ?? null;
+    const appUrlValue = appUrl(appSubdomain);
+
+    // If appUrl is null (not deployed) we still queue — button is omitted in template.
+    // If appUrl would be invalid (non-https), do not queue.
+    const urlIsValid = appSubdomain === null || (appUrlValue !== null);
+    if (!urlIsValid) {
+      res.status(201).json({ status: "granted", email_status: "invalid_url" });
+      return;
+    }
+
+    const emailEnabled = getEmailSender() !== null;
+    let emailStatus: string = emailEnabled ? "queued" : "disabled";
+
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+
+      let shouldQueueEmail = emailEnabled;
+
+      if (emailEnabled) {
+        // C3: Check if recipient already has app_access
+        const { rows: accessRows } = await client.query(
+          `SELECT 1 FROM app_access aa
+           JOIN users u ON u.id = aa.user_id
+           WHERE aa.app_id = $1 AND lower(u.email) = lower($2)
+           LIMIT 1`,
+          [appId, rawEmail],
+        );
+        if (accessRows.length > 0) {
+          shouldQueueEmail = false;
+          emailStatus = "already_has_access";
+        }
+      }
+
+      if (emailEnabled && shouldQueueEmail) {
+        // C2: Advisory lock on (app_id, lower(email)) to serialize per-recipient rate limit
+        await client.query(
+          `SELECT pg_advisory_xact_lock(hashtext($1 || '|' || lower($2)))`,
+          [appId, rawEmail],
+        );
+
+        // Per-recipient: max 1 email per app per 24h
+        const { rows: recipientRows } = await client.query<{ cnt: string }>(
+          `SELECT COUNT(*) AS cnt FROM email_outbox
+           WHERE app_id = $1
+             AND lower(to_email) = lower($2)
+             AND created_at > now() - INTERVAL '24 hours'`,
+          [appId, rawEmail],
+        );
+        const recipientCount = parseInt(recipientRows[0]?.cnt ?? "0", 10);
+        if (recipientCount >= 1) {
+          shouldQueueEmail = false;
+          emailStatus = "rate_limited_recipient";
+        }
+      }
+
+      if (emailEnabled && shouldQueueEmail) {
+        // C2: Advisory lock on granter id to serialize per-day sender limit
+        await client.query(
+          `SELECT pg_advisory_xact_lock(hashtext($1))`,
+          [granterId ?? "anon"],
+        );
+
+        // Per-granter: max 50 emails per day
+        const { rows: senderRows } = await client.query<{ cnt: string }>(
+          `SELECT COUNT(*) AS cnt FROM email_outbox
+           WHERE actor_user_id = $1
+             AND created_at > now() - INTERVAL '24 hours'`,
+          [granterId],
+        );
+        const senderCount = parseInt(senderRows[0]?.cnt ?? "0", 10);
+        if (senderCount >= 50) {
+          shouldQueueEmail = false;
+          emailStatus = "rate_limited_sender";
+        }
+      }
+
       await client.query(
         `INSERT INTO pending_access (app_id, email, granted_by)
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
         [appId, rawEmail, granterId],
       );
+
       await recordActivityInTx(client, {
         eventType: ActivityEventType.ACCESS_GRANTED,
         actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
@@ -167,6 +274,34 @@ appAccessRouter.post(
         targetId: rawEmail,
         metadata: {},
       });
+
+      if (shouldQueueEmail) {
+        const outboxId = await queueInviteEmail(client, {
+          toEmail: rawEmail,
+          appId,
+          actorUserId: granterId,
+          granterName,
+          granterEmail: granterEmail ?? "",
+          appName,
+          appUrl: appUrlValue,
+        });
+
+        if (outboxId) {
+          await recordActivityInTx(client, {
+            eventType: ActivityEventType.EMAIL_INVITE_QUEUED,
+            actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
+            actorUserId: granterId,
+            actorEmail: req.sscAuth!.type === "clerk" ? granterEmail : null,
+            orgId,
+            appId,
+            targetId: rawEmail,
+            metadata: { outbox_id: outboxId },
+          });
+        } else {
+          emailStatus = "disabled"; // queue insert failed
+        }
+      }
+
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -175,7 +310,7 @@ appAccessRouter.post(
       client.release();
     }
 
-    res.status(201).json({ status: "granted" });
+    res.status(201).json({ status: "granted", email_status: emailStatus });
   }),
 );
 

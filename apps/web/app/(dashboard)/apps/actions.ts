@@ -2,7 +2,7 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { apiFetch } from "../../../lib/api";
-import type { App, AppAccess } from "../../../lib/api-types";
+import type { App, AppAccess, EmailInviteStatus } from "../../../lib/api-types";
 
 export async function deleteApp(
   appId: string,
@@ -38,18 +38,17 @@ export async function deleteApp(
 export async function grantAccess(
   appId: string,
   email: string,
-): Promise<{ error?: string }> {
+): Promise<{ error?: string; email_status?: EmailInviteStatus }> {
   const { getToken } = await auth();
   const token = await getToken();
   if (!token) return { error: "not_authenticated" };
 
   try {
-    await apiFetch(`/v1/apps/${appId}/access`, {
-      method: "POST",
-      body: { email },
-      token,
-    });
-    return {};
+    const result = await apiFetch<{ status: string; email_status?: EmailInviteStatus }>(
+      `/v1/apps/${appId}/access`,
+      { method: "POST", body: { email }, token },
+    );
+    return { email_status: result.email_status };
   } catch (e: unknown) {
     const code = (e as { code?: string }).code;
     return { error: code ?? "grant_failed" };

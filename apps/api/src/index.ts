@@ -107,6 +107,7 @@ import { meRouter } from "./routes/me";
 import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
+import { ResendSender, setEmailSender } from "./lib/email/sender";
 
 // PLATFORM_ADMIN_CLERK_IDS — optional; each entry must match ^user_[A-Za-z0-9]+$
 // Called here, directly after the ./routes/admin import, so the compiled require()
@@ -175,6 +176,16 @@ app.use((_req, res) => {
 // call next(err) themselves.  The process.on("unhandledRejection") above is the
 // safety net for anything that leaks without calling next(err).
 app.use(errorHandlerMiddleware);
+
+// ─── Email sender setup ──────────────────────────────────────────────────────
+// RESEND_API_KEY is optional; when absent, email sending is skipped silently.
+const _resendKey = process.env.RESEND_API_KEY;
+if (_resendKey) {
+  setEmailSender(new ResendSender(_resendKey));
+  console.log("[email] Resend sender configured");
+} else {
+  console.log("[email] RESEND_API_KEY not set — email sending disabled");
+}
 
 // ─── Background jobs ─────────────────────────────────────────────────────────
 startReaper();

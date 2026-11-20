@@ -157,6 +157,7 @@ export default async function AppDetailPage({ params }: PageProps) {
             <AppDetailClient
               appId={app.id}
               appName={app.name}
+              appUrl={appUrl}
               accessList={accessList}
               isAdmin={isAdmin}
             />

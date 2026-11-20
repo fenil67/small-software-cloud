@@ -16,6 +16,7 @@
   "refused_today": 0,
   "watchdog": null,
   "discord_configured": true,
+  "email_sending_configured": true,
   "deploy_series": [
     {
       "date": "2026-11-07",

@@ -2,18 +2,20 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import type { AppAccess } from "../../../../lib/api-types";
+import type { AppAccess, EmailInviteStatus } from "../../../../lib/api-types";
 import { deleteApp, grantAccess, revokeAccess } from "../actions";
+import { CopyButton } from "../../../../components/dashboard/CopyButton";
 
 interface Props {
   appId: string;
   appName: string;
+  appUrl?: string | null;
   accessList: AppAccess[];
   isAdmin: boolean;
   showDeleteOnly?: boolean;
 }
 
-export function AppDetailClient({ appId, appName, accessList, isAdmin, showDeleteOnly }: Props) {
+export function AppDetailClient({ appId, appName, appUrl, accessList, isAdmin, showDeleteOnly }: Props) {
   if (showDeleteOnly) {
     // Guard: only admins can reach this; page enforces it, component double-checks
     if (!isAdmin) return null;
@@ -51,7 +53,7 @@ export function AppDetailClient({ appId, appName, accessList, isAdmin, showDelet
         ))}
       </ul>
 
-      {isAdmin && <GrantAccessForm appId={appId} />}
+      {isAdmin && <GrantAccessForm appId={appId} appUrl={appUrl} />}
     </div>
   );
 }
@@ -144,22 +146,47 @@ function AccessRow({
   );
 }
 
-function GrantAccessForm({ appId }: { appId: string }) {
+type NoticeState =
+  | { kind: "emailed"; email: string }
+  | { kind: "open"; url: string }
+  | null;
+
+function noticeFromStatus(
+  status: EmailInviteStatus | undefined,
+  submittedEmail: string,
+  appUrl: string | null | undefined,
+): NoticeState {
+  if (status === "queued") return { kind: "emailed", email: submittedEmail };
+  if (
+    status === "disabled" ||
+    status === "rate_limited_recipient" ||
+    status === "rate_limited_sender" ||
+    status === "already_has_access"
+  ) {
+    return appUrl ? { kind: "open", url: appUrl } : null;
+  }
+  return null;
+}
+
+function GrantAccessForm({ appId, appUrl }: { appId: string; appUrl?: string | null }) {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | undefined>();
+  const [notice, setNotice] = useState<NoticeState>(null);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = email.trim();
     if (!trimmed) return;
     setError(undefined);
+    setNotice(null);
     startTransition(async () => {
       const result = await grantAccess(appId, trimmed);
       if (result.error) {
         setError(result.error === "already_granted" ? "Already has access." : "Could not grant access.");
       } else {
+        setNotice(noticeFromStatus(result.email_status, trimmed, appUrl));
         setEmail("");
         router.refresh();
       }
@@ -205,6 +232,19 @@ function GrantAccessForm({ appId }: { appId: string }) {
         </button>
       </div>
       {error && <p role="alert" style={{ margin: 0, fontSize: "12px", color: "var(--red)" }}>{error}</p>}
+      <div aria-live="polite" aria-atomic="true" style={{ minHeight: "16px" }}>
+        {notice?.kind === "emailed" && (
+          <p style={{ margin: 0, fontSize: "12px", color: "var(--fg-2)" }}>
+            We emailed {notice.email} a link.
+          </p>
+        )}
+        {notice?.kind === "open" && (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "12px", color: "var(--fg-2)" }}>
+            They can open it at {notice.url}.
+            <CopyButton value={notice.url} label="Copy link" />
+          </span>
+        )}
+      </div>
     </form>
   );
 }

@@ -221,6 +221,9 @@ export function AdminOverviewClient({ stats, apps, statsError, appsError }: Admi
             {stats.discord_configured && (
               <span style={{ fontSize: "12px", color: "var(--fg-3)" }}>Also sent to Discord</span>
             )}
+            {stats.email_sending_configured && (
+              <span style={{ fontSize: "12px", color: "var(--fg-3)" }}>Email sending on</span>
+            )}
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {stats.open_alerts.map((alert) => {

@@ -24,6 +24,8 @@ process.env.FLY_API_TOKEN = "test-token";
 process.env.FLY_ORG_SLUG = "test-org";
 process.env.CLERK_SECRET_KEY = "sk_test_fake";
 process.env.SSC_TEST = "1";
+// Fake Resend API key — enables email outbox in test mode
+process.env.RESEND_API_KEY = "re_test_fake";
 // PLATFORM_ADMIN_CLERK_IDS: use env override if provided, otherwise default to
 // a single well-known test admin ID used by AF tests.
 if (!process.env.PLATFORM_ADMIN_CLERK_IDS) {
@@ -360,6 +362,13 @@ const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/rou
 const { activityAdminRouter, adminStatsRouter } = require("../src/routes/activityAdmin") as typeof import("../src/routes/activityAdmin");
 const { meRouter } = require("../src/routes/me") as typeof import("../src/routes/me");
 const { _resetThrottleMapsForTest, _armInsertFailureForTest, _resetActivitySearchedThrottleForTest } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
+const { MemorySender, setEmailSender, disableEmailSender } = require("../src/lib/email/sender") as typeof import("../src/lib/email/sender");
+const { runEmailOutboxSender } = require("../src/lib/email/outbox") as typeof import("../src/lib/email/outbox");
+
+// ── Email sender stub ─────────────────────────────────────────────────────────
+// Use MemorySender so tests can drain sent emails; no real HTTP calls to Resend.
+const _memorySender = new MemorySender();
+setEmailSender(_memorySender);
 const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
 // Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
 // With no-import-time-parsing design, this is the single place that fills _adminIds.
@@ -769,6 +778,41 @@ app.post("/test/run-key-reconciliation", async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+// POST /test/run-email-outbox — runs one email outbox pass synchronously
+app.post("/test/run-email-outbox", async (_req, res) => {
+  try {
+    const sent = await runEmailOutboxSender();
+    res.json({ ok: true, sent });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// GET /test/get-sent-emails — returns and clears all emails captured by MemorySender
+app.get("/test/get-sent-emails", (_req, res) => {
+  res.json({ emails: _memorySender.drain() });
+});
+
+// POST /test/set-email-disabled { disabled: bool }
+// Disables or re-enables the email sender. When disabled, email_status:"disabled".
+app.post("/test/set-email-disabled", (req, res) => {
+  const { disabled } = req.body as { disabled?: boolean };
+  if (disabled) {
+    disableEmailSender();
+  } else {
+    setEmailSender(_memorySender);
+  }
+  res.json({ ok: true, disabled: disabled ?? false });
+});
+
+// POST /test/set-memory-sender-fail { times: number }
+// 0 = succeed; -1 = always fail; N = fail next N calls then succeed.
+app.post("/test/set-memory-sender-fail", (req, res) => {
+  const { times } = req.body as { times?: number };
+  _memorySender.setFailMode(typeof times === "number" ? times : 0);
+  res.json({ ok: true, times });
 });
 
 // ── Fake Clerk API stub ───────────────────────────────────────────────────────

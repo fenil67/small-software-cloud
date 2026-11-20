@@ -50,6 +50,10 @@ export const ActivityEventType = {
   CLERK_MEMBERSHIP_CREATED: "clerk.membership_created",
   CLERK_MEMBERSHIP_UPDATED: "clerk.membership_updated",
   CLERK_MEMBERSHIP_DELETED: "clerk.membership_deleted",
+
+  EMAIL_INVITE_QUEUED:      "email.invite_queued",
+  EMAIL_INVITE_SENT:        "email.invite_sent",
+  EMAIL_INVITE_FAILED:      "email.invite_failed",
 } as const;
 
 export type ActivityEventTypeValue = (typeof ActivityEventType)[keyof typeof ActivityEventType];
