@@ -7,7 +7,12 @@ import { useClerk, useUser, useOrganization, useOrganizationList } from "@clerk/
 import { Logo } from "../brand/Logo";
 import { navigateHard } from "../../lib/navigate";
 
-export function Sidebar() {
+interface SidebarProps {
+  isAdmin?: boolean;
+  openAlertCount?: number;
+}
+
+export function Sidebar({ isAdmin = false, openAlertCount = 0 }: SidebarProps) {
   const pathname = usePathname();
   const router = useRouter();
   const clerk = useClerk();
@@ -54,6 +59,28 @@ export function Sidebar() {
         <NavItem href="/keys" active={pathname.startsWith("/keys")} icon={<KeyIcon />} label="API keys" />
         <NavItem href="/settings" active={pathname.startsWith("/settings")} icon={<SettingsIcon />} label="Settings" />
       </div>
+
+      {/* Admin section */}
+      {isAdmin && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+          <div style={{ padding: "0 8px", fontSize: "12px", color: "var(--fg-3)", fontWeight: 500, marginBottom: "4px" }}>
+            Admin
+          </div>
+          <NavItem
+            href="/admin"
+            active={pathname === "/admin"}
+            icon={<ShieldIcon />}
+            label="Overview"
+            badge={openAlertCount > 0 ? openAlertCount : undefined}
+          />
+          <NavItem
+            href="/admin/activity"
+            active={pathname.startsWith("/admin/activity")}
+            icon={<WaveformIcon />}
+            label="Activity"
+          />
+        </div>
+      )}
 
       <div style={{ flex: 1 }} />
 
@@ -363,9 +390,10 @@ interface NavItemProps {
   active: boolean;
   icon: React.ReactNode;
   label: string;
+  badge?: number;
 }
 
-function NavItem({ href, active, icon, label }: NavItemProps) {
+function NavItem({ href, active, icon, label, badge }: NavItemProps) {
   return (
     <Link
       href={href}
@@ -386,7 +414,21 @@ function NavItem({ href, active, icon, label }: NavItemProps) {
       }}
     >
       {icon}
-      {label}
+      <span style={{ flex: 1 }}>{label}</span>
+      {badge !== undefined && (
+        <span
+          aria-label={`${badge} open alerts`}
+          style={{
+            background: "var(--red)", color: "var(--btn-fg)",
+            borderRadius: "999px", fontSize: "12px", fontWeight: 600,
+            padding: "0 6px", minWidth: "20px", height: "20px",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            lineHeight: 1,
+          }}
+        >
+          {badge}
+        </span>
+      )}
     </Link>
   );
 }
@@ -455,6 +497,22 @@ function CheckIcon() {
   return (
     <svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function ShieldIcon() {
+  return (
+    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 1.5L2 4v4c0 3 2.5 5.5 6 6 3.5-.5 6-3 6-6V4L8 1.5z" />
+    </svg>
+  );
+}
+
+function WaveformIcon() {
+  return (
+    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M1 8h2M5 4v8M9 2v12M13 5v6M15 8h-2" />
     </svg>
   );
 }

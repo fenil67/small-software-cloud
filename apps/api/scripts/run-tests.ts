@@ -290,6 +290,26 @@ function authHeaders(key: string): Record<string, string> {
   return { Authorization: `Bearer ${key}` };
 }
 
+/**
+ * Poll the DB until check(rows) is true or timeoutMs elapses.
+ * Used to wait on fire-and-forget recordActivity() writes without a fixed sleep.
+ */
+async function waitForRow<T>(
+  queryText: string,
+  params: unknown[],
+  check: (rows: T[]) => boolean,
+  timeoutMs = 2000,
+): Promise<T[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { rows } = await pool.query<T>(queryText, params);
+    if (check(rows)) return rows;
+    await new Promise<void>((r) => setTimeout(r, 25));
+  }
+  const { rows } = await pool.query<T>(queryText, params);
+  return rows;
+}
+
 // ── Small zip builder ─────────────────────────────────────────────────────────
 
 async function buildZip(files: Record<string, string>): Promise<Buffer> {
@@ -11078,6 +11098,548 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM apps WHERE id=$1", [m8AppId]);
       await pool.query("DELETE FROM orgs WHERE id=$1", [m8OrgId]);
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("AS: Admin area — A1–A5, shared-apps, M1–M8");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // ── AS setup ──────────────────────────────────────────────────────────────
+    // Admin user — clerk ID matches PLATFORM_ADMIN_CLERK_IDS = "user_admintest1"
+    const asAdminClerkId = "user_admintest1";
+    const asNonAdminClerkId = "clerk_as_nonAdmin";
+    const asUserBClerkId = "clerk_as_userB";
+    const asUserCClerkId = "clerk_as_userC";
+
+    // Insert users (may already exist from AF section — use ON CONFLICT)
+    const asAdminUserRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+      [asAdminClerkId, "as-admin@test.local", "AS Admin"],
+    );
+    const asAdminUserId = asAdminUserRow.rows[0].id;
+
+    const asNonAdminUserRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+      [asNonAdminClerkId, "as-nonadmin@test.local", "AS NonAdmin"],
+    );
+    const asNonAdminUserId = asNonAdminUserRow.rows[0].id;
+
+    const asUserBRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+      [asUserBClerkId, "as-userb@test.local", "AS UserB"],
+    );
+    const asUserBId = asUserBRow.rows[0].id;
+
+    const asUserCRow = await pool.query<{ id: string }>(
+      `INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,$3)
+       ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+      [asUserCClerkId, "as-userc@test.local", "AS UserC"],
+    );
+    const asUserCId = asUserCRow.rows[0].id;
+
+    // Register with fake Clerk
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: asAdminClerkId, email: "as-admin@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: asNonAdminClerkId, email: "as-nonadmin@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: asUserBClerkId, email: "as-userb@test.local", verified: true } });
+    await request("POST", "/test/set-clerk-user", { body: { clerkUserId: asUserCClerkId, email: "as-userc@test.local", verified: true } });
+
+    // Create orgs for userB (owns apps) and admin user
+    const asOrgBRow = await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id`,
+      ["clerk_as_orgB", "AS OrgB", "as-org-b"],
+    );
+    const asOrgBId = asOrgBRow.rows[0].id;
+    await pool.query(`INSERT INTO org_members (org_id, user_id, role) VALUES ($1,$2,'admin') ON CONFLICT DO NOTHING`,
+      [asOrgBId, asUserBId]);
+    await pool.query(`INSERT INTO org_members (org_id, user_id, role) VALUES ($1,$2,'admin') ON CONFLICT DO NOTHING`,
+      [asOrgBId, asUserCId]);
+
+    // Create app X owned by orgB
+    const asAppXRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,'as-app-x','as-app-x','zip') RETURNING id`,
+      [asOrgBId, asUserBId],
+    );
+    const asAppXId = asAppXRow.rows[0].id;
+
+    // Create app Y owned by orgB (pending access only)
+    const asAppYRow = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, source_type) VALUES ($1,$2,'as-app-y','as-app-y','zip') RETURNING id`,
+      [asOrgBId, asUserBId],
+    );
+    const asAppYId = asAppYRow.rows[0].id;
+
+    // Grant admin user (A) access to app X
+    await pool.query(
+      `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+      [asAppXId, asAdminUserId],
+    );
+
+    // Add pending_access for admin user's email on app Y
+    await pool.query(
+      `INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+      [asAppYId, "as-admin@test.local"],
+    );
+
+    // Grant user C access to app X (should not appear in admin's results)
+    await pool.query(
+      `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+      [asAppXId, asUserCId],
+    );
+
+    // Create API key for non-admin tests
+    const asApiKeyRow = await pool.query<{ id: string; key_hash: string }>(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'as-key','as_key_','${require("crypto").createHash("sha256").update("as-api-key-test").digest("hex")}','{read}') RETURNING id`,
+      [asOrgBId, asUserBId],
+    );
+    void asApiKeyRow;
+
+    const asAdminHeaders = { "x-test-clerk-user-id": asAdminClerkId };
+    const asNonAdminHeaders = { "x-test-clerk-user-id": asNonAdminClerkId };
+    // Create a fresh API key for the AS section (keyA may have been revoked earlier)
+    const asRawKey = "ssc_as-fresh-api-key-for-as-section-tests";
+    const asKeyHash = require("crypto").createHash("sha256").update(asRawKey).digest("hex") as string;
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'as-fresh-key','as_frsh_',$3,'{read}')
+       ON CONFLICT (key_hash) DO NOTHING`,
+      [asOrgBId, asUserBId, asKeyHash],
+    );
+    const asApiKeyHeaders = authHeaders(asRawKey);
+
+    const asFixturesDir = path.resolve(__dirname, "fixtures");
+    fs.mkdirSync(asFixturesDir, { recursive: true });
+    function saveFixture(name: string, data: unknown): void {
+      fs.writeFileSync(path.join(asFixturesDir, name), JSON.stringify(data, null, 2));
+    }
+
+    // ── AS-A1: GET /v1/me ─────────────────────────────────────────────────────
+    {
+      const r = await request("GET", "/v1/me", { headers: asAdminHeaders });
+      if (r.status === 200 && (r.body as { is_admin: boolean }).is_admin === true &&
+          typeof (r.body as { open_alert_count: number | null }).open_alert_count === "number") {
+        ok("AS-A1: admin GET /v1/me → is_admin=true, open_alert_count≥0");
+      } else {
+        fail(`AS-A1: admin /v1/me failed, got status ${r.status}`, JSON.stringify(r.body).slice(0, 100));
+      }
+
+      const r2 = await request("GET", "/v1/me", { headers: asNonAdminHeaders });
+      if (r2.status === 200 &&
+          (r2.body as { is_admin: boolean }).is_admin === false &&
+          (r2.body as { open_alert_count: number | null }).open_alert_count === null) {
+        ok("AS-A1: non-admin GET /v1/me → is_admin=false, open_alert_count=null");
+      } else {
+        fail(`AS-A1: non-admin /v1/me failed, got status ${r2.status}`, JSON.stringify(r2.body).slice(0, 100));
+      }
+
+      const r3 = await request("GET", "/v1/me", { headers: asApiKeyHeaders });
+      r3.status === 403
+        ? ok("AS-A1: API key GET /v1/me → 403")
+        : fail(`AS-A1: API key /v1/me should be 403, got ${r3.status}`);
+    }
+
+    // ── AS-A2: GET /v1/admin/stats ────────────────────────────────────────────
+    {
+      const r = await request("GET", "/v1/admin/stats", { headers: asAdminHeaders });
+      if (r.status === 200) {
+        const b = r.body as {
+          people: number;
+          workspaces: number;
+          apps: { total: number; live: number; suspended: number };
+          deploys_today: { total: number; failed: number };
+          visits_today: number;
+          refused_today: number;
+          deploy_series: unknown[];
+          open_alerts: unknown[];
+          discord_configured: boolean;
+          watchdog: unknown;
+        };
+        const valid =
+          typeof b.people === "number" &&
+          typeof b.workspaces === "number" &&
+          typeof b.apps?.total === "number" &&
+          typeof b.deploys_today?.total === "number" &&
+          typeof b.visits_today === "number" &&
+          typeof b.refused_today === "number" &&
+          Array.isArray(b.deploy_series) && b.deploy_series.length === 14 &&
+          Array.isArray(b.open_alerts) &&
+          typeof b.discord_configured === "boolean";
+        valid
+          ? ok("AS-A2: admin GET /v1/admin/stats → 200 correct shape")
+          : fail("AS-A2: admin /admin/stats shape invalid", JSON.stringify(b).slice(0, 200));
+      } else {
+        fail(`AS-A2: admin /admin/stats failed, got ${r.status}`);
+      }
+
+      const r2 = await request("GET", "/v1/admin/stats", { headers: asNonAdminHeaders });
+      r2.status === 404
+        ? ok("AS-A2: non-admin GET /v1/admin/stats → 404")
+        : fail(`AS-A2: non-admin /admin/stats should 404, got ${r2.status}`);
+
+      const r3 = await request("GET", "/v1/admin/stats", { headers: asApiKeyHeaders });
+      r3.status === 404
+        ? ok("AS-A2: API key GET /v1/admin/stats → 404")
+        : fail(`AS-A2: API key /admin/stats should 404, got ${r3.status}`);
+
+      // Save fixture
+      if (r.status === 200) {
+        saveFixture("admin-stats.json", normalizeFixture(r.body));
+        ok("AS-A2: admin-stats.json fixture saved");
+      }
+    }
+
+    // ── AS-A3: GET /v1/me/shared-apps ─────────────────────────────────────────
+    {
+      const r = await request("GET", "/v1/me/shared-apps", { headers: asAdminHeaders });
+      if (r.status === 200) {
+        const apps = r.body as Array<{ app_id: string; status: string }>;
+        const hasAppX = apps.some((a) => a.app_id === asAppXId && a.status === "active");
+        const hasAppY = apps.some((a) => a.app_id === asAppYId && a.status === "pending");
+        hasAppX
+          ? ok("AS-A3: admin shared-apps includes app X (active)")
+          : fail("AS-A3: admin shared-apps missing app X (active)");
+        hasAppY
+          ? ok("AS-A3: admin shared-apps includes app Y (pending)")
+          : fail("AS-A3: admin shared-apps missing app Y (pending)");
+      } else {
+        fail(`AS-A3: admin /me/shared-apps failed, got ${r.status}`);
+      }
+
+      // User C's grants should not appear in admin's results
+      const rC = await request("GET", "/v1/me/shared-apps", { headers: { "x-test-clerk-user-id": asUserCClerkId } });
+      if (rC.status === 200) {
+        const appsC = rC.body as Array<{ app_id: string }>;
+        // User C has app_access to app X — it SHOULD appear for C
+        const hasAppXForC = appsC.some((a) => a.app_id === asAppXId);
+        hasAppXForC
+          ? ok("AS-A3: user C sees their own grant to app X")
+          : fail("AS-A3: user C should see app X in shared-apps");
+      }
+
+      // M4 kill test: user C's grant should NOT appear in admin A's results
+      const adminApps = r.status === 200 ? r.body as Array<{ app_id: string }> : [];
+      void adminApps.some((a) => a.app_id === asAppXId); // suppress unused var lint
+      // User A also has a grant to app X, so it appearing is correct — the M4 test
+      // checks that ONLY user A's row appears, not duplicate rows.
+      // We verify isolation by checking user count: admin should see exactly 1 app X entry
+      const appXEntries = adminApps.filter((a) => a.app_id === asAppXId);
+      appXEntries.length <= 1
+        ? ok("AS-M4: user C's grant does not duplicate in user A's results (dedup NOT EXISTS check)")
+        : fail(`AS-M4: user C's grant should not appear in user A's results, got ${appXEntries.length} entries for app X`);
+
+      // M4b kill test: user B's access to a separate app NEVER appears for user A
+      // If the SQL filtered by org instead of user_id, user B's rows would bleed through
+      const a3AppZRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1,$2,'a3-app-z','a3-app-z-${Date.now()}','zip') RETURNING id`,
+        [asOrgBId, asUserBId],
+      );
+      const a3AppZId = a3AppZRow.rows[0].id;
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+        [a3AppZId, asUserBId],
+      );
+      const rM4b = await request("GET", "/v1/me/shared-apps", { headers: asAdminHeaders });
+      if (rM4b.status === 200) {
+        const appsM4b = rM4b.body as Array<{ app_id: string }>;
+        !appsM4b.some((a) => a.app_id === a3AppZId)
+          ? ok("AS-M4b: user B's grant to app Z does not appear in user A's shared-apps")
+          : fail("AS-M4b: user B's grant to app Z should not appear in user A's shared-apps");
+      } else {
+        fail(`AS-M4b: shared-apps request failed, got ${rM4b.status}`);
+      }
+      await pool.query("DELETE FROM app_access WHERE app_id = $1", [a3AppZId]);
+      await pool.query("DELETE FROM apps WHERE id = $1", [a3AppZId]);
+
+      // Deleted apps excluded
+      await pool.query("UPDATE apps SET deleted_at = now() WHERE id = $1", [asAppXId]);
+      const rDel = await request("GET", "/v1/me/shared-apps", { headers: asAdminHeaders });
+      if (rDel.status === 200) {
+        const appsAfterDelete = rDel.body as Array<{ app_id: string }>;
+        const stillHasX = appsAfterDelete.some((a) => a.app_id === asAppXId);
+        !stillHasX
+          ? ok("AS-A3: deleted app X excluded from shared-apps")
+          : fail("AS-A3: deleted app X should not appear in shared-apps");
+      }
+      // Restore
+      await pool.query("UPDATE apps SET deleted_at = NULL WHERE id = $1", [asAppXId]);
+
+      // Save fixture
+      if (r.status === 200) {
+        saveFixture("shared-apps.json", normalizeFixture(r.body));
+        ok("AS-A3: shared-apps.json fixture saved");
+      }
+    }
+
+    // ── AS-A4: actor_email filled on events ───────────────────────────────────
+    // Covers: key.created, key.revoked, access.granted, access.revoked,
+    //         access.pending_claimed, access.refused, app.deleted
+    {
+      await request("POST", "/test/set-user-email", { body: { clerk_user_id: asAdminClerkId, email: "as-admin@test.local" } });
+      await request("POST", "/test/set-user-email", { body: { clerk_user_id: asUserBClerkId, email: "as-userb@test.local" } });
+      await request("POST", "/test/set-user-email", { body: { clerk_user_id: asUserCClerkId, email: "as-userc@test.local" } });
+
+      // Admin user with clerk_org_aaa for api-keys route
+      const asOrgAdminHeaders = {
+        "x-test-clerk-user-id": asAdminClerkId,
+        "x-test-clerk-org-id": "clerk_org_aaa",
+        "x-test-clerk-org-role": "org:admin",
+      };
+      // User B is org:admin of orgB — use for org-scoped app routes
+      const asOrgBAdminHeaders = {
+        "x-test-clerk-user-id": asUserBClerkId,
+        "x-test-clerk-org-id": "clerk_as_orgB",
+        "x-test-clerk-org-role": "org:admin",
+      };
+
+      // ① key.created (recordActivity — fire-and-forget; poll by target_id=key_prefix)
+      const kcR = await request("POST", "/v1/api-keys", { headers: asOrgAdminHeaders, body: { name: "as-a4-test-key" } });
+      let a4KeyId: string | null = null;
+      if (kcR.status === 201) {
+        a4KeyId = (kcR.body as { id?: string }).id ?? null;
+        const kcPrefix = (kcR.body as { key_prefix?: string }).key_prefix ?? "";
+        const kcRows = await waitForRow<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'key.created' AND target_id = $1`,
+          [kcPrefix], (rows) => rows.length > 0,
+        );
+        kcRows[0]?.actor_email
+          ? ok(`AS-A4: key.created actor_email="${kcRows[0].actor_email}"`)
+          : fail("AS-A4: key.created actor_email is null");
+      } else {
+        fail(`AS-A4: POST /v1/api-keys failed, got ${kcR.status}`);
+      }
+
+      // ② key.revoked (recordActivityInTx — synchronous; query immediately)
+      if (a4KeyId) {
+        const krR = await request("DELETE", `/v1/api-keys/${a4KeyId}`, { headers: asOrgAdminHeaders });
+        if (krR.status === 200) {
+          const { rows: krRows } = await pool.query<{ actor_email: string | null }>(
+            `SELECT actor_email FROM activity_events WHERE event_type = 'key.revoked' AND target_id = $1`,
+            [a4KeyId],
+          );
+          krRows[0]?.actor_email
+            ? ok(`AS-A4: key.revoked actor_email="${krRows[0].actor_email}"`)
+            : fail("AS-A4: key.revoked actor_email is null");
+        } else {
+          fail(`AS-A4: DELETE /v1/api-keys/:id failed, got ${krR.status}`);
+        }
+      }
+
+      // ③ access.granted (recordActivityInTx — synchronous; query immediately)
+      // User B is org:admin of orgB and orgB owns appX
+      const agR = await request("POST", `/v1/apps/${asAppXId}/access`, {
+        headers: asOrgBAdminHeaders,
+        body: { email: "a4-granted@test.local" },
+      });
+      if (agR.status === 201) {
+        const { rows: agRows } = await pool.query<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'access.granted' AND target_id = 'a4-granted@test.local' ORDER BY occurred_at DESC LIMIT 1`,
+        );
+        agRows[0]?.actor_email
+          ? ok(`AS-A4: access.granted actor_email="${agRows[0].actor_email}"`)
+          : fail("AS-A4: access.granted actor_email is null");
+      } else {
+        fail(`AS-A4: POST /v1/apps/:id/access failed, got ${agR.status}`);
+      }
+
+      // ④ access.revoked (recordActivityInTx — synchronous; query immediately)
+      const arvR = await request("DELETE", `/v1/apps/${asAppXId}/access/a4-granted%40test.local`, {
+        headers: asOrgBAdminHeaders,
+      });
+      if (arvR.status === 200) {
+        const { rows: arvRows } = await pool.query<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'access.revoked' AND target_id = 'a4-granted@test.local' ORDER BY occurred_at DESC LIMIT 1`,
+        );
+        arvRows[0]?.actor_email
+          ? ok(`AS-A4: access.revoked actor_email="${arvRows[0].actor_email}"`)
+          : fail("AS-A4: access.revoked actor_email is null");
+      } else {
+        fail(`AS-A4: DELETE /v1/apps/:id/access/:email failed, got ${arvR.status}`);
+      }
+
+      // ⑤ app.deleted (recordActivityInTx — synchronous; query immediately)
+      const a4TempAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1,$2,'a4-temp-app','a4-temp-app-${Date.now()}','zip') RETURNING id`,
+        [asOrgBId, asUserBId],
+      );
+      const a4TempAppId = a4TempAppRow.rows[0].id;
+      const adR = await request("DELETE", `/v1/apps/${a4TempAppId}`, { headers: asOrgBAdminHeaders });
+      if (adR.status === 200) {
+        const { rows: adRows } = await pool.query<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'app.deleted' AND app_id = $1`,
+          [a4TempAppId],
+        );
+        adRows[0]?.actor_email
+          ? ok(`AS-A4: app.deleted actor_email="${adRows[0].actor_email}"`)
+          : fail("AS-A4: app.deleted actor_email is null");
+      } else {
+        fail(`AS-A4: DELETE /v1/apps/:id failed, got ${adR.status}`);
+      }
+      await pool.query("DELETE FROM apps WHERE id = $1", [a4TempAppId]);
+
+      // ⑥ access.pending_claimed (recordActivity — fire-and-forget; poll)
+      // Create temp app with pending_access for user C's email.
+      // The pending conversion + event fire happens inside POST /v1/proxy/codes
+      // (not /exchange) — the codes endpoint converts pending→real on first visit.
+      const a4PendingAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type, subdomain)
+         VALUES ($1,$2,'a4-pending','a4-pending-${Date.now()}','zip','https://a4-pending.fly.dev') RETURNING id`,
+        [asOrgBId, asUserBId],
+      );
+      const a4PendingAppId = a4PendingAppRow.rows[0].id;
+      await pool.query(
+        `INSERT INTO pending_access (app_id, email, granted_by) VALUES ($1,'as-userc@test.local',NULL) ON CONFLICT DO NOTHING`,
+        [a4PendingAppId],
+      );
+      await request("POST", "/test/reset-activity-throttle");
+      // POST /codes with user C — finds pending, converts, fires access.pending_claimed, returns 201
+      const pCodesR = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": asUserCClerkId },
+        body: { app_id: a4PendingAppId, state: "a4pendingstate1234", return: "/" },
+      });
+      if (pCodesR.status === 201) {
+        const apcRows = await waitForRow<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'access.pending_claimed' AND app_id = $1`,
+          [a4PendingAppId], (rows) => rows.length > 0,
+        );
+        apcRows[0]?.actor_email
+          ? ok(`AS-A4: access.pending_claimed actor_email="${apcRows[0].actor_email}"`)
+          : fail("AS-A4: access.pending_claimed actor_email is null");
+      } else {
+        fail(`AS-A4: proxy codes for pending_claimed failed, got ${pCodesR.status}`);
+      }
+      await pool.query("DELETE FROM app_access WHERE app_id = $1", [a4PendingAppId]);
+      await pool.query("DELETE FROM apps WHERE id = $1", [a4PendingAppId]);
+
+      // ⑦ access.refused (recordActivity — fire-and-forget; poll)
+      // User B has no access to appY and no pending_access for their email.
+      // POST /codes is where the access check runs and fires access.refused (returns 403).
+      await pool.query("UPDATE apps SET subdomain = 'https://a4-refused.fly.dev' WHERE id = $1", [asAppYId]);
+      await request("POST", "/test/reset-activity-throttle");
+      const rCodesR = await request("POST", "/v1/proxy/codes", {
+        headers: { "x-test-clerk-user-id": asUserBClerkId },
+        body: { app_id: asAppYId, state: "a4refusedstate1234", return: "/" },
+      });
+      if (rCodesR.status === 403) {
+        const arRows = await waitForRow<{ actor_email: string | null }>(
+          `SELECT actor_email FROM activity_events WHERE event_type = 'access.refused' AND app_id = $1 ORDER BY occurred_at DESC LIMIT 1`,
+          [asAppYId], (rows) => rows.length > 0,
+        );
+        arRows[0]?.actor_email
+          ? ok(`AS-A4: access.refused actor_email="${arRows[0].actor_email}"`)
+          : fail("AS-A4: access.refused actor_email is null");
+      } else {
+        fail(`AS-A4: proxy codes for access.refused should be 403, got ${rCodesR.status}`);
+      }
+    }
+
+    // ── AS-A5: activity_searched throttle ─────────────────────────────────────
+    {
+      await request("POST", "/test/reset-activity-throttle");
+
+      // Make 20 identical searches
+      for (let i = 0; i < 20; i++) {
+        await request("GET", "/v1/admin/activity?q=hello-as-a5", { headers: asAdminHeaders });
+      }
+
+      const { rows: throttleRows } = await pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM activity_events
+         WHERE event_type = 'admin.activity_searched'
+           AND metadata->>'q' = 'hello-as-a5'
+           AND occurred_at > now() - INTERVAL '1 minute'`,
+      );
+      parseInt(throttleRows[0]?.cnt ?? "0", 10) === 1
+        ? ok("AS-A5: 20 identical searches produce exactly 1 activity row")
+        : fail(`AS-A5: expected 1 row, got ${throttleRows[0]?.cnt ?? 0}`);
+
+      // Different query — should produce a new row; poll until the second row appears
+      await request("GET", "/v1/admin/activity?q=world-as-a5", { headers: asAdminHeaders });
+      const throttleRows2 = await waitForRow<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM activity_events
+         WHERE event_type = 'admin.activity_searched'
+           AND (metadata->>'q' = 'hello-as-a5' OR metadata->>'q' = 'world-as-a5')
+           AND occurred_at > now() - INTERVAL '1 minute'`,
+        [],
+        (rows) => parseInt(rows[0]?.cnt ?? "0", 10) >= 2,
+      );
+      parseInt(throttleRows2[0]?.cnt ?? "0", 10) === 2
+        ? ok("AS-A5: different query produces a separate row (2 total)")
+        : fail(`AS-A5: expected 2 rows total, got ${throttleRows2[0]?.cnt ?? 0}`);
+    }
+
+    // ── AS-M1: Sidebar admin section gate (API level) ─────────────────────────
+    {
+      const r = await request("GET", "/v1/admin/stats", { headers: asNonAdminHeaders });
+      r.status === 404
+        ? ok("AS-M1: /admin/stats returns 404 for non-admin (sidebar gate verified)")
+        : fail(`AS-M1: /admin/stats should 404 for non-admin, got ${r.status}`);
+    }
+
+    // ── AS-M2: /admin/apps returns 403 for non-admin ──────────────────────────
+    {
+      const r = await request("GET", "/v1/admin/apps", { headers: asNonAdminHeaders });
+      r.status === 403
+        ? ok("AS-M2: /admin/apps returns 403 for non-admin")
+        : fail(`AS-M2: /admin/apps should 403 for non-admin, got ${r.status}`);
+    }
+
+    // ── AS-M8: app.visit actor_email ──────────────────────────────────────────
+    {
+      // Set up: ensure non-admin user has known email and access to an app
+      await request("POST", "/test/set-user-email", { body: { clerk_user_id: asNonAdminClerkId, email: "as-nonadmin@test.local" } });
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+        [asAppXId, asNonAdminUserId],
+      );
+      // Update subdomain for app X to have https
+      await pool.query(
+        "UPDATE apps SET subdomain = $1 WHERE id = $2",
+        [`https://as-app-x.fly.dev`, asAppXId],
+      );
+      const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
+      const asProxyToken = await issueProxyToken(asAppXId);
+
+      // Post codes then exchange
+      const codesR = await request("POST", "/v1/proxy/codes", {
+        headers: { ...asNonAdminHeaders },
+        body: { app_id: asAppXId, state: "abcdefghijklmnop", return: "/" },
+      });
+      if (codesR.status === 201) {
+        const redirectUrl = (codesR.body as { redirect_url: string }).redirect_url;
+        const codeParam = new URL(redirectUrl).searchParams.get("code");
+        const exchangeR = await request("POST", "/v1/proxy/exchange", {
+          headers: { Authorization: `Bearer ${asProxyToken}` },
+          body: { code: codeParam, state: "abcdefghijklmnop" },
+        });
+        if (exchangeR.status === 200) {
+          const { rows: visitRows } = await pool.query<{ actor_email: string | null }>(
+            `SELECT actor_email FROM activity_events WHERE event_type = 'app.visit' ORDER BY occurred_at DESC LIMIT 1`,
+          );
+          visitRows[0]?.actor_email
+            ? ok(`AS-M8: app.visit actor_email="${visitRows[0].actor_email}"`)
+            : fail("AS-M8: app.visit actor_email should be non-null");
+        } else {
+          fail(`AS-M8: proxy exchange failed, got ${exchangeR.status}`);
+        }
+      } else {
+        fail(`AS-M8: proxy codes failed, got ${codesR.status}`, JSON.stringify(codesR.body).slice(0, 100));
+      }
+    }
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    await pool.query("DELETE FROM app_access WHERE app_id IN ($1,$2)", [asAppXId, asAppYId]);
+    await pool.query("DELETE FROM pending_access WHERE app_id IN ($1,$2)", [asAppXId, asAppYId]);
+    await pool.query("DELETE FROM apps WHERE id IN ($1,$2)", [asAppXId, asAppYId]);
+    await pool.query("DELETE FROM org_members WHERE org_id = $1", [asOrgBId]);
+    await pool.query("DELETE FROM orgs WHERE id = $1", [asOrgBId]);
+    await pool.query("DELETE FROM users WHERE clerk_user_id IN ($1,$2,$3)",
+      [asNonAdminClerkId, asUserBClerkId, asUserCClerkId]);
+    // Keep admin user (created with ON CONFLICT, exists from AF tests)
+    void asNonAdminUserId;
   }
 
   // ════════════════════════════════════════════════════════════════════════════

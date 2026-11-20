@@ -143,6 +143,12 @@ appAccessRouter.post(
     }
 
     // R4: access.granted written in same transaction as the pending_access insert.
+    let granterEmail: string | null = null;
+    if (req.sscAuth!.type === "clerk" && granterId) {
+      const { rows: ge } = await pool.query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1", [granterId]);
+      granterEmail = ge[0]?.email ?? null;
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -155,6 +161,7 @@ appAccessRouter.post(
         eventType: ActivityEventType.ACCESS_GRANTED,
         actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
         actorUserId: granterId,
+        actorEmail: req.sscAuth!.type === "clerk" ? granterEmail : null,
         orgId,
         appId,
         targetId: rawEmail,
@@ -186,6 +193,12 @@ appAccessRouter.delete(
     const email = req.params.email.trim().toLowerCase();
 
     // R4: access.revoked written in same transaction as the deletions.
+    let revokerEmail: string | null = null;
+    if (req.sscAuth!.type === "clerk" && granterId) {
+      const { rows: re } = await pool.query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1", [granterId]);
+      revokerEmail = re[0]?.email ?? null;
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -203,6 +216,7 @@ appAccessRouter.delete(
         eventType: ActivityEventType.ACCESS_REVOKED,
         actorType: req.sscAuth!.type === "clerk" ? "user" : "api_key",
         actorUserId: granterId,
+        actorEmail: req.sscAuth!.type === "clerk" ? revokerEmail : null,
         appId,
         targetId: email,
         metadata: {},

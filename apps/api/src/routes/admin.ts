@@ -16,6 +16,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { listMachines, destroyMachine } from "../services/flyClient";
 import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
+import { queryCpuMetrics, queryEgressBytes24h } from "../lib/flyMetrics";
 
 // ── Admin ID registry ─────────────────────────────────────────────────────────
 
@@ -105,7 +106,19 @@ adminRouter.use(requireAdminCheck);
 adminRouter.get(
   "/apps",
   asyncHandler(async (_req: Request, res: Response) => {
-    const { rows } = await pool.query(`
+    const { rows } = await pool.query<{
+      id: string;
+      name: string;
+      org_id: string;
+      fly_app_id: string | null;
+      suspended: boolean;
+      suspended_at: Date | null;
+      suspend_reason: string | null;
+      owner_email: string | null;
+      org_name: string | null;
+      last_visit_at: Date | null;
+      latest_deployment_status: string | null;
+    }>(`
       SELECT
         a.id,
         a.name,
@@ -114,18 +127,44 @@ adminRouter.get(
         a.suspended_at IS NOT NULL AS suspended,
         a.suspended_at,
         a.suspend_reason,
+        u.email  AS owner_email,
+        o.name   AS org_name,
         (
-          SELECT d.status
-          FROM deployments d
+          SELECT occurred_at FROM activity_events
+          WHERE app_id = a.id AND event_type = 'app.visit'
+          ORDER BY occurred_at DESC LIMIT 1
+        ) AS last_visit_at,
+        (
+          SELECT d.status FROM deployments d
           WHERE d.app_id = a.id
-          ORDER BY d.created_at DESC
-          LIMIT 1
+          ORDER BY d.created_at DESC LIMIT 1
         ) AS latest_deployment_status
       FROM apps a
+      LEFT JOIN users u ON u.id = a.owner_id
+      LEFT JOIN orgs  o ON o.id = a.org_id
       WHERE a.deleted_at IS NULL
       ORDER BY a.created_at DESC
     `);
-    res.json(rows);
+
+    const [cpuSamples, egressSamples] = await Promise.all([
+      queryCpuMetrics(),
+      queryEgressBytes24h(),
+    ]);
+    const cpuByApp = new Map(cpuSamples.map((s) => [s.flyAppId, s.value]));
+    const egressByApp = new Map(egressSamples.map((s) => [s.flyAppId, s.value]));
+
+    const result = rows.map((r) => ({
+      ...r,
+      cpu_pct:
+        r.fly_app_id && cpuByApp.has(r.fly_app_id)
+          ? parseFloat((cpuByApp.get(r.fly_app_id)! * 100).toFixed(1))
+          : null,
+      traffic_bytes_24h:
+        r.fly_app_id && egressByApp.has(r.fly_app_id)
+          ? Math.round(egressByApp.get(r.fly_app_id)!)
+          : null,
+    }));
+    res.json(result);
   }),
 );
 
@@ -174,8 +213,8 @@ adminRouter.post(
     }
 
     // Resolve internal user id for the admin actor
-    const { rows: userRows } = await pool.query<{ id: string }>(
-      "SELECT id FROM users WHERE clerk_user_id = $1",
+    const { rows: userRows } = await pool.query<{ id: string; email: string }>(
+      "SELECT id, email FROM users WHERE clerk_user_id = $1",
       [clerkUserId],
     );
     const actorUserId: string | null = userRows[0]?.id ?? null;
@@ -202,6 +241,7 @@ adminRouter.post(
         eventType: ActivityEventType.APP_SUSPENDED,
         actorType: "user",
         actorUserId,
+        actorEmail: userRows[0]?.email ?? null,
         metadata: { reason: trimmedReason.slice(0, 100) },
       });
       await client.query("COMMIT");
@@ -270,8 +310,8 @@ adminRouter.post(
     }
 
     const clerkUserId = req.sscAuth!.clerkUserId!;
-    const { rows: userRows } = await pool.query<{ id: string }>(
-      "SELECT id FROM users WHERE clerk_user_id = $1",
+    const { rows: userRows } = await pool.query<{ id: string; email: string }>(
+      "SELECT id, email FROM users WHERE clerk_user_id = $1",
       [clerkUserId],
     );
     const actorUserId: string | null = userRows[0]?.id ?? null;
@@ -297,6 +337,7 @@ adminRouter.post(
         eventType: ActivityEventType.APP_UNSUSPENDED,
         actorType: "user",
         actorUserId,
+        actorEmail: userRows[0]?.email ?? null,
         metadata: {},
       });
       await client.query("COMMIT");

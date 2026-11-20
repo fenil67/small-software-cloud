@@ -67,12 +67,17 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, 
     [orgId, userId, name.trim(), keyPrefix, keyHash, scopes],
   );
 
+  const { rows: ke } = await pool.query<{ email: string }>(
+    "SELECT email FROM users WHERE id = $1", [userId]);
+  const actorEmail = ke[0]?.email ?? null;
+
   // Best-effort activity log for key creation
   recordActivity({
     eventType: ActivityEventType.KEY_CREATED,
     actorType: sscAuth.type === "clerk" ? "user" : "api_key",
     actorUserId: userId,
     actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
+    actorEmail,
     orgId,
     targetId: keyPrefix,
     metadata: {
@@ -128,10 +133,14 @@ apiKeysRouter.delete("/:id", requireClerkOrgAdmin, asyncHandler(async (req: Requ
       return;
     }
     const userId = await ensureUser(sscAuth.clerkUserId!);
+    const { rows: ke2 } = await client.query<{ email: string }>(
+      "SELECT email FROM users WHERE id = $1", [userId]);
+    const revokeActorEmail = ke2[0]?.email ?? null;
     await recordActivityInTx(client, {
       eventType: ActivityEventType.KEY_REVOKED,
       actorType: "user",
       actorUserId: userId,
+      actorEmail: revokeActorEmail,
       orgId,
       targetId: req.params.id,
       metadata: {},

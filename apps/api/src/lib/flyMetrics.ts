@@ -128,18 +128,50 @@ async function queryPrometheus(query: string): Promise<MetricSample[]> {
   });
 }
 
+// ── 60-second module-level cache ─────────────────────────────────────────────
+
+interface CacheEntry { value: MetricSample[]; expiresAt: number; }
+const metricCache = new Map<string, CacheEntry>();
+
+function cachedQuery(key: string, fn: () => Promise<MetricSample[]>): Promise<MetricSample[]> {
+  const entry = metricCache.get(key);
+  if (entry && Date.now() < entry.expiresAt) return Promise.resolve(entry.value);
+  return fn().then(value => {
+    metricCache.set(key, { value, expiresAt: Date.now() + 60_000 });
+    return value;
+  });
+}
+
 /** Returns per-app CPU rate (cores) over the last 30 minutes. */
-export async function queryCpuMetrics(): Promise<MetricSample[]> {
-  return queryPrometheus(
-    `sum by (app) (rate(fly_instance_cpu{mode=~"user|system"}[30m]))`,
+export function queryCpuMetrics(): Promise<MetricSample[]> {
+  return cachedQuery("cpu", () =>
+    queryPrometheus(
+      `sum by (app) (rate(fly_instance_cpu{mode=~"user|system"}[30m]))`,
+    ),
   );
 }
 
 /** Returns per-app egress bytes/sec rate over the last 30 minutes. */
-export async function queryEgressMetrics(): Promise<MetricSample[]> {
-  return queryPrometheus(
-    `sum by (app) (rate(fly_instance_net_sent_bytes[30m]))`,
+export function queryEgressMetrics(): Promise<MetricSample[]> {
+  return cachedQuery("egress30m", () =>
+    queryPrometheus(
+      `sum by (app) (rate(fly_instance_net_sent_bytes[30m]))`,
+    ),
   );
+}
+
+/** Returns per-app total egress bytes transferred in the last 24 hours. */
+export function queryEgressBytes24h(): Promise<MetricSample[]> {
+  return cachedQuery("egress24h", () =>
+    queryPrometheus(
+      `sum by (app) (increase(fly_instance_net_sent_bytes[24h]))`,
+    ),
+  );
+}
+
+/** Test-only: clears the metrics cache. Never call in production code. */
+export function _clearMetricsCacheForTest(): void {
+  metricCache.clear();
 }
 
 /** Exported for tests that need to verify the loopback-only restriction. */

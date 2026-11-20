@@ -357,8 +357,9 @@ const { apiKeysRouter } = require("../src/routes/apiKeys") as typeof import("../
 const { webhookRouter } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { verifyClerkWebhookSignature } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/routes/admin") as typeof import("../src/routes/admin");
-const { activityAdminRouter } = require("../src/routes/activityAdmin") as typeof import("../src/routes/activityAdmin");
-const { _resetThrottleMapsForTest, _armInsertFailureForTest } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
+const { activityAdminRouter, adminStatsRouter } = require("../src/routes/activityAdmin") as typeof import("../src/routes/activityAdmin");
+const { meRouter } = require("../src/routes/me") as typeof import("../src/routes/me");
+const { _resetThrottleMapsForTest, _armInsertFailureForTest, _resetActivitySearchedThrottleForTest } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
 const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
 // Parse PLATFORM_ADMIN_CLERK_IDS now that the env var is set.
 // With no-import-time-parsing design, this is the single place that fills _adminIds.
@@ -485,8 +486,20 @@ app.post("/test/reset-fly-call-log", (_req, res) => {
 // Used by AR-M1 test to ensure a clean slate before the flood test.
 app.post("/test/reset-activity-throttle", (_req, res) => {
   _resetThrottleMapsForTest();
+  _resetActivitySearchedThrottleForTest();
   res.json({ ok: true });
 });
+
+// POST /test/set-user-email — sets a user's email by clerk_user_id (for A4 email tests)
+app.post("/test/set-user-email", (async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { clerk_user_id, email } = req.body as { clerk_user_id: string; email: string };
+    await pool.query("UPDATE users SET email = $1 WHERE clerk_user_id = $2", [email, clerk_user_id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}) as express.RequestHandler);
 
 // POST /test/arm-activity-insert-failure — causes next recordActivityInTx call to throw
 app.post("/test/arm-activity-insert-failure", (_req, res) => {
@@ -1049,12 +1062,17 @@ app.post("/test/set-prometheus-data", (req, res) => {
       value: [Math.floor(Date.now() / 1000), String(c.value)] as [number, string],
     }));
   }
+  // Clear the 60s admin-stats cache so this test data is seen immediately
+  const { _clearMetricsCacheForTest } = require("../src/lib/flyMetrics") as typeof import("../src/lib/flyMetrics");
+  _clearMetricsCacheForTest();
   res.json({ ok: true });
 });
 
 // POST /test/set-prometheus-fail { fail: bool }
 app.post("/test/set-prometheus-fail", (req, res) => {
   _promFailMode = !!(req.body as { fail?: boolean }).fail;
+  const { _clearMetricsCacheForTest } = require("../src/lib/flyMetrics") as typeof import("../src/lib/flyMetrics");
+  _clearMetricsCacheForTest();
   res.json({ ok: true, promFailMode: _promFailMode });
 });
 
@@ -1092,6 +1110,8 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
+app.use("/v1/me", meRouter);
+app.use("/v1/admin/stats", adminStatsRouter);
 app.use("/v1/admin/activity", activityAdminRouter);
 app.use("/v1/admin", adminRouter);
 app.use((_req, res) => res.status(404).json({ error: "not_found" }));

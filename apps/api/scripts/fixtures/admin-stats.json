@@ -1,0 +1,115 @@
+{
+  "people": 25,
+  "people_joined_this_week": 25,
+  "workspaces": 1,
+  "workspaces_with_teammates": 1,
+  "apps": {
+    "total": 47,
+    "live": 39,
+    "suspended": 8
+  },
+  "deploys_today": {
+    "total": 3,
+    "failed": 2
+  },
+  "visits_today": 1,
+  "refused_today": 0,
+  "watchdog": null,
+  "discord_configured": true,
+  "deploy_series": [
+    {
+      "date": "2026-11-07",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-08",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-09",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-10",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-11",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-12",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-13",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-14",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-15",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-16",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-17",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-18",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-19",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-20",
+      "succeeded": 1,
+      "failed": 2
+    }
+  ],
+  "open_alerts": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "kind": "test_alert_2",
+      "app_id": null,
+      "app_name": null,
+      "owner_email": null,
+      "created_at": "2026-01-01T00:00:00.000Z",
+      "detail": {
+        "x": 2
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "kind": "test_alert_1",
+      "app_id": null,
+      "app_name": null,
+      "owner_email": null,
+      "created_at": "2026-01-01T00:00:00.000Z",
+      "detail": {
+        "x": 1
+      }
+    }
+  ]
+}

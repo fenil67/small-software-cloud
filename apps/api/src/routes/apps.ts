@@ -133,12 +133,14 @@ appsRouter.delete("/:id", requireScope("manage"), asyncHandler(async (req: Reque
 
   // Resolve actor user ID
   let actorUserId: string | null = null;
+  let actorEmail: string | null = null;
   if (sscAuth.type === "clerk" && sscAuth.clerkUserId) {
-    const { rows: userRows } = await pool.query<{ id: string }>(
-      "SELECT id FROM users WHERE clerk_user_id = $1",
+    const { rows: userRows } = await pool.query<{ id: string; email: string }>(
+      "SELECT id, email FROM users WHERE clerk_user_id = $1",
       [sscAuth.clerkUserId],
     );
     actorUserId = userRows[0]?.id ?? null;
+    actorEmail = userRows[0]?.email ?? null;
   } else if (sscAuth.type === "api_key" && sscAuth.apiKeyCreatedBy) {
     actorUserId = sscAuth.apiKeyCreatedBy;
   }
@@ -155,6 +157,7 @@ appsRouter.delete("/:id", requireScope("manage"), asyncHandler(async (req: Reque
       eventType: ActivityEventType.APP_DELETED,
       actorType: sscAuth.type === "clerk" ? "user" : "api_key",
       actorUserId,
+      actorEmail: sscAuth.type === "clerk" ? actorEmail : null,
       actorKeyId: sscAuth.type === "api_key" ? (sscAuth.apiKeyId ?? null) : null,
       orgId,
       appId,

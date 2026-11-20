@@ -90,10 +90,30 @@ const ACCESS_REFUSED_WINDOW_MS = 10 * 60_000;  // 10 minutes
  * Returns true if the event should be throttled (suppressed from DB).
  * Increments counter; only returns false (allow) for the first hit in the window.
  */
+const activitySearchedMap = new Map<string, ThrottleEntry>();
+const ACTIVITY_SEARCHED_WINDOW_MS = 10 * 60_000;
+
+export function shouldThrottleActivitySearched(adminId: string, filterKey: string): boolean {
+  const key = `${adminId}:${filterKey}`;
+  const now = Date.now();
+  const entry = activitySearchedMap.get(key);
+  if (!entry || now - entry.firstSeen > ACTIVITY_SEARCHED_WINDOW_MS) {
+    activitySearchedMap.set(key, { count: 1, firstSeen: now });
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
+export function _resetActivitySearchedThrottleForTest(): void {
+  activitySearchedMap.clear();
+}
+
 /** Test-only: clears both in-memory throttle maps. Never call in production code. */
 export function _resetThrottleMapsForTest(): void {
   keyAuthFailedMap.clear();
   accessRefusedMap.clear();
+  activitySearchedMap.clear();
 }
 
 /** Test-only: causes the next recordActivityInTx call to throw. Never call in production code. */

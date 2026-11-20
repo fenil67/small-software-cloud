@@ -18,14 +18,19 @@ import {
   ActivityEventType,
   recordActivity,
   recordActivityInTx,
+  shouldThrottleActivitySearched,
 } from "../lib/activityLog";
 
 export const activityAdminRouter = Router();
 activityAdminRouter.use(requireAuth);
 
+/** Separate router for GET /v1/admin/stats (same 404-for-non-admins guard). */
+export const adminStatsRouter = Router();
+adminStatsRouter.use(requireAuth);
+
 // ── 404-for-non-admins (C7) ───────────────────────────────────────────────────
 
-activityAdminRouter.use((req: Request, res: Response, next: () => void): void => {
+function adminOnly(req: Request, res: Response, next: () => void): void {
   const auth = req.sscAuth;
   if (
     !auth ||
@@ -37,7 +42,10 @@ activityAdminRouter.use((req: Request, res: Response, next: () => void): void =>
     return;
   }
   next();
-});
+}
+
+activityAdminRouter.use(adminOnly);
+adminStatsRouter.use(adminOnly);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +78,137 @@ function csvRow(cells: (string | null | undefined)[]): string {
     })
     .join(",");
 }
+
+// ── GET /stats — on adminStatsRouter (mounted at /v1/admin/stats) ─────────────
+
+adminStatsRouter.get(
+  "/",
+  asyncHandler(async (_req: Request, res: Response) => {
+    // Parallel batch 1: people, workspaces, apps, deploys, activity
+    const [peopleRes, appsRes, deploysRes, activityRes] = await Promise.all([
+      pool.query<{ people: number; joined_week: number }>(`
+        SELECT
+          COUNT(*)::int AS people,
+          COUNT(*) FILTER (WHERE created_at > now() - INTERVAL '7 days')::int AS joined_week
+        FROM users
+      `),
+      pool.query<{ total: number; live: number; suspended: number }>(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE suspended_at IS NULL)::int AS live,
+          COUNT(*) FILTER (WHERE suspended_at IS NOT NULL)::int AS suspended
+        FROM apps WHERE deleted_at IS NULL
+      `),
+      pool.query<{ total: number; failed: number }>(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+        FROM deployments WHERE started_at > date_trunc('day', now() AT TIME ZONE 'UTC')
+      `),
+      pool.query<{ visits: number; refused: number }>(`
+        SELECT
+          COUNT(*) FILTER (WHERE event_type = 'app.visit')::int AS visits,
+          COUNT(*) FILTER (WHERE event_type = 'access.refused')::int AS refused
+        FROM activity_events WHERE occurred_at > date_trunc('day', now() AT TIME ZONE 'UTC')
+      `),
+    ]);
+
+    // Parallel batch 2: workspaces, watchdog, discord, deploy series, open alerts
+    const [workspacesRes, watchdogRes, deploySeriesRes, alertsRes] = await Promise.all([
+      pool.query<{ total: number; with_teammates: number }>(`
+        SELECT
+          COUNT(DISTINCT org_id)::int AS total,
+          COUNT(DISTINCT org_id) FILTER (WHERE cnt > 1)::int AS with_teammates
+        FROM (SELECT org_id, COUNT(*) AS cnt FROM org_members GROUP BY org_id) sub
+      `),
+      pool.query<{ apps_checked: number; last_checked_at: Date | null }>(`
+        SELECT COUNT(*)::int AS apps_checked, MAX(last_probe_at) AS last_checked_at
+        FROM watchdog_probe_state
+      `),
+      pool.query<{ date: string; succeeded: number; failed: number }>(`
+        WITH days AS (
+          SELECT generate_series(
+            date_trunc('day', now() AT TIME ZONE 'UTC') - INTERVAL '13 days',
+            date_trunc('day', now() AT TIME ZONE 'UTC'),
+            INTERVAL '1 day'
+          ) AS day
+        )
+        SELECT
+          to_char(d.day, 'YYYY-MM-DD') AS date,
+          COALESCE(COUNT(dep.id) FILTER (WHERE dep.status = 'success'), 0)::int AS succeeded,
+          COALESCE(COUNT(dep.id) FILTER (WHERE dep.status = 'failed'),  0)::int AS failed
+        FROM days d
+        LEFT JOIN deployments dep
+          ON date_trunc('day', dep.started_at AT TIME ZONE 'UTC') = d.day
+        GROUP BY d.day
+        ORDER BY d.day ASC
+      `),
+      pool.query<{
+        id: string;
+        kind: string;
+        app_id: string | null;
+        created_at: Date;
+        detail: Record<string, unknown>;
+        app_name: string | null;
+        owner_email: string | null;
+      }>(`
+        SELECT wa.id, wa.kind, wa.app_id, wa.created_at, wa.detail,
+               a.name AS app_name,
+               u.email AS owner_email
+        FROM watchdog_alerts wa
+        LEFT JOIN apps a ON a.id = wa.app_id
+        LEFT JOIN users u ON u.id = a.owner_id
+        ORDER BY wa.created_at DESC
+        LIMIT 50
+      `),
+    ]);
+
+    const watchdogRow = watchdogRes.rows[0];
+    const watchdog =
+      watchdogRow && watchdogRow.apps_checked > 0
+        ? {
+            apps_checked: watchdogRow.apps_checked,
+            last_checked_at: watchdogRow.last_checked_at
+              ? watchdogRow.last_checked_at.toISOString()
+              : new Date().toISOString(),
+          }
+        : null;
+
+    const discord_configured =
+      typeof process.env.ALERT_DISCORD_WEBHOOK_URL === "string" &&
+      process.env.ALERT_DISCORD_WEBHOOK_URL.length > 0;
+
+    res.json({
+      people: peopleRes.rows[0]?.people ?? 0,
+      people_joined_this_week: peopleRes.rows[0]?.joined_week ?? 0,
+      workspaces: workspacesRes.rows[0]?.total ?? 0,
+      workspaces_with_teammates: workspacesRes.rows[0]?.with_teammates ?? 0,
+      apps: {
+        total: appsRes.rows[0]?.total ?? 0,
+        live: appsRes.rows[0]?.live ?? 0,
+        suspended: appsRes.rows[0]?.suspended ?? 0,
+      },
+      deploys_today: {
+        total: deploysRes.rows[0]?.total ?? 0,
+        failed: deploysRes.rows[0]?.failed ?? 0,
+      },
+      visits_today: activityRes.rows[0]?.visits ?? 0,
+      refused_today: activityRes.rows[0]?.refused ?? 0,
+      watchdog,
+      discord_configured,
+      deploy_series: deploySeriesRes.rows,
+      open_alerts: alertsRes.rows.map((r) => ({
+        id: r.id,
+        kind: r.kind,
+        app_id: r.app_id,
+        app_name: r.app_name,
+        owner_email: r.owner_email,
+        created_at: r.created_at.toISOString(),
+        detail: r.detail,
+      })),
+    });
+  }),
+);
 
 // ── GET /summary — MUST be registered before /:id ────────────────────────────
 
@@ -423,18 +562,22 @@ activityAdminRouter.get(
       ).toString("base64");
     }
 
-    // Best-effort audit of search
-    recordActivity({
-      eventType: ActivityEventType.ADMIN_ACTIVITY_SEARCHED,
-      actorType: "user",
-      actorUserId: null,
-      metadata: {
-        q: (q ?? "").slice(0, 100),
-        event_type: event_type ?? "",
-        limit,
-        has_cursor: cursorStr ? true : false,
-      },
-    });
+    // Best-effort audit of search (throttled: once per unique filter per 10 min)
+    const adminId = req.sscAuth!.clerkUserId!;
+    const fromStr = from ?? "";
+    const toStr = to ?? "";
+    const filterKey = JSON.stringify({ q: q ?? "", event_type: event_type ?? "", from: fromStr, to: toStr });
+    if (!shouldThrottleActivitySearched(adminId, filterKey)) {
+      recordActivity({
+        eventType: ActivityEventType.ADMIN_ACTIVITY_SEARCHED,
+        actorType: "user",
+        actorUserId: null,
+        metadata: {
+          q: (q ?? "").slice(0, 100),
+          event_type: event_type ?? "",
+        },
+      });
+    }
 
     res.json({ events, next_cursor });
   }),

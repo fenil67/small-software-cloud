@@ -102,7 +102,8 @@ import { deployStreamRouter } from "./routes/deployStream";
 import { deploymentsRouter } from "./routes/deployments";
 import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
-import { activityAdminRouter } from "./routes/activityAdmin";
+import { activityAdminRouter, adminStatsRouter } from "./routes/activityAdmin";
+import { meRouter } from "./routes/me";
 import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
@@ -156,8 +157,10 @@ app.use("/v1/deployments/intake", intakeRouter);
 app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
-// Mount BEFORE /v1/admin so activity routes return 404 to non-admins
+app.use("/v1/me", meRouter);
+// Mount BEFORE /v1/admin so these routes return 404 to non-admins (C7)
 // (the existing adminRouter returns 403, which would leak endpoint existence)
+app.use("/v1/admin/stats", adminStatsRouter);
 app.use("/v1/admin/activity", activityAdminRouter);
 app.use("/v1/admin", adminRouter);
 
