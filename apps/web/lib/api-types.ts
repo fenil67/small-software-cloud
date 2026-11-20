@@ -149,6 +149,7 @@ export interface ActivityEvent {
   actor_key_id: string | null;
   org_id: string | null;
   app_id: string | null;
+  app_name: string | null;
   target_id: string | null;
   ip: string | null;
   user_agent: string | null;

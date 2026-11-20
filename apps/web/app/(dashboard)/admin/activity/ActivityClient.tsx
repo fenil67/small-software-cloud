@@ -626,7 +626,7 @@ function EventDetailPanel({ event, onFilterByActor }: EventDetailPanelProps) {
         {event.app_id && (
           <>
             <dt style={{ color: "var(--fg-3)" }}>App</dt>
-            <dd style={{ margin: 0 }}>{typeof event.metadata.app_name === "string" ? event.metadata.app_name : event.app_id}</dd>
+            <dd style={{ margin: 0 }}>{event.app_name ?? (typeof event.metadata.app_name === "string" ? event.metadata.app_name : event.app_id)}</dd>
           </>
         )}
 

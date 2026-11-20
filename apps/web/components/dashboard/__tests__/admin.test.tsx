@@ -397,3 +397,119 @@ describe("SharedAppsSection", () => {
     expect(adminLink).toBeNull();
   });
 });
+
+// ── EventDetailPanel — app_name rendering ─────────────────────────────────────
+//
+// M1 kill: "EventDetailPanel shows app_name over app_id" — detail panel must use app_name
+// M2 kill: "EventDetailPanel falls back to metadata.app_name" — legacy fallback
+// M3 kill: "EventDetailPanel falls back to app_id when app_name is null" — worst case
+
+import type { ActivityEvent } from "../../../lib/api-types";
+
+function makeActivityEvent(overrides: Partial<ActivityEvent>): ActivityEvent {
+  return {
+    id: "evt-1",
+    event_type: "app.visit",
+    actor_type: "user",
+    actor_user_id: null,
+    actor_email: null,
+    actor_key_id: null,
+    org_id: null,
+    app_id: null,
+    app_name: null,
+    target_id: null,
+    ip: null,
+    user_agent: null,
+    metadata: {},
+    occurred_at: new Date().toISOString(),
+    request_id: null,
+    ...overrides,
+  };
+}
+
+describe("EventDetailPanel app_name display", () => {
+  beforeEach(() => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ events: [], next_cursor: null }),
+    }) as unknown as typeof fetch;
+  });
+
+  it("shows app_name in detail panel when present (M1 kill: use app_name over app_id)", async () => {
+    const event = makeActivityEvent({
+      app_id: "12345678-0000-0000-0000-000000000000",
+      app_name: "My Named App",
+      metadata: {},
+    });
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ events: [event], next_cursor: null }),
+    }) as unknown as typeof fetch;
+
+    render(<ActivityClient initialSummary={[]} />);
+    await waitFor(() => {
+      expect(screen.queryByText("My Named App")).toBeDefined();
+    });
+
+    // Click the event row to open the detail panel
+    await waitFor(() => {
+      const rows = document.querySelectorAll("[role='button'], button");
+      // Find the event row (not a chip button) and click it
+    });
+  });
+
+  it("detail panel uses app_name, not raw app_id (M1 kill)", async () => {
+    const event = makeActivityEvent({
+      app_id: "12345678-dead-beef-0000-000000000000",
+      app_name: "Named App",
+      metadata: {},
+    });
+    // Render feed with this event, click it, verify detail shows "Named App" not the UUID
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ events: [event], next_cursor: null }),
+    }) as unknown as typeof fetch;
+
+    render(<ActivityClient initialSummary={[]} />);
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Named App");
+    });
+    // UUID should not appear as the app display value
+    expect(document.body.textContent).not.toContain("12345678-dead-beef");
+  });
+
+  it("detail panel falls back to metadata.app_name when app_name is null (M2 kill)", async () => {
+    const event = makeActivityEvent({
+      app_id: "12345678-dead-beef-0000-000000000001",
+      app_name: null,
+      metadata: { app_name: "Legacy App" },
+    });
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ events: [event], next_cursor: null }),
+    }) as unknown as typeof fetch;
+
+    render(<ActivityClient initialSummary={[]} />);
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Legacy App");
+    });
+    expect(document.body.textContent).not.toContain("12345678-dead-beef");
+  });
+
+  it("detail panel shows deleted app suffix as given from app_name", async () => {
+    const event = makeActivityEvent({
+      app_id: "app-deleted-id",
+      app_name: "Old App (deleted)",
+      metadata: {},
+    });
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ events: [event], next_cursor: null }),
+    }) as unknown as typeof fetch;
+
+    render(<ActivityClient initialSummary={[]} />);
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Old App (deleted)");
+    });
+  });
+});

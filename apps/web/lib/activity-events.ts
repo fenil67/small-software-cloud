@@ -21,6 +21,7 @@ export interface ActivityEventFields {
   actor_type: string;
   target_id: string | null;
   app_id: string | null;
+  app_name: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -29,8 +30,11 @@ function actor(e: ActivityEventFields): string {
 }
 
 function appName(e: ActivityEventFields): string {
-  // metadata may contain app_name from enriched API response
-  return typeof e.metadata.app_name === 'string' ? e.metadata.app_name : (e.app_id ?? 'an app');
+  if (typeof e.app_name === 'string' && e.app_name) return e.app_name;
+  // legacy fallback: metadata.app_name (pre-enrichment responses)
+  if (typeof e.metadata.app_name === 'string' && e.metadata.app_name) return e.metadata.app_name;
+  // last resort: short id
+  return e.app_id ? e.app_id.slice(0, 8) : 'an app';
 }
 
 export const EVENT_META: Record<string, EventMeta> = {

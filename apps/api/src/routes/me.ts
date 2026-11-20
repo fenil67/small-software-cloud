@@ -10,6 +10,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { pool } from "../db";
 import { isAdminId } from "./admin";
+import { normalizeAppUrl } from "../lib/appUrl";
 
 export const meRouter = Router();
 meRouter.use(requireAuth);
@@ -130,7 +131,7 @@ meRouter.get(
     const result = rows.map((r) => ({
       app_id: r.app_id,
       app_name: r.app_name,
-      url: r.url,
+      url: normalizeAppUrl(r.url),
       org_name: r.org_name,
       granted_at: r.granted_at ? r.granted_at.toISOString() : null,
       status: r.status as "active" | "pending",

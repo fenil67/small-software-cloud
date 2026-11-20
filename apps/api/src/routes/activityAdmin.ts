@@ -562,8 +562,14 @@ activityAdminRouter.get(
     // Fetch limit+1 to detect if there's a next page
     params.push(limit + 1);
     const { rows } = await pool.query(
-      `SELECT ae.*
+      `SELECT ae.*,
+              CASE
+                WHEN a.id IS NULL THEN NULL
+                WHEN a.deleted_at IS NOT NULL THEN a.name || ' (deleted)'
+                ELSE a.name
+              END AS app_name
        FROM activity_events ae
+       LEFT JOIN apps a ON a.id = ae.app_id
        ${where}
        ORDER BY ae.occurred_at DESC, ae.id DESC
        LIMIT $${pi}`,
@@ -613,7 +619,15 @@ activityAdminRouter.get(
       return;
     }
     const { rows } = await pool.query(
-      "SELECT * FROM activity_events WHERE id = $1",
+      `SELECT ae.*,
+              CASE
+                WHEN a.id IS NULL THEN NULL
+                WHEN a.deleted_at IS NOT NULL THEN a.name || ' (deleted)'
+                ELSE a.name
+              END AS app_name
+       FROM activity_events ae
+       LEFT JOIN apps a ON a.id = ae.app_id
+       WHERE ae.id = $1`,
       [id],
     );
     if (!rows[0]) {

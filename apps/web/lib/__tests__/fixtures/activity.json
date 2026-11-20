@@ -1,0 +1,56 @@
+{
+  "events": [
+    {
+      "id": "11111111-0000-0000-0000-000000000001",
+      "event_type": "app.visit",
+      "actor_type": "user",
+      "actor_user_id": "user-aaa",
+      "actor_email": "alice@example.com",
+      "actor_key_id": null,
+      "org_id": "org-aaa",
+      "app_id": "app-aaa",
+      "app_name": "Live App",
+      "target_id": null,
+      "ip": null,
+      "user_agent": null,
+      "metadata": {},
+      "occurred_at": "2026-01-01T12:00:00.000Z",
+      "request_id": null
+    },
+    {
+      "id": "11111111-0000-0000-0000-000000000002",
+      "event_type": "access.refused",
+      "actor_type": "user",
+      "actor_user_id": "user-bbb",
+      "actor_email": "bob@example.com",
+      "actor_key_id": null,
+      "org_id": "org-aaa",
+      "app_id": "app-bbb",
+      "app_name": "Gone App (deleted)",
+      "target_id": null,
+      "ip": null,
+      "user_agent": null,
+      "metadata": {},
+      "occurred_at": "2026-01-01T11:00:00.000Z",
+      "request_id": null
+    },
+    {
+      "id": "11111111-0000-0000-0000-000000000003",
+      "event_type": "key.auth_failed",
+      "actor_type": "system",
+      "actor_user_id": null,
+      "actor_email": null,
+      "actor_key_id": null,
+      "org_id": null,
+      "app_id": null,
+      "app_name": null,
+      "target_id": null,
+      "ip": null,
+      "user_agent": null,
+      "metadata": {},
+      "occurred_at": "2026-01-01T10:00:00.000Z",
+      "request_id": null
+    }
+  ],
+  "next_cursor": null
+}
