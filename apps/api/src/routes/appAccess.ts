@@ -18,25 +18,7 @@ import { asyncHandler } from "../lib/asyncHandler";
 import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
 import { queueInviteEmail } from "../lib/email/outbox";
 import { getEmailSender } from "../lib/email/sender";
-
-// ── URL helper ────────────────────────────────────────────────────────────────
-// Returns a canonical https://<host> URL only when host is a valid *.fly.dev name.
-// null subdomain (app not yet deployed) returns null; callers queue with no button.
-// Non-.fly.dev or structurally invalid subdomain also returns null; callers skip queue.
-
-function appUrl(subdomain: string | null): string | null {
-  if (!subdomain) return null;
-  const s = subdomain.trim();
-  if (!s) return null;
-  // Strip any https:// prefix stored in the field
-  let host = s;
-  while (host.startsWith("https://")) host = host.slice("https://".length);
-  // Must end with .fly.dev and contain no structural tricks
-  if (!host.endsWith(".fly.dev")) return null;
-  if (host.includes("@") || host.includes("/") || host.includes(":") ||
-      host.includes("?") || host.includes("#") || host.startsWith(".")) return null;
-  return `https://${host}`;
-}
+import { normalizeAppUrl } from "../lib/appUrl";
 
 export const appAccessRouter = Router({ mergeParams: true });
 appAccessRouter.use(requireAuth);
@@ -181,7 +163,7 @@ appAccessRouter.post(
     );
     const appName = appRows[0]?.name ?? "an app";
     const appSubdomain = appRows[0]?.subdomain ?? null;
-    const appUrlValue = appUrl(appSubdomain);
+    const appUrlValue = normalizeAppUrl(appSubdomain);
 
     // If appUrl is null (not deployed) we still queue — button is omitted in template.
     // If appUrl would be invalid (non-https), do not queue.

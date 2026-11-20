@@ -16,6 +16,7 @@ import { safeErr } from "../safeErr";
 import { buildInviteEmail } from "./template";
 import { getEmailSender } from "./sender";
 import { ActivityEventType, recordActivity } from "../activityLog";
+import { normalizeAppUrl } from "../appUrl";
 
 const BATCH_SIZE = 10;
 const LEASE_MINUTES = 2;
@@ -153,7 +154,23 @@ async function processRow(
       );
       if (aRows[0]) {
         appName = aRows[0].name;
-        appUrl = aRows[0].subdomain ? `https://${aRows[0].subdomain}` : null;
+        // null subdomain → app not yet deployed → no button in template (fine)
+        // non-null subdomain that fails normalization → permanently invalid; never send
+        if (aRows[0].subdomain !== null) {
+          appUrl = normalizeAppUrl(aRows[0].subdomain);
+          if (appUrl === null) {
+            // Do NOT log the raw subdomain value — it may be attacker-controlled
+            console.error(`[email-outbox] row ${row.id}: subdomain failed URL normalization — marking failed (no retry)`);
+            await pool.query(
+              `UPDATE email_outbox
+               SET status = 'failed', lease_until = NULL, attempts = attempts + 1,
+                   last_error_code = 'invalid_url'
+               WHERE id = $1`,
+              [row.id],
+            ).catch((e) => console.error("[email-outbox] mark-failed (invalid_url) failed:", safeErr(e)));
+            return;
+          }
+        }
       }
     }
   } catch (err) {

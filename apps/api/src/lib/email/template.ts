@@ -49,6 +49,12 @@ export function buildInviteEmail(params: InviteEmailParams): BuiltEmail {
   const eApp = escapeHtml(appName);
   const eUrl = appUrl ? escapeHtml(appUrl) : null;
 
+  // Show "Name (email)" only when a real display name exists and differs from the email.
+  // When granterName === granterEmail (no display_name), show just the email once.
+  const hasDisplayName = granterName !== granterEmail;
+  const granterLine = hasDisplayName ? `${eName} (${eEmail})` : eEmail;
+  const granterLineText = hasDisplayName ? `${granterName} (${granterEmail})` : granterEmail;
+
   const buttonHtml = eUrl
     ? `
     <tr>
@@ -92,11 +98,11 @@ export function buildInviteEmail(params: InviteEmailParams): BuiltEmail {
           <tr>
             <td style="padding:32px 32px 8px;">
               <p style="margin:0 0 16px;font-size:16px;font-weight:600;color:#0d0d0d;line-height:1.4;">
-                ${eName} shared an app with you
+                ${granterLine} shared an app with you
               </p>
               <p style="margin:0 0 8px;font-size:14px;color:#555;line-height:1.6;">
-                <strong style="color:#0d0d0d;">${eName}</strong>
-                (${eEmail}) gave you access to
+                <strong style="color:#0d0d0d;">${granterLine}</strong>
+                gave you access to
                 <strong style="color:#0d0d0d;">${eApp}</strong>.
               </p>
               ${eUrl
@@ -114,7 +120,7 @@ export function buildInviteEmail(params: InviteEmailParams): BuiltEmail {
           <tr>
             <td style="padding:32px 32px 28px;border-top:1px solid #f0f0f0;margin-top:24px;">
               <p style="margin:0;font-size:12px;color:#aaa;line-height:1.6;">
-                You received this because ${eName} (${eEmail}) shared an app with you on Utir.
+                You received this because ${granterLine} shared an app with you on Utir.
                 If you did not expect this email, you can safely ignore it.
               </p>
             </td>
@@ -129,12 +135,12 @@ export function buildInviteEmail(params: InviteEmailParams): BuiltEmail {
   const textButton = eUrl ? `\nOpen ${appName}: ${appUrl}\n` : "\nThe app is not yet deployed.\n";
 
   const text = [
-    `${granterName} shared ${appName} with you`,
+    `${granterLineText} shared ${appName} with you`,
     "",
-    `${granterName} (${granterEmail}) gave you access to "${appName}".`,
+    `${granterLineText} gave you access to "${appName}".`,
     textButton,
     "---",
-    `You received this because ${granterName} (${granterEmail}) shared an app with you on Utir.`,
+    `You received this because ${granterLineText} shared an app with you on Utir.`,
     "If you did not expect this email, you can safely ignore it.",
   ].join("\n");
 

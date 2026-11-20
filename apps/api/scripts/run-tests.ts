@@ -11099,6 +11099,98 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM apps WHERE id=$1", [m8AppId]);
       await pool.query("DELETE FROM orgs WHERE id=$1", [m8OrgId]);
     }
+
+    // ── AR-T9: GET / and GET /:id return app_name (live + deleted) ────────────
+    {
+      const { rows: t9OrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_ar_t9_org','AR-T9 Org','ar-t9-org') RETURNING id",
+      );
+      const t9OrgId = t9OrgRows[0].id;
+
+      const { rows: t9UserRows } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email) VALUES ('clerk_ar_t9_user','ar-t9@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+      );
+      const t9UserId = t9UserRows[0].id;
+
+      // Live app
+      const { rows: t9AppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, status)
+         VALUES ($1,$2,'AR-T9 Live App','ar-t9-live','running') RETURNING id`,
+        [t9OrgId, t9UserId],
+      );
+      const t9AppId = t9AppRows[0].id;
+
+      // Deleted app
+      const { rows: t9DelRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, status, deleted_at)
+         VALUES ($1,$2,'AR-T9 Deleted App','ar-t9-deleted','stopped',now()) RETURNING id`,
+        [t9OrgId, t9UserId],
+      );
+      const t9DelAppId = t9DelRows[0].id;
+
+      // Insert events referencing both apps
+      const { rows: t9EvLive } = await pool.query<{ id: string }>(
+        `INSERT INTO activity_events (event_type, actor_type, metadata, app_id)
+         VALUES ('app.visit','system','{}', $1) RETURNING id`,
+        [t9AppId],
+      );
+      const { rows: t9EvDel } = await pool.query<{ id: string }>(
+        `INSERT INTO activity_events (event_type, actor_type, metadata, app_id)
+         VALUES ('app.visit','system','{}', $1) RETURNING id`,
+        [t9DelAppId],
+      );
+
+      // Test list endpoint
+      const listR = await request("GET", `/v1/admin/activity?app_id=${t9AppId}`, { headers: adminHeaders });
+      if (listR.status === 200) {
+        const evs = ((listR.body as { events?: unknown[] }).events ?? []) as Array<{ id: string; app_name: string | null }>;
+        const liveEv = evs.find((e) => e.id === t9EvLive[0].id);
+        liveEv?.app_name === "AR-T9 Live App"
+          ? ok("AR-T9a: GET /activity list returns app_name for live app")
+          : fail("AR-T9a: app_name missing or wrong for live app", String(liveEv?.app_name));
+      } else {
+        fail(`AR-T9a: GET /activity list failed ${listR.status}`);
+      }
+
+      // Test list for deleted app
+      const listDelR = await request("GET", `/v1/admin/activity?app_id=${t9DelAppId}`, { headers: adminHeaders });
+      if (listDelR.status === 200) {
+        const evsDel = ((listDelR.body as { events?: unknown[] }).events ?? []) as Array<{ id: string; app_name: string | null }>;
+        const delEv = evsDel.find((e) => e.id === t9EvDel[0].id);
+        delEv?.app_name === "AR-T9 Deleted App (deleted)"
+          ? ok("AR-T9b: GET /activity list returns 'name (deleted)' for soft-deleted app")
+          : fail("AR-T9b: soft-deleted app_name wrong", String(delEv?.app_name));
+      } else {
+        fail(`AR-T9b: GET /activity list for deleted app failed ${listDelR.status}`);
+      }
+
+      // Test single-event endpoint (/:id)
+      const singleR = await request("GET", `/v1/admin/activity/${t9EvLive[0].id}`, { headers: adminHeaders });
+      if (singleR.status === 200) {
+        const ev = singleR.body as { app_name?: string | null };
+        ev.app_name === "AR-T9 Live App"
+          ? ok("AR-T9c: GET /activity/:id returns app_name")
+          : fail("AR-T9c: GET /:id app_name wrong", String(ev.app_name));
+      } else {
+        fail(`AR-T9c: GET /activity/:id failed ${singleR.status}`);
+      }
+
+      const singleDelR = await request("GET", `/v1/admin/activity/${t9EvDel[0].id}`, { headers: adminHeaders });
+      if (singleDelR.status === 200) {
+        const evDel = singleDelR.body as { app_name?: string | null };
+        evDel.app_name === "AR-T9 Deleted App (deleted)"
+          ? ok("AR-T9d: GET /activity/:id returns 'name (deleted)' for soft-deleted app")
+          : fail("AR-T9d: GET /:id soft-deleted app_name wrong", String(evDel.app_name));
+      } else {
+        fail(`AR-T9d: GET /activity/:id for deleted app failed ${singleDelR.status}`);
+      }
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE id IN ($1,$2)", [t9AppId, t9DelAppId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [t9OrgId]);
+      await pool.query("DELETE FROM users WHERE id=$1", [t9UserId]);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -12305,6 +12397,124 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM apps WHERE id=$1", [badUrlAppId]);
     }
 
+    // EM-T-url-norm: normalizeAppUrl produces the EXACT correct URL for all stored forms
+    // Mutation: template re-prefixes https:// → href/text would be "https://https://..."
+    {
+      await pool.query("DELETE FROM email_outbox");        // clear any queued rows from earlier
+      await request("GET", "/test/get-sent-emails", {}); // drain already-sent buffer
+
+      // Helper: create a temp app with a given subdomain, share to a fresh address,
+      // run the outbox, and return the sent email.
+      async function sendAndCapture(subdomain: string, addr: string): Promise<Record<string,unknown> | null> {
+        const appRow = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, owner_id, name, slug, subdomain, fly_app_id)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [emOrgId, emUserId, `em-url-${addr.split("@")[0]}`, `em-url-${addr.split("@")[0]}`, subdomain, `em-url-${addr.split("@")[0]}`],
+        );
+        const tmpId = appRow.rows[0].id;
+        await request("POST", `/v1/apps/${tmpId}/access`,
+          { body: { email: addr },
+            headers: { "x-test-clerk-user-id": "clerk_em_user1", "x-test-clerk-org-id": "clerk_em_org1", "x-test-clerk-org-role": "org:admin" } });
+        await request("POST", "/test/run-email-outbox", {});
+        const sentR = await request("GET", "/test/get-sent-emails", {});
+        const emails = ((sentR.body as Record<string,unknown>).emails as unknown[]) ?? [];
+        await pool.query("DELETE FROM email_outbox WHERE app_id=$1", [tmpId]);
+        await pool.query("DELETE FROM pending_access WHERE app_id=$1", [tmpId]);
+        await pool.query("DELETE FROM apps WHERE id=$1", [tmpId]);
+        return (emails[0] as Record<string,unknown>) ?? null;
+      }
+
+      const expectedHref = "https://ssc-abc12345.fly.dev";
+      const expectedText = "https://ssc-abc12345.fly.dev";
+
+      // Form 1: bare host
+      const em1 = await sendAndCapture("ssc-abc12345.fly.dev", "em-url1@example.com");
+      const html1 = em1?.html as string ?? "";
+      const text1 = em1?.text as string ?? "";
+      html1.includes(`href="${expectedHref}"`) && !html1.includes("https://https://")
+        ? ok(`EM-T-url-norm-1a: bare host → href="${expectedHref}" (kill: template adds https:// again)`)
+        : fail("EM-T-url-norm-1a: wrong href for bare host", html1.match(/href="[^"]*fly\.dev[^"]*"/)?.[0] ?? "(not found)");
+      text1.includes(expectedText) && !text1.includes("https://https://")
+        ? ok(`EM-T-url-norm-1b: bare host → plain text link="${expectedText}"`)
+        : fail("EM-T-url-norm-1b: wrong plain text link for bare host", text1.split("\n").find(l => l.includes("fly.dev")) ?? "(not found)");
+
+      // Form 2: single https:// prefix
+      const em2 = await sendAndCapture("https://ssc-abc12345.fly.dev", "em-url2@example.com");
+      const html2 = em2?.html as string ?? "";
+      const text2 = em2?.text as string ?? "";
+      html2.includes(`href="${expectedHref}"`) && !html2.includes("https://https://")
+        ? ok(`EM-T-url-norm-2a: https:// prefix → href="${expectedHref}" (kill: template adds https:// again)`)
+        : fail("EM-T-url-norm-2a: wrong href for https:// prefix", html2.match(/href="[^"]*fly\.dev[^"]*"/)?.[0] ?? "(not found)");
+      text2.includes(expectedText) && !text2.includes("https://https://")
+        ? ok(`EM-T-url-norm-2b: https:// prefix → plain text link="${expectedText}"`)
+        : fail("EM-T-url-norm-2b: wrong plain text link for https:// prefix", text2.split("\n").find(l => l.includes("fly.dev")) ?? "(not found)");
+
+      // Form 3: doubled https:// prefix (the production bug)
+      const em3 = await sendAndCapture("https://https://ssc-abc12345.fly.dev", "em-url3@example.com");
+      const html3 = em3?.html as string ?? "";
+      const text3 = em3?.text as string ?? "";
+      html3.includes(`href="${expectedHref}"`) && !html3.includes("https://https://")
+        ? ok(`EM-T-url-norm-3a: doubled https:// → href="${expectedHref}" (kill: template adds https:// again)`)
+        : fail("EM-T-url-norm-3a: wrong href for doubled https:// prefix", html3.match(/href="[^"]*fly\.dev[^"]*"/)?.[0] ?? "(not found)");
+      text3.includes(expectedText) && !text3.includes("https://https://")
+        ? ok(`EM-T-url-norm-3b: doubled https:// → plain text link="${expectedText}"`)
+        : fail("EM-T-url-norm-3b: wrong plain text link for doubled https:// prefix", text3.split("\n").find(l => l.includes("fly.dev")) ?? "(not found)");
+    }
+
+    // EM-T-granter-display: granter presentation — with/without display_name
+    {
+      await request("GET", "/test/get-sent-emails", {}); // drain
+
+      // With display_name: "EM Granter" differs from email "em-granter@test.local"
+      // → body shows "EM Granter (em-granter@test.local)"
+      await request("POST", `/v1/apps/${emAppId}/access`,
+        { body: { email: "em-display-test1@example.com" },
+          headers: { "x-test-clerk-user-id": "clerk_em_user1", "x-test-clerk-org-id": "clerk_em_org1", "x-test-clerk-org-role": "org:admin" } });
+      await request("POST", "/test/run-email-outbox", {});
+      const sentR1 = await request("GET", "/test/get-sent-emails", {});
+      const emails1 = ((sentR1.body as Record<string,unknown>).emails as unknown[]) ?? [];
+      const em1 = emails1[0] as Record<string,unknown>;
+
+      const html1 = em1?.html as string ?? "";
+      const text1 = em1?.text as string ?? "";
+
+      // Should contain "EM Granter (em-granter@test.local)" or the escaped equivalents
+      (html1.includes("EM Granter") && html1.includes("em-granter@test.local"))
+        ? ok("EM-T-granter-display-a: with display_name → HTML shows Name and email")
+        : fail("EM-T-granter-display-a: missing Name or email in HTML", html1.slice(0, 300));
+      // Must NOT show "email (email)" — email must only appear alongside the display name
+      !html1.includes("em-granter@test.local (em-granter@test.local)")
+        ? ok("EM-T-granter-display-b: with display_name → HTML does NOT show duplicate 'email (email)'")
+        : fail("EM-T-granter-display-b: HTML shows 'email (email)' duplicate pattern");
+      (text1.includes("EM Granter (em-granter@test.local)") || text1.includes("EM Granter") && text1.includes("em-granter@test.local"))
+        ? ok("EM-T-granter-display-c: with display_name → plain text shows Name (email)")
+        : fail("EM-T-granter-display-c: missing Name or email in plain text", text1.slice(0, 200));
+
+      // Without display_name: user2 "em-nodisplay@test.local" has display_name=null
+      // → body shows just "em-nodisplay@test.local" (not "em-nodisplay@test.local (em-nodisplay@test.local)")
+      await request("POST", `/v1/apps/${emAppId}/access`,
+        { body: { email: "em-display-test2@example.com" },
+          headers: { "x-test-clerk-user-id": "clerk_em_user2", "x-test-clerk-org-id": "clerk_em_org1", "x-test-clerk-org-role": "org:admin" } });
+      await request("POST", "/test/run-email-outbox", {});
+      const sentR2 = await request("GET", "/test/get-sent-emails", {});
+      const emails2 = ((sentR2.body as Record<string,unknown>).emails as unknown[]) ?? [];
+      const em2 = emails2[0] as Record<string,unknown>;
+
+      const html2 = em2?.html as string ?? "";
+      const text2 = em2?.text as string ?? "";
+
+      // Should show email, but NOT show "email (email)" pattern
+      html2.includes("em-nodisplay@test.local")
+        ? ok("EM-T-granter-no-display-a: without display_name → HTML shows email")
+        : fail("EM-T-granter-no-display-a: email missing from HTML", html2.slice(0, 300));
+      !html2.includes("em-nodisplay@test.local (em-nodisplay@test.local)")
+        ? ok("EM-T-granter-no-display-b: without display_name → HTML does NOT show 'email (email)'")
+        : fail("EM-T-granter-no-display-b: HTML shows duplicate 'email (email)' pattern");
+      !text2.includes("em-nodisplay@test.local (em-nodisplay@test.local)")
+        ? ok("EM-T-granter-no-display-c: without display_name → plain text does NOT show 'email (email)'")
+        : fail("EM-T-granter-no-display-c: plain text shows duplicate 'email (email)' pattern");
+    }
+
     // EM-T-key-leak: RESEND_API_KEY not in activity logs, response body, or logs
     {
       const fakeKey = "re_test_fake";
@@ -12331,6 +12541,60 @@ async function main(): Promise<void> {
       !JSON.stringify(evRows[0]?.metadata ?? {}).includes(fakeKey)
         ? ok("EM-T-key-leak: RESEND_API_KEY not in activity event metadata")
         : fail("EM-T-key-leak: RESEND_API_KEY in activity event metadata");
+    }
+
+    // EM-T-invalid-url-outbox: bad subdomain in DB → outbox row marked failed (no send, no retry)
+    // Mutation kill: "send anyway even when normalizeAppUrl returns null → EM-T-invalid-url-outbox-b fails"
+    {
+      await pool.query("DELETE FROM email_outbox");
+      await request("GET", "/test/get-sent-emails", {}); // drain
+
+      // Insert an app whose subdomain is not a valid .fly.dev URL
+      const { rows: badSubRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, subdomain, fly_app_id)
+         VALUES ($1,$2,'EM BadSub','em-badsub','http://evil.example.com/redirect','em-badsub-fly') RETURNING id`,
+        [emOrgId, emUserId],
+      );
+      const badSubAppId = badSubRows[0].id;
+
+      // Insert an outbox row directly (bypassing the POST /access check that already rejects invalid URLs)
+      const { rows: outboxRows } = await pool.query<{ id: string }>(
+        `INSERT INTO email_outbox (kind, to_email, app_id, actor_user_id, status, next_attempt_at)
+         VALUES ('invite','em-invalidsub@example.com',$1,$2,'queued',now()) RETURNING id`,
+        [badSubAppId, emUserId],
+      );
+      const badSubOutboxId = outboxRows[0].id;
+
+      await request("POST", "/test/run-email-outbox", {});
+
+      // EM-T-invalid-url-outbox-a: row must be marked failed
+      const { rows: postRows } = await pool.query<{ status: string; last_error_code: string | null; attempts: number }>(
+        "SELECT status, last_error_code, attempts FROM email_outbox WHERE id=$1",
+        [badSubOutboxId],
+      );
+      postRows[0]?.status === "failed"
+        ? ok("EM-T-invalid-url-outbox-a: bad subdomain → outbox row marked failed (no retry)")
+        : fail("EM-T-invalid-url-outbox-a: row should be failed", postRows[0]?.status);
+      postRows[0]?.last_error_code === "invalid_url"
+        ? ok("EM-T-invalid-url-outbox-a2: last_error_code='invalid_url'")
+        : fail("EM-T-invalid-url-outbox-a2: last_error_code wrong", String(postRows[0]?.last_error_code));
+
+      // EM-T-invalid-url-outbox-b: no email must have been sent (kill: M — send anyway)
+      const sentR = await request("GET", "/test/get-sent-emails", {});
+      const emails = ((sentR.body as Record<string,unknown>).emails as unknown[]) ?? [];
+      emails.length === 0
+        ? ok("EM-T-invalid-url-outbox-b: no email sent for invalid subdomain (kill: send anyway → test fails)")
+        : fail("EM-T-invalid-url-outbox-b: email was sent with broken link", `${emails.length} email(s) captured`);
+
+      // EM-T-invalid-url-outbox-c: bad subdomain value not in logs
+      const logsR = await request("GET", "/test/drain-logs", {});
+      const logs = ((logsR.body as Record<string,unknown>).logs as string[]) ?? [];
+      !logs.some((l) => l.includes("http://evil.example.com"))
+        ? ok("EM-T-invalid-url-outbox-c: subdomain value not in logs (no attacker-controlled string in logs)")
+        : fail("EM-T-invalid-url-outbox-c: bad subdomain value leaked into logs");
+
+      await pool.query("DELETE FROM email_outbox WHERE id=$1", [badSubOutboxId]);
+      await pool.query("DELETE FROM apps WHERE id=$1", [badSubAppId]);
     }
 
     // Cleanup EM test data
