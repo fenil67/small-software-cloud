@@ -11374,6 +11374,43 @@ async function main(): Promise<void> {
       }
     }
 
+    // ── AS-A6: shared-apps excludes apps owned by the active org ─────────────
+    // Mutation kill: removing the AND a.org_id != $3 filter makes this fail.
+    {
+      // App X is owned by orgB (clerk_as_orgB). When admin user's active org is orgB,
+      // app X should not appear in shared-apps (it already shows in the main table).
+      const rWithOrg = await request("GET", "/v1/me/shared-apps", {
+        headers: {
+          "x-test-clerk-user-id": asAdminClerkId,
+          "x-test-clerk-org-id": "clerk_as_orgB",
+        },
+      });
+      if (rWithOrg.status === 200) {
+        const appsWithOrg = rWithOrg.body as Array<{ app_id: string }>;
+        !appsWithOrg.some((a) => a.app_id === asAppXId)
+          ? ok("AS-A6: app X excluded from shared-apps when active org = orgB (owns it)")
+          : fail("AS-A6: app X should be excluded when active org = orgB — mutation: remove AND a.org_id != $3");
+        !appsWithOrg.some((a) => a.app_id === asAppYId)
+          ? ok("AS-A6: app Y excluded from shared-apps when active org = orgB (owns it)")
+          : fail("AS-A6: app Y should be excluded when active org = orgB — mutation: remove AND a.org_id != $3");
+      } else {
+        fail(`AS-A6: shared-apps with org-id header failed, got ${rWithOrg.status}`);
+      }
+
+      // Without an active org, app X must still appear (unchanged baseline behaviour)
+      const rNoOrg = await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asAdminClerkId },
+      });
+      if (rNoOrg.status === 200) {
+        const appsNoOrg = rNoOrg.body as Array<{ app_id: string; status: string }>;
+        appsNoOrg.some((a) => a.app_id === asAppXId && a.status === "active")
+          ? ok("AS-A6: app X appears in shared-apps when no active org")
+          : fail("AS-A6: app X should appear when no active org");
+      } else {
+        fail(`AS-A6: shared-apps without org-id header failed, got ${rNoOrg.status}`);
+      }
+    }
+
     // ── AS-A4: actor_email filled on events ───────────────────────────────────
     // Covers: key.created, key.revoked, access.granted, access.revoked,
     //         access.pending_claimed, access.refused, app.deleted

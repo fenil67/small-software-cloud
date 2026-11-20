@@ -74,6 +74,23 @@ meRouter.get(
     const internalUserId = userRows[0].id;
     const userEmail = userRows[0].email;
 
+    // Exclude apps that belong to the user's currently active org — those already
+    // appear in the main "Your apps" table (GET /v1/apps) and would be duplicated here.
+    const clerkOrgId = req.sscAuth!.clerkOrgId;
+    let activeOrgId: string | null = null;
+    if (clerkOrgId) {
+      const { rows: orgRows } = await pool.query<{ id: string }>(
+        "SELECT id FROM orgs WHERE clerk_org_id = $1",
+        [clerkOrgId],
+      );
+      activeOrgId = orgRows[0]?.id ?? null;
+    }
+
+    const orgFilter = activeOrgId ? "AND a.org_id != $3" : "";
+    const queryParams: unknown[] = activeOrgId
+      ? [internalUserId, userEmail, activeOrgId]
+      : [internalUserId, userEmail];
+
     const { rows } = await pool.query<SharedAppRow>(`
       SELECT
         a.id        AS app_id,
@@ -86,6 +103,7 @@ meRouter.get(
       JOIN apps a ON a.id = aa.app_id AND a.deleted_at IS NULL
       JOIN orgs o ON o.id = a.org_id
       WHERE aa.user_id = $1
+        ${orgFilter}
 
       UNION ALL
 
@@ -104,9 +122,10 @@ meRouter.get(
           SELECT 1 FROM app_access aa2
           WHERE aa2.app_id = pa.app_id AND aa2.user_id = $1
         )
+        ${orgFilter}
 
       ORDER BY granted_at DESC NULLS LAST
-    `, [internalUserId, userEmail]);
+    `, queryParams);
 
     const result = rows.map((r) => ({
       app_id: r.app_id,

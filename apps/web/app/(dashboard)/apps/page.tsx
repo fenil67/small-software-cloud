@@ -1,3 +1,4 @@
+import { auth } from "@clerk/nextjs/server";
 import { apiFetch } from "../../../lib/api";
 import type { App, SharedApp } from "../../../lib/api-types";
 import { AppsTable } from "../../../components/dashboard/AppsTable";
@@ -7,6 +8,9 @@ import { ErrorCard } from "../../../components/dashboard/ErrorCard";
 export const dynamic = "force-dynamic";
 
 export default async function AppsPage() {
+  const { orgRole } = await auth();
+  const isOrgAdmin = orgRole === "org:admin";
+
   let apps: App[] = [];
   let sharedApps: SharedApp[] = [];
   let error: string | null = null;
@@ -27,7 +31,7 @@ export default async function AppsPage() {
       {error ? (
         <ErrorCard message={error} />
       ) : (
-        <AppsTable apps={apps} />
+        <AppsTable apps={apps} isOrgAdmin={isOrgAdmin} />
       )}
       {sharedApps.length > 0 && <SharedAppsSection apps={sharedApps} />}
     </div>

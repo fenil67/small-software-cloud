@@ -227,6 +227,85 @@ describe("AppsTable – search", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// AppsTable – New app dialog
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("AppsTable – New app dialog", () => {
+  beforeEach(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  it("dialog is hidden before button click", () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("opens on 'New app' button click", () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText("Ship a new app")).toBeInTheDocument();
+  });
+
+  it("Escape closes dialog and returns focus to trigger button", async () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    const triggerBtn = screen.getByRole("button", { name: /new app/i });
+    fireEvent.click(triggerBtn);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(triggerBtn);
+  });
+
+  it("close button dismisses dialog", async () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("copy button for login command copies exact string", async () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    fireEvent.click(screen.getByRole("button", { name: /copy login command/i }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("npx @utir/ssc login");
+  });
+
+  it("copy button for deploy command copies exact string", async () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    fireEvent.click(screen.getByRole("button", { name: /copy deploy command/i }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("npx @utir/ssc deploy .");
+  });
+
+  it("copy button for MCP package name copies exact string", async () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    fireEvent.click(screen.getByRole("button", { name: /copy package name/i }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("@utir/ssc-mcp");
+  });
+
+  it("non-admin sees 'Ask a workspace admin for a key.'", () => {
+    render(<AppsTable apps={[]} isOrgAdmin={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    expect(screen.getByText(/ask a workspace admin for a key/i)).toBeInTheDocument();
+    expect(screen.queryByText(/go to api keys/i)).not.toBeInTheDocument();
+  });
+
+  it("org admin sees 'Go to API keys' link", () => {
+    render(<AppsTable apps={[]} isOrgAdmin />);
+    fireEvent.click(screen.getByRole("button", { name: /new app/i }));
+    expect(screen.queryByText(/ask a workspace admin for a key/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /go to api keys/i })).toBeInTheDocument();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // AppStatusBadge – all 5 statuses
 // ═════════════════════════════════════════════════════════════════════════════
 
