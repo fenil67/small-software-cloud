@@ -82,13 +82,16 @@ proxyRouter.post(
       return;
     }
 
-    // Fetch the app (must exist and not be deleted)
+    // Fetch the app (must exist, not be deleted, and belong to a live org)
     const { rows: appRows } = await pool.query<{
       id: string;
       subdomain: string | null;
       suspended_at: Date | null;
     }>(
-      "SELECT id, subdomain, suspended_at FROM apps WHERE id = $1 AND deleted_at IS NULL",
+      `SELECT a.id, a.subdomain, a.suspended_at
+       FROM apps a
+       JOIN orgs o ON o.id = a.org_id AND o.deleted_at IS NULL
+       WHERE a.id = $1 AND a.deleted_at IS NULL`,
       [body.app_id],
     );
     if (!appRows[0]) {
@@ -278,12 +281,15 @@ proxyRouter.post(
       const stateMatch = a.length === b.length && crypto.timingSafeEqual(aPad, bPad);
       if (!stateMatch) { await rollbackAndDeny(); return; }
 
-      // App must still exist, not be deleted, and not be suspended
+      // App must still exist, not be deleted, belong to a live org, and not be suspended
       const { rows: appRows } = await client.query<{
         id: string;
         suspended_at: Date | null;
       }>(
-        "SELECT id, suspended_at FROM apps WHERE id = $1 AND deleted_at IS NULL",
+        `SELECT a.id, a.suspended_at
+         FROM apps a
+         JOIN orgs o ON o.id = a.org_id AND o.deleted_at IS NULL
+         WHERE a.id = $1 AND a.deleted_at IS NULL`,
         [appId],
       );
       if (!appRows[0]) { await rollbackAndDeny(); return; }
@@ -371,6 +377,7 @@ proxyRouter.get(
          SELECT 1
          FROM app_access aa
          JOIN apps a ON a.id = aa.app_id
+         JOIN orgs o ON o.id = a.org_id AND o.deleted_at IS NULL
          WHERE aa.app_id = $1
            AND aa.user_id = $2
            AND a.deleted_at IS NULL

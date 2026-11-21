@@ -10056,17 +10056,17 @@ async function main(): Promise<void> {
           fail(`AR-T1: failed to insert event type "${evType}"`, String(e));
         }
       }
-      insertedCount === 32
-        ? ok("AR-T1: all 32 event types inserted into activity_events")
-        : fail(`AR-T1: expected 32 insertable event types, got ${insertedCount}`);
+      insertedCount === 33
+        ? ok("AR-T1: all 33 event types inserted into activity_events")
+        : fail(`AR-T1: expected 33 insertable event types, got ${insertedCount}`);
 
       const { rows: countRows } = await pool.query<{ n: string }>(
         "SELECT COUNT(*) AS n FROM activity_events",
       );
       const n = parseInt(countRows[0].n, 10);
-      n === 32
-        ? ok("AR-T1: activity_events has exactly 32 rows after seeding")
-        : fail(`AR-T1: expected 32 rows, got ${n}`);
+      n === 33
+        ? ok("AR-T1: activity_events has exactly 33 rows after seeding")
+        : fail(`AR-T1: expected 33 rows, got ${n}`);
     }
 
     // ── T2: Secrets never stored in any activity_events column ────────────────
@@ -12605,6 +12605,756 @@ async function main(): Promise<void> {
     await pool.query("DELETE FROM org_members WHERE org_id=$1", [emOrgId]);
     await pool.query("DELETE FROM orgs WHERE id=$1", [emOrgId]);
     await pool.query("DELETE FROM users WHERE id IN ($1,$2)", [emUserId, emUser2Id]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("WD: Workspace deletion — DELETE /v1/workspace and related invariants");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // ── Seed: main WD org (admin, member, 2 apps, 1 key, 1 pending invite) ─────
+    const wdClerkOrgId   = "clerk_org_wdtest1";
+    const wdClerkUserId  = "user_wdadmin1";
+    const wdMemberClerkUserId = "user_wdmember1";
+    const wdOrgName      = "WD Test Org";
+
+    const { rows: wdOrgRows } = await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug)
+       VALUES ($1, $2, 'wd-test-org') RETURNING id`,
+      [wdClerkOrgId, wdOrgName],
+    );
+    const wdOrgId = wdOrgRows[0].id;
+
+    const { rows: wdUserRows } = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email) VALUES ($1, 'wd-admin@test.local') RETURNING id",
+      [wdClerkUserId],
+    );
+    const wdUserId = wdUserRows[0].id;
+
+    const { rows: wdMemberRows } = await pool.query<{ id: string }>(
+      "INSERT INTO users (clerk_user_id, email) VALUES ($1, 'wd-member@test.local') RETURNING id",
+      [wdMemberClerkUserId],
+    );
+    const wdMemberId = wdMemberRows[0].id;
+
+    // Two apps — first has a Fly app id
+    const { rows: wdApp1Rows } = await pool.query<{ id: string }>(
+      `INSERT INTO apps (org_id, owner_id, name, slug, fly_app_id, subdomain)
+       VALUES ($1,$2,'WD App One','wd-app-one','wd-fly-app-one','wd-fly-app-one.fly.dev') RETURNING id`,
+      [wdOrgId, wdUserId],
+    );
+    const wdApp1Id = wdApp1Rows[0].id;
+
+    const { rows: wdApp2Rows } = await pool.query<{ id: string }>(
+      "INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1,$2,'WD App Two','wd-app-two') RETURNING id",
+      [wdOrgId, wdUserId],
+    );
+    const wdApp2Id = wdApp2Rows[0].id;
+
+    // One active API key (keep fullKey for auth-1 test)
+    const { fullKey: wdApiFullKey, keyPrefix: wdKeyPrefix, keyHash: wdKeyHash } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+       VALUES ($1,$2,'WD Key',$3,$4,ARRAY['read','manage'])`,
+      [wdOrgId, wdUserId, wdKeyPrefix, wdKeyHash],
+    );
+
+    // One pending email invite
+    await pool.query(
+      `INSERT INTO email_outbox (kind, to_email, app_id, actor_user_id, status, next_attempt_at)
+       VALUES ('invite','wd-invited@test.local',$1,$2,'queued',now())`,
+      [wdApp1Id, wdUserId],
+    );
+
+    // ── WD-auth-1: API key → 403 on both endpoints ────────────────────────────
+    {
+      const previewR = await request("GET", "/v1/workspace/delete-preview", {
+        headers: { Authorization: `Bearer ${wdApiFullKey}` },
+      });
+      previewR.status === 403
+        ? ok("WD-auth-1a: API key → 403 on GET /delete-preview (clerk_session_required)")
+        : fail("WD-auth-1a: API key should be 403 on preview", String(previewR.status));
+      (previewR.body as { error?: string }).error === "clerk_session_required"
+        ? ok("WD-auth-1b: error code clerk_session_required on preview")
+        : fail("WD-auth-1b: wrong error", String((previewR.body as { error?: string }).error));
+
+      const deleteR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdOrgName },
+        headers: { Authorization: `Bearer ${wdApiFullKey}` },
+      });
+      deleteR.status === 403
+        ? ok("WD-auth-1c: API key → 403 on DELETE /workspace (clerk_session_required)")
+        : fail("WD-auth-1c: API key should be 403 on delete", String(deleteR.status));
+    }
+
+    // ── WD-auth-2: admin from unknown org (not in DB) → 404 ──────────────────
+    {
+      const unknownOrgClerkId = "clerk_org_wdunknown99";
+      const previewR = await request("GET", "/v1/workspace/delete-preview", {
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": unknownOrgClerkId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      previewR.status === 404
+        ? ok("WD-auth-2a: admin from unknown org → 404 on preview")
+        : fail("WD-auth-2a: unknown org should be 404 on preview", String(previewR.status));
+
+      const deleteR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: "anything" },
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": unknownOrgClerkId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      deleteR.status === 404
+        ? ok("WD-auth-2b: admin from unknown org → 404 on delete")
+        : fail("WD-auth-2b: unknown org should be 404 on delete", String(deleteR.status));
+    }
+
+    // ── WD-member: non-admin → 403 (kill: drop admin check) ──────────────────
+    {
+      const memberPreviewR = await request("GET", "/v1/workspace/delete-preview", {
+        headers: {
+          "x-test-clerk-user-id": wdMemberClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:member",
+        },
+      });
+      memberPreviewR.status === 403
+        ? ok("WD-member-a: member GET /delete-preview → 403 (kill: drop admin check → 200)")
+        : fail("WD-member-a: member should get 403 on preview", String(memberPreviewR.status));
+
+      const memberDeleteR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdOrgName },
+        headers: {
+          "x-test-clerk-user-id": wdMemberClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:member",
+        },
+      });
+      memberDeleteR.status === 403
+        ? ok("WD-member-b: member DELETE /workspace → 403 (kill: drop admin check → 200)")
+        : fail("WD-member-b: member should get 403 on delete", String(memberDeleteR.status));
+    }
+
+    // ── Proxy sub-section: separate proxy org to test deleted-state access ────
+    {
+      const wdPrxClerkOrgId  = "clerk_org_wdprx1";
+      const wdPrxClerkUserId = "user_wdprx1";
+
+      const { rows: wdPrxOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,'WD Proxy Org','wd-proxy-org') RETURNING id",
+        [wdPrxClerkOrgId],
+      );
+      const wdPrxOrgId = wdPrxOrgRows[0].id;
+
+      const { rows: wdPrxUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-prx@test.local') RETURNING id",
+        [wdPrxClerkUserId],
+      );
+      const wdPrxUserId = wdPrxUserRows[0].id;
+
+      // App with no valid HTTPS subdomain → /codes returns 409 when alive, 404 when deleted
+      const { rows: wdPrxAppRows } = await pool.query<{ id: string }>(
+        "INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1,$2,'WD Proxy App','wd-proxy-app') RETURNING id",
+        [wdPrxOrgId, wdPrxUserId],
+      );
+      const wdPrxAppId = wdPrxAppRows[0].id;
+
+      // Grant access and issue a proxy token for /access tests
+      await pool.query(
+        "INSERT INTO app_access (app_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+        [wdPrxAppId, wdPrxUserId],
+      );
+      const { issueProxyToken } = require("../src/lib/proxyCredentials") as typeof import("../src/lib/proxyCredentials");
+      const wdPrxToken = await issueProxyToken(wdPrxAppId);
+
+      // /access baseline: app alive → allowed:true
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${wdPrxUserId}`, {
+          headers: { Authorization: `Bearer ${wdPrxToken}` },
+        });
+        (r.body as { allowed: boolean }).allowed === true
+          ? ok("WD-proxy-pre: /access allowed:true before any deletion")
+          : fail("WD-proxy-pre: should be allowed before deletion", JSON.stringify(r.body));
+      }
+
+      // /codes baseline with no subdomain: app found → 409 (not 404)
+      const wdPrxState = "d2QtcHJ4LXN0YXRlLTAwMQ"; // 23 chars, valid base64url
+      {
+        const r = await request("POST", "/v1/proxy/codes", {
+          body: { app_id: wdPrxAppId, state: wdPrxState },
+          headers: {
+            "x-test-clerk-user-id": wdPrxClerkUserId,
+            "x-test-clerk-org-id": wdPrxClerkOrgId,
+          },
+        });
+        r.status !== 404
+          ? ok("WD-proxy-pre-codes: /codes returns non-404 when app alive (confirms app found)")
+          : fail("WD-proxy-pre-codes: should not be 404 before deletion", String(r.status));
+      }
+
+      // ── WD-proxy-1: app.deleted_at → /codes 404, /access allowed:false ──────
+      await pool.query("UPDATE apps SET deleted_at = now() WHERE id=$1", [wdPrxAppId]);
+      {
+        const r = await request("POST", "/v1/proxy/codes", {
+          body: { app_id: wdPrxAppId, state: wdPrxState },
+          headers: {
+            "x-test-clerk-user-id": wdPrxClerkUserId,
+            "x-test-clerk-org-id": wdPrxClerkOrgId,
+          },
+        });
+        r.status === 404
+          ? ok("WD-proxy-1a: /codes app.deleted_at → 404 app_not_found")
+          : fail("WD-proxy-1a: /codes should 404 after app soft-delete", String(r.status));
+      }
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${wdPrxUserId}`, {
+          headers: { Authorization: `Bearer ${wdPrxToken}` },
+        });
+        (r.body as { allowed: boolean }).allowed === false
+          ? ok("WD-proxy-1b: /access app.deleted_at → allowed:false")
+          : fail("WD-proxy-1b: /access should deny after app soft-delete", JSON.stringify(r.body));
+      }
+      await pool.query("UPDATE apps SET deleted_at = NULL WHERE id=$1", [wdPrxAppId]);
+
+      // ── WD-proxy-2: org.deleted_at → /codes 404, /access allowed:false ───────
+      //   kill: proxy allows deleted org's app (mutation M5: remove org JOIN from proxy.ts)
+      await pool.query("UPDATE orgs SET deleted_at = now() WHERE id=$1", [wdPrxOrgId]);
+      {
+        const r = await request("POST", "/v1/proxy/codes", {
+          body: { app_id: wdPrxAppId, state: wdPrxState },
+          headers: {
+            "x-test-clerk-user-id": wdPrxClerkUserId,
+            "x-test-clerk-org-id": wdPrxClerkOrgId,
+          },
+        });
+        r.status === 404
+          ? ok("WD-proxy-2a: /codes org.deleted_at → 404 (kill: proxy allows deleted org's app)")
+          : fail("WD-proxy-2a: /codes should 404 when org soft-deleted", String(r.status));
+      }
+      {
+        const r = await request("GET", `/v1/proxy/access?user_id=${wdPrxUserId}`, {
+          headers: { Authorization: `Bearer ${wdPrxToken}` },
+        });
+        (r.body as { allowed: boolean }).allowed === false
+          ? ok("WD-proxy-2b: /access org.deleted_at → allowed:false (kill: proxy allows deleted org's app)")
+          : fail("WD-proxy-2b: /access should deny when org soft-deleted", JSON.stringify(r.body));
+      }
+      await pool.query("UPDATE orgs SET deleted_at = NULL WHERE id=$1", [wdPrxOrgId]);
+
+      // Proxy cleanup
+      await pool.query("DELETE FROM proxy_credentials WHERE app_id=$1", [wdPrxAppId]);
+      await pool.query("DELETE FROM app_access WHERE app_id=$1", [wdPrxAppId]);
+      await pool.query("DELETE FROM apps WHERE id=$1", [wdPrxAppId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [wdPrxOrgId]);
+      await pool.query("DELETE FROM users WHERE id=$1", [wdPrxUserId]);
+    }
+
+    // ── Shared-apps sub-section ───────────────────────────────────────────────
+    {
+      const wdShOwnClerkOrgId  = "clerk_org_wdsho1";
+      const wdShViewClerkOrgId = "clerk_org_wdshv1";
+      const wdShViewClerkUserId = "user_wdshv1";
+
+      // Owner org and user
+      const { rows: wdShOwnOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,'WD Share Owner','wd-share-own') RETURNING id",
+        [wdShOwnClerkOrgId],
+      );
+      const wdShOwnOrgId = wdShOwnOrgRows[0].id;
+
+      const { rows: wdShOwnUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-sho@test.local') RETURNING id",
+        ["user_wdsho1"],
+      );
+      const wdShOwnUserId = wdShOwnUserRows[0].id;
+
+      // Viewer org (viewer's active org; must differ from owner org to show up in shared-apps)
+      const { rows: wdShViewOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,'WD Share Viewer','wd-share-view') RETURNING id",
+        [wdShViewClerkOrgId],
+      );
+      const wdShViewOrgId = wdShViewOrgRows[0].id;
+
+      // Viewer user
+      const { rows: wdShViewUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-shv@test.local') RETURNING id",
+        [wdShViewClerkUserId],
+      );
+      const wdShViewUserId = wdShViewUserRows[0].id;
+
+      // The shared app (in owner org, not viewer org)
+      const { rows: wdShAppRows } = await pool.query<{ id: string }>(
+        "INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1,$2,'WD Shared App','wd-shared-app') RETURNING id",
+        [wdShOwnOrgId, wdShOwnUserId],
+      );
+      const wdShAppId = wdShAppRows[0].id;
+
+      // Grant viewer direct access
+      await pool.query(
+        "INSERT INTO app_access (app_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+        [wdShAppId, wdShViewUserId],
+      );
+
+      // Baseline: viewer sees the app
+      {
+        const r = await request("GET", "/v1/me/shared-apps", {
+          headers: {
+            "x-test-clerk-user-id": wdShViewClerkUserId,
+            "x-test-clerk-org-id": wdShViewClerkOrgId,
+          },
+        });
+        const apps = r.body as { app_id: string }[];
+        apps.some((a) => a.app_id === wdShAppId)
+          ? ok("WD-shared-pre: shared app visible before deletion")
+          : fail("WD-shared-pre: shared app should appear before deletion", JSON.stringify(apps));
+      }
+
+      // ── WD-shared-1: app.deleted_at → excluded from shared-apps ─────────────
+      //   kill: shared-apps includes deleted app (mutation M6: remove a.deleted_at IS NULL from me.ts)
+      await pool.query("UPDATE apps SET deleted_at = now() WHERE id=$1", [wdShAppId]);
+      {
+        const r = await request("GET", "/v1/me/shared-apps", {
+          headers: {
+            "x-test-clerk-user-id": wdShViewClerkUserId,
+            "x-test-clerk-org-id": wdShViewClerkOrgId,
+          },
+        });
+        const apps = r.body as { app_id: string }[];
+        !apps.some((a) => a.app_id === wdShAppId)
+          ? ok("WD-shared-1: app.deleted_at → excluded from shared-apps (kill: shared-apps includes deleted app)")
+          : fail("WD-shared-1: deleted app should NOT appear in shared-apps");
+      }
+      await pool.query("UPDATE apps SET deleted_at = NULL WHERE id=$1", [wdShAppId]);
+
+      // ── WD-shared-2: org.deleted_at → excluded from shared-apps ─────────────
+      await pool.query("UPDATE orgs SET deleted_at = now() WHERE id=$1", [wdShOwnOrgId]);
+      {
+        const r = await request("GET", "/v1/me/shared-apps", {
+          headers: {
+            "x-test-clerk-user-id": wdShViewClerkUserId,
+            "x-test-clerk-org-id": wdShViewClerkOrgId,
+          },
+        });
+        const apps = r.body as { app_id: string }[];
+        !apps.some((a) => a.app_id === wdShAppId)
+          ? ok("WD-shared-2: org.deleted_at → excluded from shared-apps")
+          : fail("WD-shared-2: app from deleted org should NOT appear in shared-apps");
+      }
+      await pool.query("UPDATE orgs SET deleted_at = NULL WHERE id=$1", [wdShOwnOrgId]);
+
+      // Shared-apps cleanup
+      await pool.query("DELETE FROM app_access WHERE app_id=$1", [wdShAppId]);
+      await pool.query("DELETE FROM apps WHERE id=$1", [wdShAppId]);
+      await pool.query("DELETE FROM orgs WHERE id IN ($1,$2)", [wdShOwnOrgId, wdShViewOrgId]);
+      await pool.query("DELETE FROM users WHERE id IN ($1,$2)", [wdShOwnUserId, wdShViewUserId]);
+    }
+
+    // ── WD-webhook: organization.deleted webhook → org+apps soft-deleted ──────
+    //   kill: webhook doesn't call cleanup (mutation M4: remove deleteWorkspaceData call in webhooks.ts)
+    {
+      const wdHkClerkOrgId  = "clerk_org_wdhk1";
+      const wdHkClerkUserId = "user_wdhk1";
+
+      const { rows: wdHkOrgRows } = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,'WD Hook Org','wd-hook-org') RETURNING id",
+        [wdHkClerkOrgId],
+      );
+      const wdHkOrgId = wdHkOrgRows[0].id;
+
+      const { rows: wdHkUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-hk@test.local') RETURNING id",
+        [wdHkClerkUserId],
+      );
+      const wdHkUserId = wdHkUserRows[0].id;
+
+      await pool.query(
+        "INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1,$2,'WD Hook App','wd-hook-app')",
+        [wdHkOrgId, wdHkUserId],
+      );
+
+      const wdHkEvent = { type: "organization.deleted", data: { id: wdHkClerkOrgId } };
+      const signR = await request("POST", "/test/sign-webhook-event", { body: { body: wdHkEvent } });
+      const { svixId: wdHkSvixId, svixTimestamp: wdHkSvixTs, svixSignature: wdHkSvixSig } =
+        signR.body as { svixId: string; svixTimestamp: string; svixSignature: string };
+
+      const webhookR = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "svix-id": wdHkSvixId,
+          "svix-timestamp": wdHkSvixTs,
+          "svix-signature": wdHkSvixSig,
+        },
+        body: wdHkEvent,
+      });
+      webhookR.status === 200
+        ? ok("WD-webhook-a: organization.deleted webhook → 200")
+        : fail("WD-webhook-a: webhook handler failed", String(webhookR.status));
+
+      const { rows: wdHkOrgRows2 } = await pool.query<{ deleted_at: Date | null }>(
+        "SELECT deleted_at FROM orgs WHERE id=$1",
+        [wdHkOrgId],
+      );
+      wdHkOrgRows2[0]?.deleted_at !== null
+        ? ok("WD-webhook-b: org.deleted_at set after organization.deleted webhook (kill: webhook doesn't call cleanup)")
+        : fail("WD-webhook-b: org.deleted_at should be set after organization.deleted webhook");
+
+      const { rows: wdHkAppRows } = await pool.query<{ deleted_at: Date | null }>(
+        "SELECT deleted_at FROM apps WHERE org_id=$1",
+        [wdHkOrgId],
+      );
+      wdHkAppRows.length > 0 && wdHkAppRows.every((r) => r.deleted_at !== null)
+        ? ok("WD-webhook-c: all apps soft-deleted after organization.deleted webhook (kill: webhook doesn't call cleanup)")
+        : fail("WD-webhook-c: apps should be soft-deleted after organization.deleted webhook");
+
+      // Webhook cleanup
+      {
+        const wdHkClear = await pool.connect();
+        try {
+          await wdHkClear.query("BEGIN");
+          await wdHkClear.query("SET LOCAL ssc.allow_erase = 'on'");
+          await wdHkClear.query("DELETE FROM activity_events WHERE org_id=$1", [wdHkOrgId]);
+          await wdHkClear.query("COMMIT");
+        } catch { await wdHkClear.query("ROLLBACK").catch(() => {}); } finally { wdHkClear.release(); }
+      }
+      await pool.query("DELETE FROM apps WHERE org_id=$1", [wdHkOrgId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [wdHkOrgId]);
+      await pool.query("DELETE FROM users WHERE id=$1", [wdHkUserId]);
+    }
+
+    // ── WD-1: GET /v1/workspace/delete-preview — returns correct counts ────────
+    {
+      const previewR = await request("GET", "/v1/workspace/delete-preview", {
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      previewR.status === 200
+        ? ok("WD-1a: GET /delete-preview → 200")
+        : fail("WD-1a: GET /delete-preview status", String(previewR.status));
+      const pv = previewR.body as { apps: number; keys: number; pending_invites: number };
+      pv.apps === 2
+        ? ok("WD-1b: preview.apps === 2")
+        : fail("WD-1b: preview.apps wrong", String(pv.apps));
+      pv.keys === 1
+        ? ok("WD-1c: preview.keys === 1")
+        : fail("WD-1c: preview.keys wrong", String(pv.keys));
+      pv.pending_invites === 1
+        ? ok("WD-1d: preview.pending_invites === 1")
+        : fail("WD-1d: preview.pending_invites wrong", String(pv.pending_invites));
+    }
+
+    // ── WD-3: wrong confirm_name → 400 ────────────────────────────────────────
+    {
+      const wrongNameR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: "wrong name" },
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      wrongNameR.status === 400
+        ? ok("WD-3a: wrong confirm_name → 400 name_mismatch")
+        : fail("WD-3a: wrong confirm_name should be 400", String(wrongNameR.status));
+      (wrongNameR.body as { error?: string }).error === "name_mismatch"
+        ? ok("WD-3b: error code is name_mismatch")
+        : fail("WD-3b: wrong error code", String((wrongNameR.body as { error?: string }).error));
+    }
+
+    // ── WD-4: successful delete — counts, DB state, clerk_deleted:true ────────
+    {
+      const deleteR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdOrgName },
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      deleteR.status === 200
+        ? ok("WD-4a: DELETE /workspace → 200")
+        : fail("WD-4a: DELETE /workspace status", String(deleteR.status));
+      const dr = deleteR.body as {
+        deleted?: boolean; apps_deleted?: number; keys_revoked?: number;
+        invites_cancelled?: number; clerk_deleted?: boolean;
+      };
+      dr.deleted === true
+        ? ok("WD-4b: deleted:true in response")
+        : fail("WD-4b: deleted flag missing or false");
+      dr.apps_deleted === 2
+        ? ok("WD-4c: apps_deleted === 2 (kill: skip soft-delete → 0)")
+        : fail("WD-4c: apps_deleted wrong", String(dr.apps_deleted));
+      dr.keys_revoked === 1
+        ? ok("WD-4d: keys_revoked === 1 (kill: skip key revoke → 0)")
+        : fail("WD-4d: keys_revoked wrong", String(dr.keys_revoked));
+      dr.invites_cancelled === 1
+        ? ok("WD-4e: invites_cancelled === 1")
+        : fail("WD-4e: invites_cancelled wrong", String(dr.invites_cancelled));
+      dr.clerk_deleted === true
+        ? ok("WD-4f: clerk_deleted:true in response")
+        : fail("WD-4f: clerk_deleted should be true", String(dr.clerk_deleted));
+
+      // DB state: apps soft-deleted
+      const { rows: appRows } = await pool.query<{ deleted_at: Date | null }>(
+        "SELECT deleted_at FROM apps WHERE org_id=$1",
+        [wdOrgId],
+      );
+      appRows.every((r) => r.deleted_at !== null)
+        ? ok("WD-4g: all apps have deleted_at set (kill: skip soft-delete → null)")
+        : fail("WD-4g: some apps not soft-deleted");
+
+      // DB state: keys revoked
+      const { rows: keyRows } = await pool.query<{ revoked_at: Date | null }>(
+        "SELECT revoked_at FROM api_keys WHERE org_id=$1",
+        [wdOrgId],
+      );
+      keyRows.every((r) => r.revoked_at !== null)
+        ? ok("WD-4h: all keys revoked (kill: skip key revoke → null)")
+        : fail("WD-4h: some keys not revoked");
+
+      // DB state: pending email_outbox rows deleted
+      const { rows: outboxRows } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM email_outbox WHERE app_id=$1 AND status IN ('queued','sending')",
+        [wdApp1Id],
+      );
+      parseInt(outboxRows[0].n, 10) === 0
+        ? ok("WD-4i: pending outbox rows deleted (invites cancelled)")
+        : fail("WD-4i: pending outbox rows still present", outboxRows[0].n);
+
+      // DB state: org soft-deleted
+      const { rows: orgRows } = await pool.query<{ deleted_at: Date | null }>(
+        "SELECT deleted_at FROM orgs WHERE id=$1",
+        [wdOrgId],
+      );
+      orgRows[0]?.deleted_at !== null
+        ? ok("WD-4j: org has deleted_at set")
+        : fail("WD-4j: org not soft-deleted");
+
+      // Clerk org was sent to the delete stub
+      const clerkDelR = await request("GET", "/test/get-clerk-deleted-orgs");
+      const deletedClerkOrgs = (clerkDelR.body as { orgs: string[] }).orgs ?? [];
+      deletedClerkOrgs.includes(wdClerkOrgId)
+        ? ok("WD-4k: Clerk org DELETE stub was called")
+        : fail("WD-4k: Clerk org DELETE stub was NOT called", JSON.stringify(deletedClerkOrgs));
+
+      // Activity event written
+      const { rows: actRows } = await pool.query<{ metadata: { apps_deleted: number } }>(
+        "SELECT metadata FROM activity_events WHERE org_id=$1 AND event_type='workspace.deleted'",
+        [wdOrgId],
+      );
+      actRows.length >= 1
+        ? ok("WD-4l: workspace.deleted activity event written")
+        : fail("WD-4l: no workspace.deleted activity event found");
+      actRows[0]?.metadata?.apps_deleted === 2
+        ? ok("WD-4m: activity metadata has apps_deleted=2")
+        : fail("WD-4m: activity metadata apps_deleted wrong", String(actRows[0]?.metadata?.apps_deleted));
+    }
+
+    // ── WD-5: idempotency — second delete → 404 (org already has deleted_at) ──
+    {
+      const deleteR2 = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdOrgName },
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      deleteR2.status === 404
+        ? ok("WD-5a: second delete → 404 (org excluded by deleted_at IS NULL guard)")
+        : fail("WD-5a: second delete should be 404", String(deleteR2.status));
+
+      const { rows: actRows2 } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM activity_events WHERE org_id=$1 AND event_type='workspace.deleted'",
+        [wdOrgId],
+      );
+      parseInt(actRows2[0].n, 10) <= 1
+        ? ok("WD-5b: at most 1 workspace.deleted event (ON CONFLICT dedup)")
+        : fail("WD-5b: duplicate workspace.deleted events", actRows2[0].n);
+    }
+
+    // ── WD-clerk-fail: Clerk org delete fails → 200 + clerk_deleted:false, no secret in log ─
+    {
+      const wdCfClerkOrgId  = "clerk_org_wdcf1";
+      const wdCfClerkUserId = "user_wdcf1";
+      const wdCfOrgName     = "WD CF Org";
+
+      const { rows: wdCfOrgRows } = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug)
+         VALUES ($1, $2, 'wd-cf-org') RETURNING id`,
+        [wdCfClerkOrgId, wdCfOrgName],
+      );
+      const wdCfOrgId = wdCfOrgRows[0].id;
+
+      const { rows: wdCfUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-cf@test.local') RETURNING id",
+        [wdCfClerkUserId],
+      );
+      const wdCfUserId = wdCfUserRows[0].id;
+
+      // Drain prior logs, then enable Clerk delete failure mode
+      await request("GET", "/test/drain-logs");
+      await request("POST", "/test/set-clerk-delete-org-fail", { body: { fail: true } });
+
+      const cfDeleteR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdCfOrgName },
+        headers: {
+          "x-test-clerk-user-id": wdCfClerkUserId,
+          "x-test-clerk-org-id": wdCfClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      cfDeleteR.status === 200
+        ? ok("WD-clerk-fail-a: Clerk delete fails → still 200 (DB already deleted)")
+        : fail("WD-clerk-fail-a: should be 200 even when Clerk fails", String(cfDeleteR.status));
+      (cfDeleteR.body as { clerk_deleted?: boolean }).clerk_deleted === false
+        ? ok("WD-clerk-fail-b: clerk_deleted:false when Clerk API fails")
+        : fail("WD-clerk-fail-b: clerk_deleted should be false", String((cfDeleteR.body as { clerk_deleted?: boolean }).clerk_deleted));
+
+      // Allow the workspace route's console.error to flush
+      await new Promise((r) => setTimeout(r, 50));
+      const logsR = await request("GET", "/test/drain-logs");
+      const logs: string[] = (logsR.body as { logs: string[] }).logs ?? [];
+      const logText = logs.join("\n");
+
+      const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+      const keyInLog = clerkKey && logText.includes(clerkKey);
+      !keyInLog
+        ? ok("WD-clerk-fail-c: CLERK_SECRET_KEY not leaked in log after Clerk org delete failure")
+        : fail("WD-clerk-fail-c: Clerk key leaked in log", logText.slice(0, 200));
+
+      // DB was still cleaned up (org.deleted_at set)
+      const { rows: cfOrgRows } = await pool.query<{ deleted_at: Date | null }>(
+        "SELECT deleted_at FROM orgs WHERE id=$1",
+        [wdCfOrgId],
+      );
+      cfOrgRows[0]?.deleted_at !== null
+        ? ok("WD-clerk-fail-d: org deleted_at set even when Clerk delete fails")
+        : fail("WD-clerk-fail-d: org should still be soft-deleted");
+
+      // Reset failure mode
+      await request("POST", "/test/set-clerk-delete-org-fail", { body: { fail: false } });
+
+      // Clerk-fail cleanup
+      {
+        const cfClear = await pool.connect();
+        try {
+          await cfClear.query("BEGIN");
+          await cfClear.query("SET LOCAL ssc.allow_erase = 'on'");
+          await cfClear.query("DELETE FROM activity_events WHERE org_id=$1", [wdCfOrgId]);
+          await cfClear.query("COMMIT");
+        } catch { await cfClear.query("ROLLBACK").catch(() => {}); } finally { cfClear.release(); }
+      }
+      await pool.query("DELETE FROM orgs WHERE id=$1", [wdCfOrgId]);
+      await pool.query("DELETE FROM users WHERE id=$1", [wdCfUserId]);
+    }
+
+    // ── WD-reaper: failed Fly destroy → orphaned_fly_apps → reaper retries ────
+    {
+      const wdRpClerkOrgId  = "clerk_org_wdrp1";
+      const wdRpClerkUserId = "user_wdrp1";
+      const wdRpOrgName     = "WD RP Org";
+      const wdRpFlyAppId    = "wd-rp-fly-app-1";
+
+      const { rows: wdRpOrgRows } = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug)
+         VALUES ($1, $2, 'wd-rp-org') RETURNING id`,
+        [wdRpClerkOrgId, wdRpOrgName],
+      );
+      const wdRpOrgId = wdRpOrgRows[0].id;
+
+      const { rows: wdRpUserRows } = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-rp@test.local') RETURNING id",
+        [wdRpClerkUserId],
+      );
+      const wdRpUserId = wdRpUserRows[0].id;
+
+      // App with fly_app_id so destroyWorkspaceFlyApps has something to destroy
+      await pool.query(
+        "INSERT INTO apps (org_id, owner_id, name, slug, fly_app_id) VALUES ($1,$2,'WD RP App','wd-rp-app',$3)",
+        [wdRpOrgId, wdRpUserId, wdRpFlyAppId],
+      );
+
+      // Make Fly destroy always fail
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: -1 } });
+
+      await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdRpOrgName },
+        headers: {
+          "x-test-clerk-user-id": wdRpClerkUserId,
+          "x-test-clerk-org-id": wdRpClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+
+      // Poll: destroyWorkspaceFlyApps is fire-and-forget; wait up to 1 s for the orphan row
+      let reaperOrphanFound = false;
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        const { rows } = await pool.query<{ n: string }>(
+          "SELECT COUNT(*) AS n FROM orphaned_fly_apps WHERE fly_app_name=$1",
+          [wdRpFlyAppId],
+        );
+        if (parseInt(rows[0].n, 10) > 0) { reaperOrphanFound = true; break; }
+      }
+      reaperOrphanFound
+        ? ok("WD-reaper-a: failed Fly destroy → orphaned_fly_apps row inserted")
+        : fail("WD-reaper-a: orphaned_fly_apps row not found after failed destroy");
+
+      // Let Fly destroy succeed now
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: 0 } });
+
+      // Run the reaper — it should pick up and remove the orphan row
+      const reaperR = await request("POST", "/test/run-reaper");
+      (reaperR.body as { destroyed?: number }).destroyed !== undefined
+        ? ok("WD-reaper-b: reaper ran without error")
+        : fail("WD-reaper-b: reaper call failed", JSON.stringify(reaperR.body));
+
+      const { rows: orphanAfter } = await pool.query<{ n: string }>(
+        "SELECT COUNT(*) AS n FROM orphaned_fly_apps WHERE fly_app_name=$1",
+        [wdRpFlyAppId],
+      );
+      parseInt(orphanAfter[0].n, 10) === 0
+        ? ok("WD-reaper-c: reaper removed orphaned_fly_apps row after successful retry")
+        : fail("WD-reaper-c: orphaned_fly_apps row should be gone after reaper");
+
+      // Reaper cleanup
+      await request("POST", "/test/set-fly-destroy-failures", { body: { times: 0 } });
+      {
+        const rpClear = await pool.connect();
+        try {
+          await rpClear.query("BEGIN");
+          await rpClear.query("SET LOCAL ssc.allow_erase = 'on'");
+          await rpClear.query("DELETE FROM activity_events WHERE org_id=$1", [wdRpOrgId]);
+          await rpClear.query("COMMIT");
+        } catch { await rpClear.query("ROLLBACK").catch(() => {}); } finally { rpClear.release(); }
+      }
+      await pool.query("DELETE FROM orphaned_fly_apps WHERE fly_app_name=$1", [wdRpFlyAppId]);
+      await pool.query("DELETE FROM apps WHERE org_id=$1", [wdRpOrgId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [wdRpOrgId]);
+      await pool.query("DELETE FROM users WHERE id=$1", [wdRpUserId]);
+    }
+
+    // ── Cleanup: main WD org ──────────────────────────────────────────────────
+    {
+      const wdClear = await pool.connect();
+      try {
+        await wdClear.query("BEGIN");
+        await wdClear.query("SET LOCAL ssc.allow_erase = 'on'");
+        await wdClear.query("DELETE FROM activity_events WHERE org_id=$1", [wdOrgId]);
+        await wdClear.query("COMMIT");
+      } catch { await wdClear.query("ROLLBACK").catch(() => {}); } finally { wdClear.release(); }
+    }
+    await pool.query("DELETE FROM email_outbox WHERE app_id IN (SELECT id FROM apps WHERE org_id=$1)", [wdOrgId]);
+    await pool.query("DELETE FROM apps WHERE org_id=$1", [wdOrgId]);
+    await pool.query("DELETE FROM api_keys WHERE org_id=$1", [wdOrgId]);
+    await pool.query("DELETE FROM orgs WHERE id=$1", [wdOrgId]);
+    await pool.query("DELETE FROM users WHERE id IN ($1,$2)", [wdUserId, wdMemberId]);
   }
 
   // ════════════════════════════════════════════════════════════════════════════

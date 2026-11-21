@@ -19,6 +19,7 @@ import express from "express";
 import { createHmac, timingSafeEqual } from "crypto";
 import { pool } from "../db";
 import { ActivityEventType, recordActivity } from "../lib/activityLog";
+import { deleteWorkspaceData, destroyWorkspaceFlyApps } from "../lib/workspaceDelete";
 
 export const webhookRouter = Router();
 
@@ -164,12 +165,24 @@ webhookRouter.post("/clerk", async (req: Request, res: Response): Promise<void> 
         metadata: { clerk_org_id: orgId ?? "" },
       });
     } else if (event.type === "organization.deleted") {
-      const orgId = event.data.id as string | undefined;
+      const clerkOrgId = event.data.id as string | undefined;
+      // Run workspace teardown for the deleted org (deduped by svixId requestId)
+      if (clerkOrgId) {
+        const { rows: orgRows } = await pool.query<{ id: string }>(
+          "SELECT id FROM orgs WHERE clerk_org_id = $1",
+          [clerkOrgId],
+        );
+        if (orgRows[0]) {
+          const result = await deleteWorkspaceData(orgRows[0].id, { requestId: svixId });
+          // Post-commit Fly cleanup — failures go to orphaned_fly_apps → reaper
+          destroyWorkspaceFlyApps(result.fly_app_ids, orgRows[0].id).catch(() => {});
+        }
+      }
       recordActivity({
         eventType: ActivityEventType.CLERK_ORG_DELETED,
         actorType: "clerk",
-        requestId: svixId,
-        metadata: { clerk_org_id: orgId ?? "" },
+        requestId: svixId ? `clerk.org_deleted:${svixId}` : null,
+        metadata: { clerk_org_id: clerkOrgId ?? "" },
       });
     } else if (event.type === "organizationMembership.created") {
       const userId = (event.data.public_user_data as Record<string, string> | undefined)?.user_id;

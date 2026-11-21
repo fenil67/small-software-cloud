@@ -54,6 +54,8 @@ export const ActivityEventType = {
   EMAIL_INVITE_QUEUED:      "email.invite_queued",
   EMAIL_INVITE_SENT:        "email.invite_sent",
   EMAIL_INVITE_FAILED:      "email.invite_failed",
+
+  WORKSPACE_DELETED:        "workspace.deleted",
 } as const;
 
 export type ActivityEventTypeValue = (typeof ActivityEventType)[keyof typeof ActivityEventType];

@@ -361,6 +361,7 @@ const { verifyClerkWebhookSignature } = require("../src/routes/webhooks") as typ
 const { adminRouter, validateAdminConfig: _validateAdmin } = require("../src/routes/admin") as typeof import("../src/routes/admin");
 const { activityAdminRouter, adminStatsRouter } = require("../src/routes/activityAdmin") as typeof import("../src/routes/activityAdmin");
 const { meRouter } = require("../src/routes/me") as typeof import("../src/routes/me");
+const { workspaceRouter } = require("../src/routes/workspace") as typeof import("../src/routes/workspace");
 const { _resetThrottleMapsForTest, _armInsertFailureForTest, _resetActivitySearchedThrottleForTest } = require("../src/lib/activityLog") as typeof import("../src/lib/activityLog");
 const { MemorySender, setEmailSender, disableEmailSender } = require("../src/lib/email/sender") as typeof import("../src/lib/email/sender");
 const { runEmailOutboxSender } = require("../src/lib/email/outbox") as typeof import("../src/lib/email/outbox");
@@ -858,6 +859,30 @@ app.get("/clerk-stub/organizations/:id", (req, res) => {
   res.json({ id: req.params.id, name: known?.name ?? req.params.id, slug: known?.slug ?? req.params.id });
 });
 
+// DELETE /clerk-stub/organizations/:id — fake Clerk DELETE /v1/organizations/:id
+// Succeeds by default. Configured to fail via POST /test/set-clerk-delete-org-fail.
+let _clerkDeleteOrgFailMode = false;
+const _clerkDeletedOrgs: Set<string> = new Set();
+app.delete("/clerk-stub/organizations/:id", (req, res) => {
+  if (_clerkDeleteOrgFailMode) {
+    res.status(500).json({ error: "simulated clerk delete org error" }); return;
+  }
+  _clerkDeletedOrgs.add(req.params.id);
+  res.status(200).json({ deleted: true });
+});
+
+// POST /test/set-clerk-delete-org-fail { fail: bool }
+app.post("/test/set-clerk-delete-org-fail", (req, res) => {
+  _clerkDeleteOrgFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, clerkDeleteOrgFailMode: _clerkDeleteOrgFailMode });
+});
+
+// GET /test/get-clerk-deleted-orgs — returns orgs deleted via DELETE stub
+app.get("/test/get-clerk-deleted-orgs", (_req, res) => {
+  res.json({ orgs: Array.from(_clerkDeletedOrgs) });
+  _clerkDeletedOrgs.clear();
+});
+
 // GET /clerk-stub/organizations/:orgId/memberships?user_id=:userId
 // Returns { total_count: 1 } if the user is a member, { total_count: 0 } if not.
 // 500 when _clerkMembershipFailMode is true (simulates API error).
@@ -1155,6 +1180,7 @@ app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
 app.use("/v1/me", meRouter);
+app.use("/v1/workspace", workspaceRouter);
 app.use("/v1/admin/stats", adminStatsRouter);
 app.use("/v1/admin/activity", activityAdminRouter);
 app.use("/v1/admin", adminRouter);

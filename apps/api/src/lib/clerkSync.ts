@@ -93,6 +93,18 @@ export async function ensureUser(clerkUserId: string): Promise<string> {
   return rows[0].id;
 }
 
+/**
+ * Deletes a Clerk organization via the Clerk backend API.
+ * Throws on network or API errors — callers should catch and decide whether
+ * to surface clerk_deleted: false or surface the error.
+ */
+export async function deleteClerkOrg(clerkOrgId: string): Promise<void> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  await axios.delete(`${clerkApiBase()}/organizations/${clerkOrgId}`, {
+    headers: { Authorization: `Bearer ${clerkKey}` },
+  });
+}
+
 export async function ensureOrg(clerkOrgId: string): Promise<string> {
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
 

@@ -163,6 +163,12 @@ export interface ActivityListResponse {
   next_cursor: string | null;
 }
 
+export interface WorkspaceDeletePreview {
+  apps: number;
+  keys: number;
+  pending_invites: number;
+}
+
 export interface ActivitySummaryItem {
   event_type: string;
   count_24h: number;

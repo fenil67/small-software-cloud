@@ -104,6 +104,7 @@ import { proxyRouter } from "./routes/proxy";
 import { adminRouter, validateAdminConfig } from "./routes/admin";
 import { activityAdminRouter, adminStatsRouter } from "./routes/activityAdmin";
 import { meRouter } from "./routes/me";
+import { workspaceRouter } from "./routes/workspace";
 import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
@@ -159,6 +160,7 @@ app.use("/v1/deployments", deployStreamRouter);
 app.use("/v1/deployments", deploymentsRouter);
 app.use("/v1/proxy", proxyRouter);
 app.use("/v1/me", meRouter);
+app.use("/v1/workspace", workspaceRouter);
 // Mount BEFORE /v1/admin so these routes return 404 to non-admins (C7)
 // (the existing adminRouter returns 403, which would leak endpoint existence)
 app.use("/v1/admin/stats", adminStatsRouter);

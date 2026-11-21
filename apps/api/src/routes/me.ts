@@ -102,7 +102,7 @@ meRouter.get(
         'active'    AS status
       FROM app_access aa
       JOIN apps a ON a.id = aa.app_id AND a.deleted_at IS NULL
-      JOIN orgs o ON o.id = a.org_id
+      JOIN orgs o ON o.id = a.org_id AND o.deleted_at IS NULL
       WHERE aa.user_id = $1
         ${orgFilter}
 
@@ -117,7 +117,7 @@ meRouter.get(
         'pending'   AS status
       FROM pending_access pa
       JOIN apps a ON a.id = pa.app_id AND a.deleted_at IS NULL
-      JOIN orgs o ON o.id = a.org_id
+      JOIN orgs o ON o.id = a.org_id AND o.deleted_at IS NULL
       WHERE lower(pa.email) = lower($2)
         AND NOT EXISTS (
           SELECT 1 FROM app_access aa2
