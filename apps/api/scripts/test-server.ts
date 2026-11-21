@@ -736,6 +736,92 @@ app.post("/test/set-clerk-membership-fail", (req, res) => {
   res.json({ ok: true, clerkMembershipFailMode: _clerkMembershipFailMode });
 });
 
+// ── User org memberships stub (for getUserOrgIds in clerkSync) ────────────────
+// GET /clerk-stub/users/:userId/organization_memberships?limit=N&offset=M
+// Returns a paginated slice of the orgs registered via POST /test/set-user-org-memberships.
+// Default: empty list (user is not a member of any org).
+// Fail mode: POST /test/set-user-org-memberships-fail { fail: bool } → 500.
+
+const _userOrgMemberships = new Map<string, string[]>(); // clerkUserId → clerkOrgId[]
+let _userOrgMembershipsFailMode = false;
+// Per-user call counter — incremented on each GET (even failed ones)
+const _userOrgMembershipsCallCount = new Map<string, number>();
+
+app.get("/clerk-stub/users/:userId/organization_memberships", (req, res) => {
+  _userOrgMembershipsCallCount.set(
+    req.params.userId,
+    (_userOrgMembershipsCallCount.get(req.params.userId) ?? 0) + 1,
+  );
+  if (_userOrgMembershipsFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const orgIds = _userOrgMemberships.get(req.params.userId) ?? [];
+  // Honour limit/offset for pagination tests
+  const limit = parseInt((req.query.limit as string) ?? "100", 10);
+  const offset = parseInt((req.query.offset as string) ?? "0", 10);
+  const page = orgIds.slice(offset, offset + limit);
+  const data = page.map((id) => ({ organization: { id } }));
+  res.json({ data, total_count: orgIds.length });
+});
+
+// POST /test/set-user-org-memberships { clerkUserId, orgIds: string[] }
+// Configures which Clerk org IDs the stub reports for a given user.
+app.post("/test/set-user-org-memberships", (req, res) => {
+  const { clerkUserId, orgIds } = req.body as { clerkUserId?: string; orgIds?: string[] };
+  if (!clerkUserId || !Array.isArray(orgIds)) {
+    res.status(400).json({ error: "clerkUserId and orgIds[] required" }); return;
+  }
+  _userOrgMemberships.set(clerkUserId, orgIds);
+  res.json({ ok: true, clerkUserId, orgIds });
+});
+
+// POST /test/set-user-org-memberships-fail { fail: bool }
+app.post("/test/set-user-org-memberships-fail", (req, res) => {
+  _userOrgMembershipsFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, userOrgMembershipsFailMode: _userOrgMembershipsFailMode });
+});
+
+// GET /test/get-user-memberships-call-count?clerkUserId=X
+// Returns how many times the memberships stub was called for a given user.
+app.get("/test/get-user-memberships-call-count", (req, res) => {
+  const userId = (req.query.clerkUserId as string) ?? "";
+  res.json({ count: _userOrgMembershipsCallCount.get(userId) ?? 0 });
+});
+
+// POST /test/reset-user-memberships-call-count { clerkUserId? }
+// Resets the counter for one user (or all users if clerkUserId is omitted).
+app.post("/test/reset-user-memberships-call-count", (req, res) => {
+  const { clerkUserId } = req.body as { clerkUserId?: string };
+  if (clerkUserId) {
+    _userOrgMembershipsCallCount.delete(clerkUserId);
+  } else {
+    _userOrgMembershipsCallCount.clear();
+  }
+  res.json({ ok: true });
+});
+
+// Cache / fetch-limit control (for getUserOrgIds 60s cache and pagination tests)
+const { _clearOrgIdsCacheForTest, _setOrgIdsFetchLimitForTest } =
+  require("../src/lib/clerkSync") as typeof import("../src/lib/clerkSync");
+
+// POST /test/clear-org-ids-cache — clears the per-user 60s cache
+app.post("/test/clear-org-ids-cache", (_req, res) => {
+  _clearOrgIdsCacheForTest();
+  res.json({ ok: true });
+});
+
+// POST /test/set-org-ids-fetch-limit { limit: number }
+// Sets the per-page limit used in getUserOrgIds (default 100). Lower it in tests
+// to simulate pagination without needing > 100 orgs.
+app.post("/test/set-org-ids-fetch-limit", (req, res) => {
+  const { limit } = req.body as { limit?: number };
+  if (typeof limit !== "number" || limit < 1) {
+    res.status(400).json({ error: "limit must be a positive number" }); return;
+  }
+  _setOrgIdsFetchLimitForTest(limit);
+  res.json({ ok: true, limit });
+});
+
 // POST /test/sign-webhook-event { body, timestamp?, id? }
 // Computes svix HMAC-SHA256 signature using the test webhook secret.
 // Returns svixId, svixTimestamp, svixSignature ready to pass as headers.
@@ -850,13 +936,26 @@ app.get("/clerk-stub/users/:id", (req, res) => {
 // GET /clerk-stub/organizations/:id — fake Clerk GET /v1/organizations/:id
 // Well-known test orgs return deterministic human-readable names so ensureOrg()
 // doesn't overwrite the seeded "Org Alpha" / "Org Beta" names with the clerk_org_* ID.
-const _knownOrgNames: Record<string, { name: string; slug: string }> = {
-  clerk_org_aaa: { name: "Org Alpha",   slug: "org-alpha"   },
-  clerk_org_bbb: { name: "Org Beta",    slug: "org-beta"    },
-};
+// Additional entries can be registered at runtime via POST /test/set-clerk-org-name.
+const _knownOrgNames: Map<string, { name: string; slug: string }> = new Map([
+  ["clerk_org_aaa", { name: "Org Alpha", slug: "org-alpha" }],
+  ["clerk_org_bbb", { name: "Org Beta",  slug: "org-beta"  }],
+]);
 app.get("/clerk-stub/organizations/:id", (req, res) => {
-  const known = _knownOrgNames[req.params.id];
+  const known = _knownOrgNames.get(req.params.id);
   res.json({ id: req.params.id, name: known?.name ?? req.params.id, slug: known?.slug ?? req.params.id });
+});
+
+// POST /test/set-clerk-org-name { clerkOrgId, name, slug? }
+// Registers (or overwrites) the display name the org stub returns for a given clerkOrgId.
+// Required so workspace-delete tests can distinguish the display name from the org slug.
+app.post("/test/set-clerk-org-name", (req, res) => {
+  const { clerkOrgId, name, slug } = req.body as { clerkOrgId?: string; name?: string; slug?: string };
+  if (!clerkOrgId || !name) {
+    res.status(400).json({ error: "clerkOrgId and name required" }); return;
+  }
+  _knownOrgNames.set(clerkOrgId, { name, slug: slug ?? clerkOrgId });
+  res.json({ ok: true, clerkOrgId, name });
 });
 
 // DELETE /clerk-stub/organizations/:id — fake Clerk DELETE /v1/organizations/:id

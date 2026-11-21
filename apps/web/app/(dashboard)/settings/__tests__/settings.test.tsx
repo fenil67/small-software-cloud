@@ -33,6 +33,11 @@ vi.mock("@clerk/nextjs/server", () => ({
     orgSlug: "test-org",
     getToken: async () => "test-token",
   }),
+  clerkClient: vi.fn().mockResolvedValue({
+    organizations: {
+      getOrganization: vi.fn().mockResolvedValue({ name: "My Test Org" }),
+    },
+  }),
 }));
 
 vi.mock("next/headers", () => ({
@@ -217,6 +222,72 @@ describe("WorkspaceDeleteSection", () => {
   });
 });
 
+// ── WorkspaceDeleteSection: display name vs slug (M-web-name kills) ───────────
+//
+// The dialog must show the Clerk display name, not the org slug.
+// Mutation kill: when page.tsx passes orgSlug instead of org.name,
+// "My Organization" no longer appears in the dialog → "typing display name enables
+// delete" fails because the button stays disabled.
+
+describe("WorkspaceDeleteSection slug vs display name", () => {
+  const displayName = "My Organization";
+  const orgSlug    = "my-organization-abc123"; // distinct from display name
+
+  async function openDialog() {
+    mockFetchDeletePreview.mockResolvedValue({ preview: { apps: 1, keys: 0, pending_invites: 0 } });
+    render(<WorkspaceDeleteSection orgName={displayName} />);
+    fireEvent.click(screen.getByRole("button", { name: /delete workspace/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+  }
+
+  function getSubmitButton(): HTMLButtonElement {
+    const dialog = screen.getByRole("dialog");
+    return Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete workspace"),
+    ) as HTMLButtonElement;
+  }
+
+  it("dialog label shows the Clerk display name, not the slug (M-web-name: pass orgSlug → 'My Organization' missing → test fails)", async () => {
+    await openDialog();
+    // The <label> shows: Type <strong>{orgName}</strong> to confirm
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain(displayName);
+    expect(dialog.textContent).not.toContain(orgSlug);
+  });
+
+  it("typing the slug keeps the submit button disabled (M-web-name: slug accepted → test fails)", async () => {
+    await openDialog();
+    const input = screen.getByPlaceholderText(displayName);
+    fireEvent.change(input, { target: { value: orgSlug } });
+    expect(getSubmitButton().disabled).toBe(true);
+  });
+
+  it("typing the exact display name enables the submit button (M-web-name: compares against slug → stays disabled)", async () => {
+    await openDialog();
+    const input = screen.getByPlaceholderText(displayName);
+    fireEvent.change(input, { target: { value: displayName } });
+    expect(getSubmitButton().disabled).toBe(false);
+  });
+
+  it('"  My Organization  " with surrounding spaces is accepted (trimmed before comparison)', async () => {
+    await openDialog();
+    const input = screen.getByPlaceholderText(displayName);
+    fireEvent.change(input, { target: { value: `  ${displayName}  ` } });
+    expect(getSubmitButton().disabled).toBe(false);
+  });
+
+  it("submit button carries the HTML disabled attribute (not only visual styling) until name matches", async () => {
+    await openDialog();
+    const btn = getSubmitButton();
+    // Before typing: must have the disabled attribute
+    expect(btn.hasAttribute("disabled")).toBe(true);
+    // After typing exact name: attribute removed
+    const input = screen.getByPlaceholderText(displayName);
+    fireEvent.change(input, { target: { value: displayName } });
+    expect(btn.hasAttribute("disabled")).toBe(false);
+  });
+});
+
 // ── Settings page admin guard (M2 kill) ───────────────────────────────────────
 
 import SettingsPage from "../page";
@@ -252,5 +323,27 @@ describe("SettingsPage admin guard", () => {
     const html = JSON.stringify(result);
     // No orgName prop in the tree = WorkspaceDeleteSection not rendered
     expect(html).not.toContain('"orgName"');
+  });
+
+  it("passes Clerk display name (not orgSlug) as orgName (M-web-name: pass orgSlug → 'My Organization' missing → test fails)", async () => {
+    const { auth, clerkClient } = await import("@clerk/nextjs/server");
+    vi.mocked(auth).mockResolvedValueOnce({
+      userId: "user_admin",
+      orgId: "org_test",
+      orgRole: "org:admin",
+      orgSlug: "my-organization-abc123", // slug is distinct from the display name
+      getToken: async () => "test-token",
+    } as Awaited<ReturnType<typeof auth>>);
+    vi.mocked(clerkClient).mockResolvedValueOnce({
+      organizations: {
+        getOrganization: vi.fn().mockResolvedValue({ name: "My Organization" }),
+      },
+    } as unknown as Awaited<ReturnType<typeof clerkClient>>);
+
+    const result = await SettingsPage();
+    const html = JSON.stringify(result);
+    // orgName must be the Clerk display name — NOT the slug
+    expect(html).toContain("My Organization");
+    expect(html).not.toContain("my-organization-abc123");
   });
 });

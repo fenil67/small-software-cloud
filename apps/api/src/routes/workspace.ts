@@ -13,7 +13,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { pool } from "../db";
 import { deleteWorkspaceData, destroyWorkspaceFlyApps } from "../lib/workspaceDelete";
-import { deleteClerkOrg } from "../lib/clerkSync";
+import { deleteClerkOrg, getClerkOrgDisplayName } from "../lib/clerkSync";
 import { safeErr } from "../lib/safeErr";
 
 export const workspaceRouter = Router();
@@ -115,16 +115,13 @@ workspaceRouter.delete(
       return;
     }
 
-    // Fetch org name and verify it matches
-    const { rows: orgRows } = await pool.query<{ name: string }>(
-      "SELECT name FROM orgs WHERE id = $1",
-      [orgId],
-    );
-    if (!orgRows[0]) {
-      res.status(404).json({ error: "org_not_found" });
+    // Fetch the current display name from Clerk (source of truth — avoids stale DB rows)
+    const clerkOrgName = await getClerkOrgDisplayName(clerkOrgId);
+    if (clerkOrgName === null) {
+      res.status(503).json({ error: "clerk_unavailable" });
       return;
     }
-    if (orgRows[0].name.trim() !== confirmName) {
+    if (clerkOrgName.trim() !== confirmName) {
       res.status(400).json({ error: "name_mismatch" });
       return;
     }
