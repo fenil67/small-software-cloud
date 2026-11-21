@@ -1,17 +1,16 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
 import { useClerk, useOrganization, useOrganizationList } from "@clerk/nextjs";
 import type { WorkspaceDeletePreview } from "../../../lib/api-types";
 import { fetchDeletePreview, deleteWorkspace } from "./actions";
+import { navigateHard } from "../../../lib/navigate";
 
 interface Props {
   orgName: string;
 }
 
 export function WorkspaceDeleteSection({ orgName }: Props) {
-  const router = useRouter();
   const { setActive } = useClerk();
   const { organization: currentOrg } = useOrganization();
   const { userMemberships } = useOrganizationList({ userMemberships: { infinite: true } });
@@ -48,6 +47,15 @@ export function WorkspaceDeleteSection({ orgName }: Props) {
     e.preventDefault();
     if (confirmName.trim() !== orgName || deleting) return;
     setDeleteError(undefined);
+
+    // Capture the target workspace BEFORE the API call — membership data may
+    // become stale or cleared once Clerk reacts to the deletion event.
+    const currentOrgId = currentOrg?.id;
+    const target =
+      (userMemberships?.data ?? []).find(
+        (m) => m.organization.id !== currentOrgId,
+      )?.organization.id ?? null;
+
     startDeleteTransition(async () => {
       const result = await deleteWorkspace(confirmName.trim());
       if (result.error) {
@@ -61,18 +69,17 @@ export function WorkspaceDeleteSection({ orgName }: Props) {
         return;
       }
 
-      // Find another workspace to switch into, excluding the one just deleted
-      const currentOrgId = currentOrg?.id;
-      const others = (userMemberships?.data ?? []).filter(
-        (m) => m.organization.id !== currentOrgId,
-      );
-
-      if (others.length > 0) {
-        // Switch to the first available workspace and go to /apps
-        await setActive({ organization: others[0].organization.id, redirectUrl: "/apps" });
+      if (target) {
+        // setActive may hang if the deleted org was active — race with a 5s timeout
+        // so navigation always fires even if Clerk's SDK gets stuck.
+        await Promise.race([
+          setActive({ organization: target }),
+          new Promise<void>((r) => setTimeout(r, 5000)),
+        ]);
+        navigateHard("/apps");
       } else {
-        // No other workspace — go to onboarding to create or join one
-        router.push("/onboarding");
+        // No other workspace — hard-navigate to onboarding.
+        navigateHard("/onboarding");
       }
     });
   }

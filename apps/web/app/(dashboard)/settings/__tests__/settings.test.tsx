@@ -3,10 +3,12 @@
  *
  * M1 kill: "submit button disabled until name matches" — canDelete guard must gate on name equality
  * M2 kill: "danger zone hidden for non-admins" — settings page must not render WorkspaceDeleteSection when isAdmin=false
+ * M-nav-target: target chosen pre-delete must exclude current org; if post-delete target includes deleted → test fails
+ * M-nav-timeout: Promise.race timeout must exist; if removed → setActive-hangs test fails
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 
 // ── Mock Clerk client hooks ───────────────────────────────────────────────────
@@ -18,7 +20,11 @@ vi.mock("@clerk/nextjs", () => ({
   useOrganization: vi.fn(() => ({ organization: { id: "current-org-id" } })),
   useOrganizationList: vi.fn(() => ({
     userMemberships: {
-      data: [{ organization: { id: "other-org-id" } }],
+      // current-org-id is first so mutation A (no filter) would pick it, not other-org-id
+      data: [
+        { organization: { id: "current-org-id" } },
+        { organization: { id: "other-org-id" } },
+      ],
     },
   })),
   useUser: vi.fn(() => ({ user: null })),
@@ -76,12 +82,25 @@ vi.mock("../../../../components/theme/ThemeSwitch", () => ({
   ThemeSwitch: () => React.createElement("div", null, "ThemeSwitch"),
 }));
 
+// ── Mock navigate helper ──────────────────────────────────────────────────────
+
+const mockNavigateHard = vi.fn();
+
+vi.mock("../../../../lib/navigate", () => ({
+  navigateHard: (...args: unknown[]) => mockNavigateHard(...args),
+}));
+
 beforeEach(() => {
   mockSetActive.mockReset();
   mockPush.mockReset();
   mockFetchDeletePreview.mockReset();
   mockDeleteWorkspace.mockReset();
+  mockNavigateHard.mockReset();
   vi.restoreAllMocks();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 import { WorkspaceDeleteSection } from "../WorkspaceDeleteSection";
@@ -130,7 +149,7 @@ describe("WorkspaceDeleteSection", () => {
     expect(submitButton.disabled).toBe(false);
   });
 
-  it("calls deleteWorkspace, then setActive with another workspace on success", async () => {
+  it("calls deleteWorkspace, then setActive (no redirectUrl) + navigateHard('/apps') on success", async () => {
     mockFetchDeletePreview.mockResolvedValue({ preview: { apps: 1, keys: 0, pending_invites: 0 } });
     mockDeleteWorkspace.mockResolvedValue({});
     mockSetActive.mockResolvedValue(undefined);
@@ -150,12 +169,11 @@ describe("WorkspaceDeleteSection", () => {
     fireEvent.click(submitButton);
 
     await waitFor(() => expect(mockDeleteWorkspace).toHaveBeenCalledWith(orgName));
+    // setActive called WITHOUT redirectUrl — navigation is explicit via navigateHard
     await waitFor(() =>
-      expect(mockSetActive).toHaveBeenCalledWith({
-        organization: "other-org-id",
-        redirectUrl: "/apps",
-      }),
+      expect(mockSetActive).toHaveBeenCalledWith({ organization: "other-org-id" }),
     );
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
   });
 
   it("navigates to /onboarding when no other workspaces exist after delete", async () => {
@@ -181,7 +199,91 @@ describe("WorkspaceDeleteSection", () => {
     fireEvent.click(submitButton);
 
     await waitFor(() => expect(mockDeleteWorkspace).toHaveBeenCalledWith(orgName));
-    await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/onboarding"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/onboarding"));
+  });
+
+  it("navigates to /apps after 5s even when setActive never resolves (M-nav-timeout: remove timeout → test hangs/fails)", async () => {
+    // Restore default useOrganizationList (previous test may have set it to empty)
+    const { useOrganizationList } = await import("@clerk/nextjs");
+    vi.mocked(useOrganizationList).mockReturnValue({
+      userMemberships: { data: [{ organization: { id: "other-org-id" } }] },
+    } as unknown as ReturnType<typeof useOrganizationList>);
+
+    mockFetchDeletePreview.mockResolvedValue({ preview: { apps: 1, keys: 0, pending_invites: 0 } });
+    mockDeleteWorkspace.mockResolvedValue({});
+    // setActive returns a promise that never resolves — simulates Clerk hang
+    mockSetActive.mockReturnValue(new Promise<void>(() => {}));
+
+    // Open dialog and type name using REAL timers so waitFor works
+    render(<WorkspaceDeleteSection orgName={orgName} />);
+    fireEvent.click(screen.getByRole("button", { name: /delete workspace/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    const input = screen.getByPlaceholderText(orgName);
+    fireEvent.change(input, { target: { value: orgName } });
+
+    const dialog = screen.getByRole("dialog");
+    const submitButton = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete workspace"),
+    ) as HTMLButtonElement;
+
+    // Switch to fake timers NOW — only the setTimeout(r, 5000) needs faking
+    vi.useFakeTimers();
+
+    fireEvent.click(submitButton);
+    // Flush microtasks: deleteWorkspace resolves, setActive called but hangs
+    await act(() => Promise.resolve());
+    await act(() => Promise.resolve());
+
+    // setActive has not resolved — navigateHard must NOT have fired yet
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+
+    // Advance past the 5-second timeout, then flush the continuation microtasks
+    // that run navigateHard after Promise.race settles.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    // The Promise.race resolution schedules a microtask for the next line
+    // (navigateHard). Flush it.
+    await act(() => Promise.resolve());
+    await act(() => Promise.resolve());
+
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+  }, 15_000);
+
+  it("shows error and re-enables buttons when API returns an error (never stuck on Deleting...)", async () => {
+    mockFetchDeletePreview.mockResolvedValue({ preview: { apps: 1, keys: 0, pending_invites: 0 } });
+    mockDeleteWorkspace.mockResolvedValue({ error: "forbidden" });
+
+    render(<WorkspaceDeleteSection orgName={orgName} />);
+    fireEvent.click(screen.getByRole("button", { name: /delete workspace/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    const input = screen.getByPlaceholderText(orgName);
+    fireEvent.change(input, { target: { value: orgName } });
+
+    const dialog = screen.getByRole("dialog");
+    const submitButton = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete workspace"),
+    ) as HTMLButtonElement;
+
+    fireEvent.click(submitButton);
+
+    // Error message shown
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("Could not delete workspace");
+    });
+
+    // navigateHard never called — we're still in the dialog
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+
+    // Submit button is re-enabled (deleting transition ended)
+    await waitFor(() => {
+      const btn = Array.from(screen.getByRole("dialog").querySelectorAll("button")).find(
+        (b) => b.textContent?.includes("Delete workspace"),
+      ) as HTMLButtonElement;
+      expect(btn.disabled).toBe(false);
+    });
   });
 
   it("shows error when deleteWorkspace returns name_mismatch", async () => {
