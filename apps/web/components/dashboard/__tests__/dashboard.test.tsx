@@ -33,6 +33,11 @@ vi.mock("next/navigation", () => ({
 vi.mock("@clerk/nextjs/server", () => ({
   auth: () => mockServerAuth(),
   currentUser: () => mockCurrentUser(),
+  clerkClient: vi.fn().mockResolvedValue({
+    organizations: {
+      getOrganization: vi.fn().mockResolvedValue({ name: "Acme Corp" }),
+    },
+  }),
 }));
 
 vi.mock("next/headers", () => ({

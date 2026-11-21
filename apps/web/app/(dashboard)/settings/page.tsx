@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { auth } from "@clerk/nextjs/server";
+import { auth, clerkClient } from "@clerk/nextjs/server";
 import { parseTheme } from "../../../lib/theme";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
 import { WorkspaceDeleteSection } from "./WorkspaceDeleteSection";
@@ -11,10 +11,17 @@ export default async function SettingsPage() {
   const rawTheme = cookieStore.get("utir-theme")?.value;
   const initialTheme = parseTheme(rawTheme);
 
-  const { orgRole, orgSlug } = await auth();
+  const { orgRole, orgId } = await auth();
   const isAdmin = orgRole === "org:admin";
-  // Use orgSlug as a fallback display name when the full org name isn't available
-  const orgName = orgSlug ?? "";
+
+  // Fetch the current display name from Clerk — the slug stored in auth() is not
+  // the human-readable name shown in the dialog, so we must fetch org.name directly.
+  let orgName = "";
+  if (orgId) {
+    const client = await clerkClient();
+    const org = await client.organizations.getOrganization({ organizationId: orgId });
+    orgName = org.name;
+  }
 
   return (
     <div style={{ padding: "40px 48px 64px", maxWidth: "680px", display: "flex", flexDirection: "column", gap: "32px" }}>

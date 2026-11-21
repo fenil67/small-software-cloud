@@ -11504,6 +11504,267 @@ async function main(): Promise<void> {
       }
     }
 
+    // ── AS-SA: shared-apps membership filter ─────────────────────────────────────
+    // Bug fix: shared-apps must NOT list apps from orgs the user is a Clerk member of.
+    // Kill: removing the membership filter makes SA1 fail (member-org app appears).
+    {
+      // Earlier AS tests (A3, A6) may have cached getUserOrgIds results for asAdminClerkId.
+      // Clear the cache so we start with a clean slate for all AS-SA membership tests.
+      await request("POST", "/test/clear-org-ids-cache");
+
+      // Create an org that admin will be a Clerk member of
+      const asSaOrgCRow = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_as_sa_orgC','AS SA OrgC','as-sa-orgc') RETURNING id`,
+      );
+      const asSaOrgCId = asSaOrgCRow.rows[0].id;
+
+      // App W owned by SA OrgC
+      const asSaAppWRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1,$2,'as-sa-app-w','as-sa-app-w-${Date.now()}','zip') RETURNING id`,
+        [asSaOrgCId, asAdminUserId],
+      );
+      const asSaAppWId = asSaAppWRow.rows[0].id;
+
+      // Grant admin access to app W
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+        [asSaAppWId, asAdminUserId],
+      );
+
+      // Configure: admin is a Clerk member of SA OrgC (but NOT orgB, so app X still appears)
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asAdminClerkId, orgIds: ["clerk_as_sa_orgC"] },
+      });
+
+      const rSA = await request("GET", "/v1/me/shared-apps", { headers: asAdminHeaders });
+      if (rSA.status === 200) {
+        const apps = rSA.body as Array<{ app_id: string }>;
+        // SA1: app W from member org must NOT appear
+        !apps.some((a) => a.app_id === asSaAppWId)
+          ? ok("AS-SA1: app from Clerk member org excluded from shared-apps (kill: remove membership filter → appears)")
+          : fail("AS-SA1: app from Clerk member org must NOT appear in shared-apps");
+        // SA2: app X from non-member org still appears
+        apps.some((a) => a.app_id === asAppXId)
+          ? ok("AS-SA2: app from non-member org still appears in shared-apps")
+          : fail("AS-SA2: app from non-member org should still appear");
+      } else {
+        fail(`AS-SA1/SA2: shared-apps failed, got ${rSA.status}`);
+      }
+
+      // Reset memberships so other tests are unaffected
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asAdminClerkId, orgIds: [] },
+      });
+      // Clear cache so SA3's fail mode actually hits Clerk (not a cached empty list)
+      await request("POST", "/test/clear-org-ids-cache");
+
+      // SA3: Clerk membership endpoint failure → 503 (kill: ignore error → 200)
+      await request("POST", "/test/set-user-org-memberships-fail", { body: { fail: true } });
+      const rSA3 = await request("GET", "/v1/me/shared-apps", { headers: asAdminHeaders });
+      rSA3.status === 503
+        ? ok("AS-SA3: Clerk memberships failure → 503 clerk_unavailable (kill: ignore error → 200)")
+        : fail(`AS-SA3: Clerk failure should give 503, got ${rSA3.status}`);
+      (rSA3.body as { error?: string }).error === "clerk_unavailable"
+        ? ok("AS-SA3: error code is clerk_unavailable")
+        : fail("AS-SA3: wrong error code", String((rSA3.body as { error?: string }).error));
+      await request("POST", "/test/set-user-org-memberships-fail", { body: { fail: false } });
+
+      // Cleanup
+      await pool.query("DELETE FROM app_access WHERE app_id = $1", [asSaAppWId]);
+      await pool.query("DELETE FROM apps WHERE id = $1", [asSaAppWId]);
+      await pool.query("DELETE FROM orgs WHERE id = $1", [asSaOrgCId]);
+    }
+
+    // ── AS-SA-left: app from a workspace the user has left → still listed ──────
+    // After leaving an org, getUserOrgIds returns [] for that org, so the filter
+    // does not exclude its apps — shared grants remain visible.
+    {
+      const asSaLeftClerkUserId = "clerk_as_sa_left_user";
+      const asSaLeftClerkOrgId  = "clerk_as_sa_left_org";
+
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: asSaLeftClerkUserId, email: "sa-left@test.local", verified: true },
+      });
+
+      const { rows: saLeftUserRow } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email) VALUES ($1, 'sa-left@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+        [asSaLeftClerkUserId],
+      );
+      const saLeftUserId = saLeftUserRow[0].id;
+
+      const { rows: saLeftOrgRow } = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1, 'SA Left Org', 'sa-left-org') RETURNING id`,
+        [asSaLeftClerkOrgId],
+      );
+      const saLeftOrgId = saLeftOrgRow[0].id;
+
+      const { rows: saLeftAppRow } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+         VALUES ($1,$2,'sa-left-app','sa-left-app-${Date.now()}','zip') RETURNING id`,
+        [saLeftOrgId, saLeftUserId],
+      );
+      const saLeftAppId = saLeftAppRow[0].id;
+
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+        [saLeftAppId, saLeftUserId],
+      );
+
+      // Phase 1: user is a member → app excluded from shared-apps
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asSaLeftClerkUserId, orgIds: [asSaLeftClerkOrgId] },
+      });
+      const rLeft1 = await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asSaLeftClerkUserId },
+      });
+      if (rLeft1.status === 200) {
+        const apps1 = rLeft1.body as Array<{ app_id: string }>;
+        !apps1.some((a) => a.app_id === saLeftAppId)
+          ? ok("AS-SA-left-pre: app excluded while user is a Clerk member (baseline)")
+          : fail("AS-SA-left-pre: app should be excluded while user is a member");
+      } else {
+        fail(`AS-SA-left-pre: request failed, got ${rLeft1.status}`);
+      }
+
+      // Phase 2: user leaves the org (membership = []) — cache cleared to simulate real-time change
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asSaLeftClerkUserId, orgIds: [] },
+      });
+      await request("POST", "/test/clear-org-ids-cache");
+      const rLeft2 = await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asSaLeftClerkUserId },
+      });
+      if (rLeft2.status === 200) {
+        const apps2 = rLeft2.body as Array<{ app_id: string }>;
+        apps2.some((a) => a.app_id === saLeftAppId)
+          ? ok("AS-SA-left: after leaving the workspace, shared app still appears in shared-apps")
+          : fail("AS-SA-left: shared app from left workspace should still be listed");
+      } else {
+        fail(`AS-SA-left: request failed after leaving, got ${rLeft2.status}`);
+      }
+
+      // Cleanup
+      await pool.query("DELETE FROM app_access WHERE app_id = $1", [saLeftAppId]);
+      await pool.query("DELETE FROM apps WHERE id = $1", [saLeftAppId]);
+      await pool.query("DELETE FROM orgs WHERE id = $1", [saLeftOrgId]);
+      await pool.query("DELETE FROM users WHERE id = $1", [saLeftUserId]);
+      await request("POST", "/test/clear-org-ids-cache");
+    }
+
+    // ── AS-SA-pagination: getUserOrgIds fetches all pages (kill: first page only) ─
+    // Creates a user with 12 org memberships where the fetch limit is set to 10,
+    // so two pages are needed. Without pagination all 12 orgs are fetched and their
+    // apps excluded. Mutation (stop after page 1) → apps from orgs 11–12 appear.
+    {
+      const asPagClerkUserId = "clerk_as_sa_pag_user";
+      await request("POST", "/test/set-clerk-user", {
+        body: { clerkUserId: asPagClerkUserId, email: "sa-pag@test.local", verified: true },
+      });
+      const { rows: pagUserRow } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email) VALUES ($1, 'sa-pag@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+        [asPagClerkUserId],
+      );
+      const pagUserId = pagUserRow[0].id;
+
+      // Create 12 orgs + 1 app per org, grant user access to each
+      const pagOrgClerkIds: string[] = [];
+      const pagOrgInternalIds: string[] = [];
+      const pagAppIds: string[] = [];
+      for (let i = 1; i <= 12; i++) {
+        const clerkOrgId = `clerk_sa_pag_org_${i}`;
+        pagOrgClerkIds.push(clerkOrgId);
+        const { rows: orgRow } = await pool.query<{ id: string }>(
+          `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1, $2, $3) RETURNING id`,
+          [clerkOrgId, `SA Pag Org ${i}`, `sa-pag-org-${i}`],
+        );
+        pagOrgInternalIds.push(orgRow[0].id);
+        const { rows: appRow } = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, owner_id, name, slug, source_type)
+           VALUES ($1,$2,$3,$3,'zip') RETURNING id`,
+          [orgRow[0].id, pagUserId, `sa-pag-app-${i}-${Date.now()}`],
+        );
+        pagAppIds.push(appRow[0].id);
+        await pool.query(
+          `INSERT INTO app_access (app_id, user_id, granted_by) VALUES ($1,$2,NULL) ON CONFLICT DO NOTHING`,
+          [appRow[0].id, pagUserId],
+        );
+      }
+
+      // Set fetch limit to 10 so 12 orgs require 2 pages
+      await request("POST", "/test/set-org-ids-fetch-limit", { body: { limit: 10 } });
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asPagClerkUserId, orgIds: pagOrgClerkIds },
+      });
+      await request("POST", "/test/clear-org-ids-cache");
+
+      const rPag = await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asPagClerkUserId },
+      });
+      if (rPag.status === 200) {
+        const apps = rPag.body as Array<{ app_id: string }>;
+        const leaked = pagAppIds.filter((id) => apps.some((a) => a.app_id === id));
+        leaked.length === 0
+          ? ok("AS-SA-pagination: all 12 member-org apps excluded when fetched across 2 pages (kill: first page only → apps 11-12 appear)")
+          : fail(`AS-SA-pagination: ${leaked.length} app(s) leaked from paginated member orgs`, JSON.stringify(leaked));
+      } else {
+        fail(`AS-SA-pagination: shared-apps failed, got ${rPag.status}`);
+      }
+
+      // Reset fetch limit to production default
+      await request("POST", "/test/set-org-ids-fetch-limit", { body: { limit: 100 } });
+      await request("POST", "/test/clear-org-ids-cache");
+
+      // Cleanup
+      for (const appId of pagAppIds) {
+        await pool.query("DELETE FROM app_access WHERE app_id = $1", [appId]);
+        await pool.query("DELETE FROM apps WHERE id = $1", [appId]);
+      }
+      for (const orgId of pagOrgInternalIds) {
+        await pool.query("DELETE FROM orgs WHERE id = $1", [orgId]);
+      }
+      await pool.query("DELETE FROM users WHERE id = $1", [pagUserId]);
+    }
+
+    // ── AS-SA-cache: second request within 60 s hits no Clerk call ────────────
+    // The 60-second per-user cache must deduplicate Clerk API calls.
+    // Mutation: remove caching → call count = 2 instead of 1 → test fails.
+    {
+      const asCacheClerkUserId = "clerk_as_sa_cache_user";
+      // Insert the user into the DB so me.ts reaches the getUserOrgIds call
+      await pool.query(
+        `INSERT INTO users (clerk_user_id, email) VALUES ($1, 'sa-cache@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email`,
+        [asCacheClerkUserId],
+      );
+      // Reset call counter and cache for this user
+      await request("POST", "/test/reset-user-memberships-call-count", { body: {} });
+      await request("POST", "/test/clear-org-ids-cache");
+      await request("POST", "/test/set-user-org-memberships", {
+        body: { clerkUserId: asCacheClerkUserId, orgIds: [] },
+      });
+
+      // First request — Clerk endpoint called
+      await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asCacheClerkUserId },
+      });
+      // Second request within the same second — cache hit, Clerk NOT called again
+      await request("GET", "/v1/me/shared-apps", {
+        headers: { "x-test-clerk-user-id": asCacheClerkUserId },
+      });
+
+      const countR = await request("GET", `/test/get-user-memberships-call-count?clerkUserId=${asCacheClerkUserId}`);
+      const callCount = (countR.body as { count: number }).count;
+      callCount === 1
+        ? ok("AS-SA-cache: second /v1/me/shared-apps request hits 60s cache, Clerk called only once (kill: no cache → count=2)")
+        : fail(`AS-SA-cache: Clerk was called ${callCount} time(s) instead of 1 (cache not working)`, String(callCount));
+
+      await request("POST", "/test/reset-user-memberships-call-count", { body: {} });
+      await request("POST", "/test/clear-org-ids-cache");
+    }
+
     // ── AS-A4: actor_email filled on events ───────────────────────────────────
     // Covers: key.created, key.revoked, access.granted, access.revoked,
     //         access.pending_claimed, access.refused, app.deleted
@@ -12616,13 +12877,19 @@ async function main(): Promise<void> {
     const wdClerkUserId  = "user_wdadmin1";
     const wdMemberClerkUserId = "user_wdmember1";
     const wdOrgName      = "WD Test Org";
+    const wdOrgSlug      = "wd-test-org";
 
     const { rows: wdOrgRows } = await pool.query<{ id: string }>(
       `INSERT INTO orgs (clerk_org_id, name, slug)
-       VALUES ($1, $2, 'wd-test-org') RETURNING id`,
-      [wdClerkOrgId, wdOrgName],
+       VALUES ($1, $2, $3) RETURNING id`,
+      [wdClerkOrgId, wdOrgName, wdOrgSlug],
     );
     const wdOrgId = wdOrgRows[0].id;
+
+    // Register the display name in the Clerk stub so DELETE /v1/workspace can verify it.
+    await request("POST", "/test/set-clerk-org-name", {
+      body: { clerkOrgId: wdClerkOrgId, name: wdOrgName, slug: wdOrgSlug },
+    });
 
     const { rows: wdUserRows } = await pool.query<{ id: string }>(
       "INSERT INTO users (clerk_user_id, email) VALUES ($1, 'wd-admin@test.local') RETURNING id",
@@ -13048,6 +13315,26 @@ async function main(): Promise<void> {
         : fail("WD-1d: preview.pending_invites wrong", String(pv.pending_invites));
     }
 
+    // ── WD-name-slug: org slug as confirm_name → 400 (kill: API checks slug → 200) ─
+    // The dialog shows the display name ("WD Test Org"), NOT the slug ("wd-test-org").
+    // If the API compared against the slug, sending the slug would incorrectly succeed.
+    {
+      const slugNameR = await request("DELETE", "/v1/workspace", {
+        body: { confirm_name: wdOrgSlug },
+        headers: {
+          "x-test-clerk-user-id": wdClerkUserId,
+          "x-test-clerk-org-id": wdClerkOrgId,
+          "x-test-clerk-org-role": "org:admin",
+        },
+      });
+      slugNameR.status === 400
+        ? ok("WD-name-slug-a: org slug → 400 name_mismatch (kill: API checks slug → 200)")
+        : fail("WD-name-slug-a: slug must NOT be accepted as confirm_name", String(slugNameR.status));
+      (slugNameR.body as { error?: string }).error === "name_mismatch"
+        ? ok("WD-name-slug-b: error code is name_mismatch")
+        : fail("WD-name-slug-b: wrong error code", String((slugNameR.body as { error?: string }).error));
+    }
+
     // ── WD-3: wrong confirm_name → 400 ────────────────────────────────────────
     {
       const wrongNameR = await request("DELETE", "/v1/workspace", {
@@ -13197,6 +13484,11 @@ async function main(): Promise<void> {
       );
       const wdCfUserId = wdCfUserRows[0].id;
 
+      // Register display name in Clerk stub so workspace DELETE can verify it
+      await request("POST", "/test/set-clerk-org-name", {
+        body: { clerkOrgId: wdCfClerkOrgId, name: wdCfOrgName },
+      });
+
       // Drain prior logs, then enable Clerk delete failure mode
       await request("GET", "/test/drain-logs");
       await request("POST", "/test/set-clerk-delete-org-fail", { body: { fail: true } });
@@ -13267,6 +13559,10 @@ async function main(): Promise<void> {
         [wdRpClerkOrgId, wdRpOrgName],
       );
       const wdRpOrgId = wdRpOrgRows[0].id;
+
+      await request("POST", "/test/set-clerk-org-name", {
+        body: { clerkOrgId: wdRpClerkOrgId, name: wdRpOrgName },
+      });
 
       const { rows: wdRpUserRows } = await pool.query<{ id: string }>(
         "INSERT INTO users (clerk_user_id, email) VALUES ($1,'wd-rp@test.local') RETURNING id",

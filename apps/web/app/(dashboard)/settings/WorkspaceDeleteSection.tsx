@@ -46,10 +46,10 @@ export function WorkspaceDeleteSection({ orgName }: Props) {
 
   function handleDelete(e: React.FormEvent) {
     e.preventDefault();
-    if (confirmName !== orgName || deleting) return;
+    if (confirmName.trim() !== orgName || deleting) return;
     setDeleteError(undefined);
     startDeleteTransition(async () => {
-      const result = await deleteWorkspace(confirmName);
+      const result = await deleteWorkspace(confirmName.trim());
       if (result.error) {
         if (result.error === "name_mismatch") {
           setDeleteError("Workspace name does not match.");
@@ -77,7 +77,7 @@ export function WorkspaceDeleteSection({ orgName }: Props) {
     });
   }
 
-  const canDelete = confirmName === orgName && !deleting;
+  const canDelete = confirmName.trim() === orgName && !deleting;
 
   return (
     <section

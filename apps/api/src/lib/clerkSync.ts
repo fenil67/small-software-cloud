@@ -105,6 +105,71 @@ export async function deleteClerkOrg(clerkOrgId: string): Promise<void> {
   });
 }
 
+/**
+ * Fetches the current display name of a Clerk organization.
+ * Returns null on any error (network, 404, etc.) — callers should treat null as a 503.
+ */
+export async function getClerkOrgDisplayName(clerkOrgId: string): Promise<string | null> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  try {
+    const { data } = await axios.get(`${clerkApiBase()}/organizations/${clerkOrgId}`, {
+      headers: { Authorization: `Bearer ${clerkKey}` },
+    });
+    return typeof data.name === "string" ? data.name : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── getUserOrgIds: paginated fetch with 60-second per-user cache ──────────────
+
+/** Page limit for Clerk org-membership list calls. Lowerable in tests. */
+let _orgIdsFetchLimit = 100;
+/** Test-only: sets the per-page limit for getUserOrgIds. Never call in production code. */
+export function _setOrgIdsFetchLimitForTest(n: number): void { _orgIdsFetchLimit = n; }
+
+interface OrgIdsCacheEntry { value: string[]; expiresAt: number; }
+const _orgIdsCache = new Map<string, OrgIdsCacheEntry>();
+/** Test-only: clears the getUserOrgIds per-user cache. Never call in production code. */
+export function _clearOrgIdsCacheForTest(): void { _orgIdsCache.clear(); }
+
+/**
+ * Returns all Clerk org IDs that the given user is currently a member of.
+ * Fetches all pages (Clerk paginates at 10 by default; we use limit=100 per page).
+ * Caches results per user for 60 seconds.
+ * Returns null on any API error — callers should treat null as a 503.
+ */
+export async function getUserOrgIds(clerkUserId: string): Promise<string[] | null> {
+  const cached = _orgIdsCache.get(clerkUserId);
+  if (cached && Date.now() < cached.expiresAt) return cached.value;
+
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  const limit = _orgIdsFetchLimit;
+  const allMemberships: Array<{ organization: { id: string } }> = [];
+  let offset = 0;
+
+  try {
+    while (true) {
+      const { data } = await axios.get(
+        `${clerkApiBase()}/users/${clerkUserId}/organization_memberships`,
+        {
+          params: { limit, offset },
+          headers: { Authorization: `Bearer ${clerkKey}` },
+        },
+      );
+      const page = ((data as { data?: unknown[] }).data ?? []) as Array<{ organization: { id: string } }>;
+      allMemberships.push(...page);
+      if (page.length < limit) break;
+      offset += limit;
+    }
+    const orgIds = allMemberships.map((m) => m.organization.id);
+    _orgIdsCache.set(clerkUserId, { value: orgIds, expiresAt: Date.now() + 60_000 });
+    return orgIds;
+  } catch {
+    return null; // errors are not cached — next call will retry
+  }
+}
+
 export async function ensureOrg(clerkOrgId: string): Promise<string> {
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
 

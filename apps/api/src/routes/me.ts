@@ -11,6 +11,7 @@ import { asyncHandler } from "../lib/asyncHandler";
 import { pool } from "../db";
 import { isAdminId } from "./admin";
 import { normalizeAppUrl } from "../lib/appUrl";
+import { getUserOrgIds } from "../lib/clerkSync";
 
 export const meRouter = Router();
 meRouter.use(requireAuth);
@@ -75,21 +76,34 @@ meRouter.get(
     const internalUserId = userRows[0].id;
     const userEmail = userRows[0].email;
 
-    // Exclude apps that belong to the user's currently active org — those already
-    // appear in the main "Your apps" table (GET /v1/apps) and would be duplicated here.
-    const clerkOrgId = req.sscAuth!.clerkOrgId;
-    let activeOrgId: string | null = null;
-    if (clerkOrgId) {
-      const { rows: orgRows } = await pool.query<{ id: string }>(
-        "SELECT id FROM orgs WHERE clerk_org_id = $1",
-        [clerkOrgId],
-      );
-      activeOrgId = orgRows[0]?.id ?? null;
+    // Fetch all Clerk org memberships for this user so we can exclude apps from
+    // orgs the user already belongs to (they appear in "Your apps", not "Shared with you").
+    const memberClerkOrgIds = await getUserOrgIds(clerkUserId);
+    if (memberClerkOrgIds === null) {
+      res.status(503).json({ error: "clerk_unavailable" });
+      return;
     }
 
-    const orgFilter = activeOrgId ? "AND a.org_id != $3" : "";
-    const queryParams: unknown[] = activeOrgId
-      ? [internalUserId, userEmail, activeOrgId]
+    // Also fold in the active org (always a member org; Clerk stubs in tests may not list it).
+    const clerkOrgId = req.sscAuth!.clerkOrgId;
+    const allMemberClerkIds = clerkOrgId
+      ? Array.from(new Set([...memberClerkOrgIds, clerkOrgId]))
+      : memberClerkOrgIds;
+
+    // Resolve Clerk org IDs → internal UUIDs
+    let memberInternalOrgIds: string[] = [];
+    if (allMemberClerkIds.length > 0) {
+      const { rows: memberOrgRows } = await pool.query<{ id: string }>(
+        "SELECT id FROM orgs WHERE clerk_org_id = ANY($1::text[]) AND deleted_at IS NULL",
+        [allMemberClerkIds],
+      );
+      memberInternalOrgIds = memberOrgRows.map((r) => r.id);
+    }
+
+    // Build the exclusion clause: use array parameter when we have orgs to exclude
+    const orgFilter = memberInternalOrgIds.length > 0 ? "AND a.org_id != ALL($3::uuid[])" : "";
+    const queryParams: unknown[] = memberInternalOrgIds.length > 0
+      ? [internalUserId, userEmail, memberInternalOrgIds]
       : [internalUserId, userEmail];
 
     const { rows } = await pool.query<SharedAppRow>(`
