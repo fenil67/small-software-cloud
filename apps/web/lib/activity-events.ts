@@ -2,7 +2,7 @@
 
 export type EventChip =
   | 'Visits' | 'Refused' | 'Deploys' | 'Sharing'
-  | 'People' | 'API keys' | 'Watchdog' | 'Admin';
+  | 'People' | 'API keys' | 'Watchdog' | 'Admin' | 'Workspace';
 
 export interface EventMeta {
   chip: EventChip;
@@ -70,6 +70,7 @@ export const EVENT_META: Record<string, EventMeta> = {
   'admin.activity_searched': { chip: 'Admin',    label: 'Admin',       sentence: e => `${actor(e)} searched activity` },
   'admin.activity_exported': { chip: 'Admin',    label: 'Admin',       sentence: e => `${actor(e)} exported the activity log` },
   'admin.person_erased':     { chip: 'Admin',    label: 'Admin',       sentence: e => `${actor(e)} erased a person` },
+  'workspace.deleted':       { chip: 'Workspace', label: 'Workspace',  labelColor: '--red', labelWeight: 500, sentence: e => `${actor(e)} deleted the workspace` },
 };
 
 export const CHIP_EVENT_TYPES: Record<EventChip, string[]> = {
@@ -81,6 +82,7 @@ export const CHIP_EVENT_TYPES: Record<EventChip, string[]> = {
   'API keys': ['key.created', 'key.revoked', 'key.auth_failed'],
   'Watchdog': ['app.suspended', 'app.unsuspended', 'watchdog.alert'],
   'Admin':    ['app.created', 'app.deleted', 'admin.activity_searched', 'admin.activity_exported', 'admin.person_erased'],
+  'Workspace': ['workspace.deleted'],
 };
 
 /** Simple UA → "Browser on Device" without any dependency */
