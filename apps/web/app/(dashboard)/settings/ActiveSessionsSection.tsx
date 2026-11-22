@@ -1,6 +1,8 @@
 "use client";
 
-import { useSession, useSessionList, useClerk } from "@clerk/nextjs";
+import { useState } from "react";
+import { useSession, useSessionList, useClerk, useReverification } from "@clerk/nextjs";
+import { ReverificationDialog } from "./ReverificationDialog";
 
 // Clerk's useSessionList returns SessionResource[] whose TS type omits
 // the runtime latestActivity / revoke members; we cast to this minimal shape.
@@ -82,6 +84,19 @@ export function ActiveSessionsSection() {
   const { session: currentSession } = useSession();
   const { sessions, isLoaded } = useSessionList();
   const { signOut } = useClerk();
+  const [reverifCallbacks, setReverifCallbacks] = useState<{ cancel: () => void; complete: () => void } | null>(null);
+
+  // useReverification hooks before early returns (hook rules)
+  const reverifOpts = {
+    onNeedsReverification: ({ cancel, complete }: { cancel: () => void; complete: () => void }) => {
+      setReverifCallbacks({ cancel, complete });
+    },
+  };
+
+  const revokeWithReverif = useReverification(
+    (session: ActiveSessionResource) => session.revoke(),
+    reverifOpts,
+  );
 
   if (!isLoaded) return null;
 
@@ -94,15 +109,22 @@ export function ActiveSessionsSection() {
   );
 
   async function revokeSession(session: ActiveSessionResource) {
-    await session.revoke();
+    await revokeWithReverif(session);
   }
 
   async function revokeAllOthers() {
-    await Promise.all(otherSessions.map((s) => s.revoke()));
+    await Promise.all(otherSessions.map((s) => revokeWithReverif(s)));
   }
 
   return (
     <section aria-labelledby="sessions-h" style={S.section}>
+      {reverifCallbacks && (
+        <ReverificationDialog
+          onVerified={() => { const cb = reverifCallbacks; setReverifCallbacks(null); cb?.complete(); }}
+          onCancel={() => { reverifCallbacks?.cancel(); setReverifCallbacks(null); }}
+        />
+      )}
+
       <h2 id="sessions-h" style={S.h2}>Active sessions</h2>
 
       <div style={S.card}>

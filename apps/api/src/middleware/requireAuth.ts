@@ -28,6 +28,12 @@ export interface SscAuth {
   apiKeyScopes?: string[];
   /** api_keys.id of the authenticated API key (undefined for Clerk sessions) */
   apiKeyId?: string;
+  /**
+   * Factor verification age from the Clerk JWT fva claim.
+   * [firstFactorAgeMinutes, secondFactorAgeMinutes] — minutes since last verification.
+   * null when the claim is absent (older tokens); undefined for API key sessions.
+   */
+  factorVerificationAge?: [number, number] | null;
 }
 
 declare global {
@@ -105,6 +111,7 @@ export async function requireAuth(
         clerkUserId: clerkAuth.userId,
         clerkOrgId: clerkAuth.orgId ?? undefined,
         clerkOrgRole: clerkAuth.orgRole ?? undefined,
+        factorVerificationAge: (clerkAuth as { factorVerificationAge?: [number, number] | null }).factorVerificationAge ?? null,
       };
       next();
       return;

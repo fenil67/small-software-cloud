@@ -184,6 +184,15 @@ meRouter.delete(
       return;
     }
 
+    // ── Reverification check: first-factor must be fresh (≤ 10 min) ──────────
+    // fva[0] = minutes since last first-factor verification. null = claim absent
+    // (backward-compat: older tokens without fva are allowed through).
+    const fva = req.sscAuth.factorVerificationAge;
+    if (fva !== undefined && fva !== null && fva[0] > 10) {
+      res.status(403).json({ error: "reverification_required" });
+      return;
+    }
+
     const clerkUserId = req.sscAuth.clerkUserId!;
 
     // Look up internal user record
@@ -192,7 +201,16 @@ meRouter.delete(
       [clerkUserId],
     );
     if (!userRows[0]) {
-      res.status(404).json({ error: "user_not_found" });
+      // Clerk-only account with no DB row — no DB cleanup needed.
+      // Still delete from Clerk so the account is fully gone.
+      let clerkDeleted = false;
+      try {
+        await deleteClerkUser(clerkUserId);
+        clerkDeleted = true;
+      } catch (err) {
+        console.error(`[me] Clerk user delete failed for ${clerkUserId.slice(0, 8)}…:`, safeErr(err));
+      }
+      res.json({ deleted: true, clerk_deleted: clerkDeleted });
       return;
     }
     const internalUserId = userRows[0].id;

@@ -1,4 +1,5 @@
 import { auth } from "@clerk/nextjs/server";
+import { redirect } from "next/navigation";
 import { apiFetch } from "../../../lib/api";
 import type { App, SharedApp } from "../../../lib/api-types";
 import { AppsTable } from "../../../components/dashboard/AppsTable";
@@ -14,10 +15,16 @@ export default async function AppsPage() {
   let apps: App[] = [];
   let sharedApps: SharedApp[] = [];
   let error: string | null = null;
+  let noActiveOrg = false;
 
   await Promise.allSettled([
     apiFetch<App[]>("/v1/apps").then(d => { apps = d; }).catch(e => {
       const status = (e as { status?: number }).status ?? 0;
+      const code   = (e as { code?: string }).code ?? "";
+      if (status === 400 && code === "no_active_org") {
+        noActiveOrg = true;
+        return;
+      }
       console.error(`[apps] GET /v1/apps failed with status ${status}`);
       error = "We could not load your apps. Try again in a moment.";
     }),
@@ -25,6 +32,8 @@ export default async function AppsPage() {
       // Non-fatal: shared apps fail silently
     }),
   ]);
+
+  if (noActiveOrg) redirect("/onboarding");
 
   return (
     <div style={{ padding: "40px 48px 64px", maxWidth: "1200px" }}>

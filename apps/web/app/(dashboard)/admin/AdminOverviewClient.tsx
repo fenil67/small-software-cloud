@@ -381,7 +381,7 @@ export function AdminOverviewClient({ stats, apps, statsError, appsError }: Admi
                         {app.name}
                       </td>
                       <td style={{ padding: "12px", fontSize: "13px", color: "var(--fg-2)" }}>
-                        {app.owner_email ?? "—"}
+                        {app.owner_email ?? "Former member"}
                       </td>
                       <td style={{ padding: "12px" }}>
                         <AppStatusBadge
