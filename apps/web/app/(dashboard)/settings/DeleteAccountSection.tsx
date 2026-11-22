@@ -5,6 +5,7 @@ import { useUser } from "@clerk/nextjs";
 import { deleteAccount } from "./actions";
 import { navigateHard } from "../../../lib/navigate";
 import type { DeleteMeBlockedResponse } from "../../../lib/api-types";
+import { ReverificationDialog } from "./ReverificationDialog";
 
 // ── Style primitives ──────────────────────────────────────────────────────────
 
@@ -33,6 +34,9 @@ export function DeleteAccountSection() {
   const [deleteError, setDeleteError] = useState<string | undefined>();
   const [blocked, setBlocked]         = useState<DeleteMeBlockedResponse | undefined>();
   const [deleting, startDeleteTransition] = useTransition();
+  const [reverifying, setReverifying] = useState(false);
+  // The email to retry with after reverification completes
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
   if (!isLoaded || !user) return null;
 
@@ -57,9 +61,16 @@ export function DeleteAccountSection() {
     setDeleteError(undefined);
     setBlocked(undefined);
 
+    const emailToUse = confirmEmail.trim();
     startDeleteTransition(async () => {
-      const result = await deleteAccount(confirmEmail.trim());
+      const result = await deleteAccount(emailToUse);
       if (result.error) {
+        if (result.error === "reverification_required") {
+          setPendingEmail(emailToUse);
+          setOpen(false);
+          setReverifying(true);
+          return;
+        }
         if (result.error === "sole_admin_blocked" && result.blocked) {
           setBlocked(result.blocked);
         } else if (result.error === "email_mismatch") {
@@ -74,8 +85,35 @@ export function DeleteAccountSection() {
     });
   }
 
+  function handleReverified() {
+    setReverifying(false);
+    if (!pendingEmail) return;
+    const email = pendingEmail;
+    setPendingEmail(null);
+    startDeleteTransition(async () => {
+      const result = await deleteAccount(email);
+      if (result.error) {
+        if (result.error === "sole_admin_blocked" && result.blocked) {
+          setBlocked(result.blocked);
+        } else if (result.error === "email_mismatch") {
+          setDeleteError("Email does not match.");
+        } else {
+          setDeleteError("Could not delete account. Please try again.");
+        }
+        return;
+      }
+      navigateHard("/sign-in");
+    });
+  }
+
   return (
     <section aria-labelledby="delete-account-h" style={S.section}>
+      {reverifying && (
+        <ReverificationDialog
+          onVerified={handleReverified}
+          onCancel={() => { setReverifying(false); setPendingEmail(null); }}
+        />
+      )}
       <h2 id="delete-account-h" style={{ ...S.h2, color: "var(--red)" }}>
         Delete account
       </h2>

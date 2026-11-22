@@ -11,7 +11,9 @@
  *
  * Events handled:
  *   organizationMembership.deleted → revoke all active keys whose created_by left the org
- *   user.deleted                   → revoke all active keys whose created_by was deleted
+ *   user.deleted                   → full DB teardown: revoke keys, NULL owner_id on
+ *                                    surviving apps, delete sole-member workspaces, delete
+ *                                    users row (safe if already cleaned by DELETE /v1/me)
  */
 
 import { Router, Request, Response } from "express";
@@ -20,6 +22,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { pool } from "../db";
 import { ActivityEventType, recordActivity } from "../lib/activityLog";
 import { deleteWorkspaceData, destroyWorkspaceFlyApps } from "../lib/workspaceDelete";
+import { deleteUserData } from "../lib/userDelete";
 
 export const webhookRouter = Router();
 
@@ -122,15 +125,51 @@ webhookRouter.post("/clerk", async (req: Request, res: Response): Promise<void> 
       });
     } else if (event.type === "user.deleted") {
       // data.id — the deleted user's Clerk ID
-      const userId = event.data.id as string | undefined;
-      if (userId) {
-        await revokeKeysByCreatorAllOrgs(userId, "creator_deleted");
+      const clerkUserId = event.data.id as string | undefined;
+      if (clerkUserId) {
+        // Always revoke keys immediately — safe even when the users row is already gone
+        // (e.g. DELETE /v1/me ran first).  Keeps revoked_reason = 'creator_deleted'.
+        await revokeKeysByCreatorAllOrgs(clerkUserId, "creator_deleted");
+
+        // Look up our internal user record.  May be absent if DELETE /v1/me already
+        // cleaned up (the revoke above is then a no-op).
+        const { rows: wuRows } = await pool.query<{ id: string }>(
+          "SELECT id FROM users WHERE clerk_user_id = $1 LIMIT 1",
+          [clerkUserId],
+        );
+        if (wuRows[0]) {
+          const internalUserId = wuRows[0].id;
+
+          // Tear down sole-member workspaces (orgs where this is the only member).
+          const { rows: wuSoleOrgs } = await pool.query<{ id: string }>(
+            `SELECT o.id FROM orgs o
+             WHERE o.deleted_at IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM org_members om WHERE om.org_id = o.id AND om.user_id = $1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM org_members om2 WHERE om2.org_id = o.id AND om2.user_id != $1
+               )`,
+            [internalUserId],
+          );
+          for (const org of wuSoleOrgs) {
+            const result = await deleteWorkspaceData(org.id, { requestId: svixId ?? undefined });
+            destroyWorkspaceFlyApps(result.fly_app_ids, org.id).catch(() => {});
+          }
+
+          // deleteUserData: NULLs owner_id (+ other nullable FKs) then deletes users row.
+          // Keys are already revoked above; deleteUserData skips them (revoked_at IS NOT NULL).
+          await deleteUserData(internalUserId, {
+            clerkUserId,
+            requestId: `clerk.user_deleted:${svixId ?? internalUserId}`,
+          });
+        }
       }
       recordActivity({
         eventType: ActivityEventType.CLERK_USER_DELETED,
         actorType: "clerk",
         requestId: svixId,
-        metadata: { clerk_user_id: userId ?? "" },
+        metadata: { clerk_user_id: clerkUserId ?? "" },
       });
     } else if (event.type === "user.created") {
       const userId = event.data.id as string | undefined;

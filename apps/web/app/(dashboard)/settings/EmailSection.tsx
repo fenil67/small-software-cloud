@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { useUser } from "@clerk/nextjs";
+import { useUser, useReverification } from "@clerk/nextjs";
 import { CodeStep } from "../../../components/auth/CodeStep";
+import { ReverificationDialog } from "./ReverificationDialog";
 
 type EmailAddressResource = NonNullable<ReturnType<typeof useUser>["user"]>["emailAddresses"][number];
 
@@ -83,6 +84,33 @@ export function EmailSection() {
   const [verifyError, setVerifyError]       = useState<string | undefined>();
   const [verifying, setVerifying]           = useState(false);
 
+  // Reverification state — shown when Clerk requires step-up auth
+  const [reverifCallbacks, setReverifCallbacks] = useState<{ cancel: () => void; complete: () => void } | null>(null);
+
+  // useReverification hooks MUST be called before any early returns (hook rules).
+  // They wrap the core Clerk operations; when Clerk needs step-up auth, the
+  // onNeedsReverification callback opens our ReverificationDialog.
+  const reverifOpts = {
+    onNeedsReverification: ({ cancel, complete }: { cancel: () => void; complete: () => void }) => {
+      setReverifCallbacks({ cancel, complete });
+    },
+  };
+
+  const addEmailWithReverif = useReverification(
+    (emailAddr: string) => (user as NonNullable<typeof user>).createEmailAddress({ email: emailAddr }),
+    reverifOpts,
+  );
+
+  const makePrimaryWithReverif = useReverification(
+    (emailId: string) => (user as NonNullable<typeof user>).update({ primaryEmailAddressId: emailId }),
+    reverifOpts,
+  );
+
+  const destroyEmailWithReverif = useReverification(
+    (email: EmailAddressResource) => email.destroy(),
+    reverifOpts,
+  );
+
   if (!isLoaded || !user) return null;
 
   const emails = user.emailAddresses;
@@ -93,10 +121,10 @@ export function EmailSection() {
     setAdding(true);
     setAddError(undefined);
     try {
-      if (!user) return;
-      const created = await user.createEmailAddress({ email: addEmail.trim() });
+      const created = await addEmailWithReverif(addEmail.trim());
+      if (!created) return; // reverification pending — dialog will retry
       await created.prepareVerification({ strategy: "email_code" });
-      setVerifyResource(created);
+      setVerifyResource(created as EmailAddressResource);
       setAddEmail("");
     } catch (err: unknown) {
       const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
@@ -134,9 +162,9 @@ export function EmailSection() {
   }
 
   async function handleMakePrimary(email: EmailAddressResource) {
-    if (email.id === primaryId || !user) return;
+    if (email.id === primaryId) return;
     try {
-      await user.update({ primaryEmailAddressId: email.id });
+      await makePrimaryWithReverif(email.id);
     } catch (err: unknown) {
       const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
       console.error("make primary failed:", clerkErrors?.[0]?.message);
@@ -147,7 +175,7 @@ export function EmailSection() {
     if (email.id === primaryId) return;          // never remove primary
     if (emails.length <= 1) return;              // never remove the last one
     try {
-      await email.destroy();
+      await destroyEmailWithReverif(email);
     } catch (err: unknown) {
       const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
       console.error("remove email failed:", clerkErrors?.[0]?.message);
@@ -156,6 +184,13 @@ export function EmailSection() {
 
   return (
     <section aria-labelledby="email-h" style={S.section}>
+      {reverifCallbacks && (
+        <ReverificationDialog
+          onVerified={() => { const cb = reverifCallbacks; setReverifCallbacks(null); cb?.complete(); }}
+          onCancel={() => { reverifCallbacks?.cancel(); setReverifCallbacks(null); }}
+        />
+      )}
+
       <h2 id="email-h" style={S.h2}>Email addresses</h2>
 
       <div style={S.card}>

@@ -79,6 +79,9 @@ vi.mock("@clerk/nextjs", () => ({
   })),
   useSession: vi.fn(() => ({ session: null })),
   useSessionList: vi.fn(() => ({ sessions: [], isLoaded: true })),
+  useReverification: vi.fn((fetcher: (...args: unknown[]) => Promise<unknown>) => {
+    return async (...args: unknown[]) => fetcher(...args);
+  }),
 }));
 
 vi.mock("next/image", () => ({
@@ -108,6 +111,15 @@ const mockGrantAccess = vi.fn();
 const mockRevokeAccess = vi.fn();
 const mockCreateKey = vi.fn();
 const mockRevokeKey = vi.fn();
+const mockApiFetch = vi.fn();
+
+vi.mock("../../../lib/api", () => ({
+  apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+  isAppArray: vi.fn(() => true),
+  isDeploymentArray: vi.fn(() => true),
+  isApp: vi.fn(() => true),
+  isAppAccessResponse: vi.fn(() => true),
+}));
 
 vi.mock("../../../app/(dashboard)/apps/actions", () => ({
   deleteApp: (...a: unknown[]) => mockDeleteApp(...a),
@@ -134,6 +146,7 @@ beforeEach(() => {
   mockRevokeAccess.mockReset().mockResolvedValue({});
   mockCreateKey.mockReset();
   mockRevokeKey.mockReset().mockResolvedValue({});
+  mockApiFetch.mockReset().mockResolvedValue([]);
   mockCreateOrganization.mockReset();
   if (typeof localStorage !== "undefined" && typeof localStorage.clear === "function") localStorage.clear();
   if (typeof sessionStorage !== "undefined" && typeof sessionStorage.clear === "function") sessionStorage.clear();
@@ -1222,5 +1235,40 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     });
     expect(await screen.findByRole("alert")).toBeInTheDocument();
     expect(mockAssign).not.toHaveBeenCalled();
+  });
+});
+
+// ── AppsPage – no_active_org redirect (Bug #4) ───────────────────────────────
+
+import AppsPage from "../../../app/(dashboard)/apps/page";
+
+describe("AppsPage – no_active_org redirect", () => {
+  it("redirects to /onboarding when GET /v1/apps returns 400 no_active_org (bug #4)", async () => {
+    mockServerAuth.mockResolvedValueOnce({ orgRole: "org:admin" });
+    mockApiFetch.mockImplementation((path: string) => {
+      if (path === "/v1/apps") {
+        return Promise.reject(
+          Object.assign(new Error("no_active_org"), { status: 400, code: "no_active_org" }),
+        );
+      }
+      return Promise.resolve([]);
+    });
+    await expect(AppsPage()).rejects.toThrow("NEXT_REDIRECT");
+    expect(mockRedirect).toHaveBeenCalledWith("/onboarding");
+  });
+
+  it("renders error card for non-no_active_org API failures (not redirected)", async () => {
+    mockServerAuth.mockResolvedValueOnce({ orgRole: "org:admin" });
+    mockApiFetch.mockImplementation((path: string) => {
+      if (path === "/v1/apps") {
+        return Promise.reject(
+          Object.assign(new Error("internal_error"), { status: 500, code: "internal_error" }),
+        );
+      }
+      return Promise.resolve([]);
+    });
+    const result = await AppsPage();
+    expect(mockRedirect).not.toHaveBeenCalledWith("/onboarding");
+    expect(JSON.stringify(result)).toContain("could not load");
   });
 });

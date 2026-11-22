@@ -208,6 +208,18 @@ describe("AdminOverviewClient", () => {
     expect(screen.getByText("1.0 MB")).toBeDefined();
   });
 
+  it("shows Former member for null owner_email (M-owner-id-null kill: skip NULL → owner row deleted → app row gone → test fails)", () => {
+    const appWithNullOwner: AdminApp = {
+      id: "app-3", name: "Orphan App", org_id: "org-1", fly_app_id: null,
+      suspended: false, suspended_at: null, suspend_reason: null,
+      owner_email: null, org_name: "Acme Corp",
+      last_visit_at: null, latest_deployment_status: null,
+      cpu_pct: null, traffic_bytes_24h: null,
+    };
+    render(<AdminOverviewClient stats={mockStats} apps={[appWithNullOwner]} statsError={null} appsError={null} />);
+    expect(screen.getByText("Former member")).toBeDefined();
+  });
+
   it("shows Not available for null CPU and traffic", () => {
     render(<AdminOverviewClient stats={mockStats} apps={mockApps} statsError={null} appsError={null} />);
     const naElements = screen.getAllByText("Not available");

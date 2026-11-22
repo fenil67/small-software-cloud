@@ -8211,6 +8211,87 @@ async function main(): Promise<void> {
         : fail("AI4d: stale timestamp should 401", `got ${r.status}`);
     }
 
+    // ── AI4e: user.deleted webhook NULLs owner_id on surviving apps ─────────
+    // (M-owner-id-null kill: skip UPDATE apps SET owner_id=NULL → FK violation → 500)
+    {
+      // Create user E (app owner) and user F (second member so workspace survives)
+      const ai4eOrgClerkId = `clerk_ai4e_org_${Date.now()}`;
+      const ai4eOrgRow = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug)
+         VALUES ($1, 'AI4e Org', $2) RETURNING id`,
+        [ai4eOrgClerkId, `ai4e-org-${Date.now()}`],
+      );
+      const ai4eOrgId = ai4eOrgRow.rows[0].id;
+
+      const ai4eUserERow = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email) VALUES ('clerk_ai4e_user_e', 'ai4e_e@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+      );
+      const ai4eUserEId = ai4eUserERow.rows[0].id;
+
+      const ai4eUserFRow = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email) VALUES ('clerk_ai4e_user_f', 'ai4e_f@test.local')
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email RETURNING id`,
+      );
+      const ai4eUserFId = ai4eUserFRow.rows[0].id;
+
+      await pool.query(
+        `INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'member')
+         ON CONFLICT (org_id, user_id) DO NOTHING`,
+        [ai4eOrgId, ai4eUserEId, ai4eUserFId],
+      );
+
+      // Create an app owned by E
+      const ai4eAppRow = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1, $2, 'AI4e App', $3) RETURNING id`,
+        [ai4eOrgId, ai4eUserEId, `ai4e-app-${Date.now()}`],
+      );
+      const ai4eAppId = ai4eAppRow.rows[0].id;
+
+      // Fire user.deleted webhook for clerk_ai4e_user_e
+      const ai4eEventBody = { type: "user.deleted", data: { id: "clerk_ai4e_user_e" } };
+      const ai4eSignR = await request("POST", "/test/sign-webhook-event", { body: { body: ai4eEventBody } });
+      const { svixId: ai4eSvixId, svixTimestamp: ai4eTs, svixSignature: ai4eSig } =
+        ai4eSignR.body as { svixId: string; svixTimestamp: string; svixSignature: string };
+      const ai4eR = await request("POST", "/v1/webhooks/clerk", {
+        headers: {
+          "content-type": "application/json",
+          "svix-id": ai4eSvixId,
+          "svix-timestamp": ai4eTs,
+          "svix-signature": ai4eSig,
+        },
+        body: ai4eEventBody,
+      });
+      ai4eR.status === 200
+        ? ok("AI4e: user.deleted webhook with app-owning user → 200, no FK error (M-owner-id-null kill)")
+        : fail("AI4e: webhook should return 200", `got ${ai4eR.status} ${JSON.stringify(ai4eR.body)}`);
+
+      // App must still exist with owner_id = NULL
+      const { rows: ai4eAppRows } = await pool.query<{ owner_id: string | null }>(
+        "SELECT owner_id FROM apps WHERE id = $1",
+        [ai4eAppId],
+      );
+      ai4eAppRows.length === 1 && ai4eAppRows[0].owner_id === null
+        ? ok("AI4e: app still exists with owner_id = NULL after webhook (M-owner-id-null kill)")
+        : fail("AI4e: app should still exist with owner_id = NULL",
+            `rows=${ai4eAppRows.length} owner_id=${ai4eAppRows[0]?.owner_id ?? "missing"}`);
+
+      // User E must be gone from users table
+      const { rows: ai4eUserRows } = await pool.query(
+        "SELECT id FROM users WHERE clerk_user_id = $1",
+        ["clerk_ai4e_user_e"],
+      );
+      ai4eUserRows.length === 0
+        ? ok("AI4e: user E deleted from DB by webhook")
+        : fail("AI4e: user E should be deleted from DB");
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE org_id = $1", [ai4eOrgId]);
+      await pool.query("DELETE FROM org_members WHERE org_id = $1", [ai4eOrgId]);
+      await pool.query("DELETE FROM users WHERE clerk_user_id = $1", ["clerk_ai4e_user_f"]);
+      await pool.query("DELETE FROM orgs WHERE id = $1", [ai4eOrgId]);
+    }
+
     // ── AI5: reconciliation (reapKeysByMembership) ────────────────────────────
 
     // Create a user and key; configure membership stub
@@ -14121,12 +14202,15 @@ async function main(): Promise<void> {
   // workspace cleanup, sole-admin-with-other-members 409, Clerk failure tolerance.
   //
   // Mutation kills:
-  //   M-ME-apikey: accepts API keys (remove clerk check) → ME-auth-apikey fails
-  //   M-ME-email:  skip confirm_email check → ME-email-mismatch fails
-  //   M-ME-admin:  skip sole-admin check → ME-admin-409 fails
+  //   M-ME-apikey:     accepts API keys (remove clerk check) → ME-auth-apikey fails
+  //   M-ME-email:      skip confirm_email check → ME-email-mismatch fails
+  //   M-ME-admin:      skip sole-admin check → ME-admin-409 fails
+  //   M-ME-no-db-row:  return 404 for missing DB row → ME-no-db-row fails
+  //   M-ME-reverif:    skip reverification check → ME-reverification fails
+  //   M-owner-id-null: skip UPDATE apps SET owner_id=NULL → FK violation → ME-owner-null-delete + AI4e fail
   //   M-ME-lastmethod: last sign-in method can be disconnected → web test fails
-  //   M-ME-primary: primary email can be removed → web test fails
-  //   (last two are web-layer mutations; API tests cover first three)
+  //   M-ME-primary:    primary email can be removed → web test fails
+  //   (last two are web-layer mutations; API tests cover first six)
   {
     // ── Helpers ─────────────────────────────────────────────────────────────
     async function meInsertUser(clerkUserId: string, email: string): Promise<string> {
@@ -14163,6 +14247,15 @@ async function main(): Promise<void> {
       return { "x-test-clerk-user-id": clerkUserId };
     }
 
+    async function meInsertApp(orgId: string, userId: string, name: string): Promise<string> {
+      const slug = `me-app-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [orgId, userId, name, slug],
+      );
+      return rows[0].id;
+    }
+
     async function cleanupMe(userIds: string[], orgIds: string[]) {
       for (const oid of orgIds) {
         await pool.query("DELETE FROM org_members WHERE org_id = $1", [oid]);
@@ -14193,15 +14286,42 @@ async function main(): Promise<void> {
         : fail("ME-auth-apikey: expected 403 clerk_session_required", `got ${r.status} ${JSON.stringify(r.body)}`);
     }
 
-    // ── ME-auth-other: Clerk session for non-existent user → 404 ────────────
+    // ── ME-no-db-row: Clerk-only user (no DB row) → 200 + Clerk deleted ────────
+    // (M-ME-no-db-row kill: return 404 → test fails)
     {
+      await request("GET", "/test/get-clerk-deleted-users"); // drain
+      const ghostClerkId = "clerk_me_ghost_user";
       const r = await request("DELETE", "/v1/me", {
-        headers: meClerkHeaders("clerk_me_ghost_user"),
+        headers: meClerkHeaders(ghostClerkId),
         body: { confirm_email: "ghost@test.local" },
       });
-      r.status === 404
-        ? ok("ME-auth-other: non-existent user → 404")
-        : fail("ME-auth-other: expected 404", `got ${r.status}`);
+      if (r.status === 200) {
+        ok("ME-no-db-row: Clerk-only user (no DB row) → 200 deleted:true (M-ME-no-db-row kill)");
+        const deletedR = await request("GET", "/test/get-clerk-deleted-users");
+        const { users: deletedUsers } = deletedR.body as { users: string[] };
+        deletedUsers.includes(ghostClerkId)
+          ? ok("ME-no-db-row: Clerk user deleted via backend API")
+          : fail("ME-no-db-row: Clerk user not deleted", `deleted=${JSON.stringify(deletedUsers)}`);
+      } else {
+        fail("ME-no-db-row: expected 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+    // ── ME-reverification: stale first factor → 403 reverification_required ──
+    // (M-ME-reverif kill: skip the check → 200 instead of 403 → test fails)
+    {
+      const uid = await meInsertUser("clerk_me_reverif1", "reverif1@test.local");
+      const r = await request("DELETE", "/v1/me", {
+        headers: {
+          ...meClerkHeaders("clerk_me_reverif1"),
+          "x-test-clerk-reverification-age": "15",
+        },
+        body: { confirm_email: "reverif1@test.local" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "reverification_required"
+        ? ok("ME-reverification: stale first factor (>10 min) → 403 reverification_required (M-ME-reverif kill)")
+        : fail("ME-reverification: expected 403 reverification_required", `got ${r.status} ${JSON.stringify(r.body)}`);
+      await cleanupMe([uid], []);
     }
 
     // ── ME-email-mismatch: wrong confirm_email → 400 (M-ME-email kill) ──────
@@ -14392,6 +14512,54 @@ async function main(): Promise<void> {
       userRows.length === 0
         ? ok("ME-clerk-fail: user deleted from DB despite Clerk failure")
         : fail("ME-clerk-fail: user row still in DB");
+    }
+
+    // ── ME-owner-null-delete: owner_id NULLed on surviving apps (M-owner-id-null kill) ──
+    // User A owns an app in a workspace that also has member B.
+    // A deletes their account → 200. App still exists with owner_id = NULL. B still there.
+    {
+      const aClerkId = `clerk_me_owna_${Date.now()}`;
+      const bClerkId = `clerk_me_ownb_${Date.now()}`;
+      const ownOrgClerkId = `clerk_me_own_org_${Date.now()}`;
+
+      const uidA = await meInsertUser(aClerkId, "me_ownera@test.local");
+      const uidB = await meInsertUser(bClerkId, "me_ownerb@test.local");
+      const oidOwn = await meInsertOrg(ownOrgClerkId, "ME Owner Org", `me-owner-org-${Date.now()}`);
+
+      // A is a plain member (not sole admin) so no 409; B is admin so workspace survives
+      await meAddMember(oidOwn, uidA, "member");
+      await meAddMember(oidOwn, uidB, "admin");
+
+      // Create an app owned by A
+      const appId = await meInsertApp(oidOwn, uidA, "Owner Test App");
+
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders(aClerkId),
+        body: { confirm_email: "me_ownera@test.local" },
+      });
+      r.status === 200
+        ? ok("ME-owner-null-delete: owner deletes account → 200 (M-owner-id-null kill)")
+        : fail("ME-owner-null-delete: expected 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+
+      // App must still exist with owner_id = NULL
+      const { rows: appRows } = await pool.query<{ owner_id: string | null }>(
+        "SELECT owner_id FROM apps WHERE id = $1",
+        [appId],
+      );
+      appRows.length === 1 && appRows[0].owner_id === null
+        ? ok("ME-owner-null-delete: app still exists, owner_id = NULL (M-owner-id-null kill)")
+        : fail("ME-owner-null-delete: app should exist with owner_id = NULL",
+            `rows=${appRows.length} owner_id=${appRows[0]?.owner_id ?? "missing"}`);
+
+      // B still exists (workspace and member B survive)
+      const { rows: bRows } = await pool.query("SELECT id FROM users WHERE id = $1", [uidB]);
+      bRows.length === 1
+        ? ok("ME-owner-null-delete: member B still in DB after A's deletion")
+        : fail("ME-owner-null-delete: B should still exist");
+
+      // Cleanup
+      await pool.query("DELETE FROM apps WHERE id = $1", [appId]);
+      await cleanupMe([uidB], [oidOwn]);
     }
 
     // ── ME-activity: user.account_deleted activity event written ────────────

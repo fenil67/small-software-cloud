@@ -50,14 +50,23 @@ function btnPrimary(disabled: boolean): React.CSSProperties {
   };
 }
 
-/** Map Clerk API error messages to plain user-facing strings. */
-function mapClerkError(msg: string): string {
+/** Map Clerk API error code (and fallback message) to plain user-facing strings. */
+function mapClerkError(code: string, msg: string): string {
+  // Code-first mapping — precise and future-proof
+  if (code === "form_identifier_exists")            return "That username is already taken.";
+  if (code === "form_username_invalid_length")       return "Username length is out of range.";
+  if (code === "form_username_invalid_character")    return "Username can only contain letters, numbers, underscores and hyphens.";
+  if (code === "form_param_format_invalid" && /username/i.test(msg)) return "Username format is invalid.";
+  if (code === "form_param_max_length_exceeded" && /first.*name/i.test(msg)) return "First name is too long.";
+  if (code === "form_param_max_length_exceeded" && /last.*name/i.test(msg))  return "Last name is too long.";
+  if (code === "form_param_max_length_exceeded")     return "One of the name fields is too long.";
+  // Fallback: message-based matching for unknown / legacy codes
   if (/username.*taken/i.test(msg) || /already.*taken/i.test(msg)) return "That username is already taken.";
   if (/username.*invalid/i.test(msg) || /invalid.*username/i.test(msg)) return "Username can only contain letters, numbers, underscores and hyphens.";
   if (/username.*too short/i.test(msg)) return "Username is too short.";
-  if (/username.*too long/i.test(msg)) return "Username is too long.";
-  if (/first.*name/i.test(msg)) return "First name is too long.";
-  if (/last.*name/i.test(msg)) return "Last name is too long.";
+  if (/username.*too long/i.test(msg))  return "Username is too long.";
+  if (/first.*name/i.test(msg))         return "First name is too long.";
+  if (/last.*name/i.test(msg))          return "Last name is too long.";
   return "Could not save changes. Please try again.";
 }
 
@@ -104,9 +113,11 @@ export function ProfileSection() {
       setLastName(undefined);
       setUsername(undefined);
     } catch (err: unknown) {
-      const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
-      const msg = clerkErrors?.[0]?.message ?? "";
-      setSaveError(mapClerkError(msg));
+      const clerkErrors = (err as { errors?: Array<{ code?: string; message?: string }> }).errors;
+      const code = clerkErrors?.[0]?.code ?? "";
+      const msg  = clerkErrors?.[0]?.message ?? "";
+      if (code) console.error("[profile] save error code:", code);
+      setSaveError(mapClerkError(code, msg));
     } finally {
       setSaving(false);
     }
@@ -127,9 +138,10 @@ export function ProfileSection() {
     try {
       await user.setProfileImage({ file });
     } catch (err: unknown) {
-      const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
-      const msg = clerkErrors?.[0]?.message ?? "";
-      setPhotoError(mapClerkError(msg) || "Could not upload photo.");
+      const clerkErrors = (err as { errors?: Array<{ code?: string; message?: string }> }).errors;
+      const code = clerkErrors?.[0]?.code ?? "";
+      const msg  = clerkErrors?.[0]?.message ?? "";
+      setPhotoError(mapClerkError(code, msg) || "Could not upload photo.");
     } finally {
       setPhotoUploading(false);
       if (fileRef.current) fileRef.current.value = "";
@@ -144,9 +156,10 @@ export function ProfileSection() {
       // Clerk v7: setProfileImage with null removes the custom image
       await user.setProfileImage({ file: null as unknown as File });
     } catch (err: unknown) {
-      const clerkErrors = (err as { errors?: Array<{ message?: string }> }).errors;
-      const msg = clerkErrors?.[0]?.message ?? "";
-      setPhotoError(mapClerkError(msg) || "Could not remove photo.");
+      const clerkErrors = (err as { errors?: Array<{ code?: string; message?: string }> }).errors;
+      const code = clerkErrors?.[0]?.code ?? "";
+      const msg  = clerkErrors?.[0]?.message ?? "";
+      setPhotoError(mapClerkError(code, msg) || "Could not remove photo.");
     } finally {
       setPhotoUploading(false);
     }

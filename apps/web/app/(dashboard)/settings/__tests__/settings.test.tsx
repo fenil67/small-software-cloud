@@ -34,6 +34,12 @@ vi.mock("@clerk/nextjs", () => ({
   useAuth: vi.fn(() => ({ getToken: vi.fn().mockResolvedValue("test-token") })),
   useSession: vi.fn(() => ({ session: null })),
   useSessionList: vi.fn(() => ({ sessions: [], isLoaded: true })),
+  // useReverification: wraps fetcher; in tests just calls it directly (no reverification interception)
+  useReverification: vi.fn((fetcher: (...args: unknown[]) => Promise<unknown>, options?: { onNeedsReverification?: (p: { cancel: () => void; complete: () => void; level?: string }) => void }) => {
+    return async (...args: unknown[]) => {
+      return fetcher(...args);
+    };
+  }),
 }));
 
 vi.mock("@clerk/nextjs/server", () => ({
@@ -96,6 +102,18 @@ vi.mock("../../../../components/auth/CodeStep", () => ({
     }),
     React.createElement("button", { onClick: onSubmit, disabled: loading }, submitLabel ?? "Verify"),
   ),
+}));
+
+// ReverificationDialog is mocked to expose a simple dialog stub in tests.
+// Real session methods are not available in the test environment.
+vi.mock("../ReverificationDialog", () => ({
+  ReverificationDialog: ({ onVerified, onCancel }: { onVerified: () => void; onCancel: () => void }) =>
+    React.createElement(
+      "div",
+      { role: "dialog", "aria-label": "reverification-dialog" },
+      React.createElement("button", { onClick: onVerified }, "Verify identity"),
+      React.createElement("button", { onClick: onCancel }, "Cancel reverification"),
+    ),
 }));
 
 vi.mock("../../../../lib/api", () => ({
@@ -837,5 +855,122 @@ describe("DeleteAccountSection", () => {
     fireEvent.click(cancelBtn);
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+// ── ProfileSection — error code mapping ──────────────────────────────────────
+
+describe("ProfileSection – Clerk error code mapping", () => {
+  it("maps form_identifier_exists (code) to 'already taken'", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    mockUserUpdate.mockRejectedValueOnce({
+      errors: [{ code: "form_identifier_exists", message: "identifier already exists" }],
+    });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "taken" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("already taken");
+    });
+  });
+
+  it("maps form_username_invalid_character to plain message", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    mockUserUpdate.mockRejectedValueOnce({
+      errors: [{ code: "form_username_invalid_character", message: "invalid chars" }],
+    });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "bad!" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("letters, numbers, underscores");
+    });
+  });
+
+  it("maps form_param_max_length_exceeded + 'first name' to 'First name is too long.'", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    mockUserUpdate.mockRejectedValueOnce({
+      errors: [{ code: "form_param_max_length_exceeded", message: "first name is too long" }],
+    });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/first name/i), { target: { value: "A".repeat(200) } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("First name is too long");
+    });
+  });
+
+  it("logs only the error code, not the message content (no PII in logs)", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockUserUpdate.mockRejectedValueOnce({
+      errors: [{ code: "form_identifier_exists", message: "pii:username_already_in_use@secret.com" }],
+    });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "taken" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeDefined());
+    const logs = errorSpy.mock.calls.flat().join(" ");
+    expect(logs).toContain("form_identifier_exists");
+    expect(logs).not.toContain("pii:username_already_in_use@secret.com");
+    errorSpy.mockRestore();
+  });
+});
+
+// ── ReverificationDialog ──────────────────────────────────────────────────────
+
+import { ReverificationDialog } from "../ReverificationDialog";
+
+describe("ReverificationDialog", () => {
+  it("renders with Verify identity and Cancel buttons", () => {
+    render(<ReverificationDialog onVerified={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByRole("dialog")).toBeDefined();
+    expect(screen.getByRole("button", { name: /verify identity/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /cancel reverification/i })).toBeDefined();
+  });
+
+  it("calls onVerified when Verify identity is clicked", () => {
+    const mockVerified = vi.fn();
+    render(<ReverificationDialog onVerified={mockVerified} onCancel={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /verify identity/i }));
+    expect(mockVerified).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls onCancel when Cancel is clicked (M-reverif cancel: remove handler → stays open → fails)", () => {
+    const mockCancel = vi.fn();
+    render(<ReverificationDialog onVerified={vi.fn()} onCancel={mockCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: /cancel reverification/i }));
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── DeleteAccountSection – reverification_required ───────────────────────────
+
+describe("DeleteAccountSection – reverification_required", () => {
+  it("shows reverification dialog when server returns reverification_required", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    mockDeleteAccount.mockResolvedValueOnce({ error: "reverification_required" });
+
+    render(<DeleteAccountSection />);
+    // Open the delete dialog
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    // Type the matching email and submit
+    const confirmInput = screen.getByPlaceholderText("owner@test.com") as HTMLInputElement;
+    fireEvent.change(confirmInput, { target: { value: "owner@test.com" } });
+
+    // Find submit button inside the dialog
+    const dialog = screen.getByRole("dialog");
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Delete account" && b.type === "submit",
+    ) as HTMLButtonElement;
+    expect(submitBtn).toBeDefined();
+    await act(async () => { fireEvent.click(submitBtn); });
+
+    // Reverification dialog should now replace the delete dialog
+    await waitFor(() => {
+      expect(screen.getByRole("dialog").getAttribute("aria-label")).toBe("reverification-dialog");
+    });
   });
 });

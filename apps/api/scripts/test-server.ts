@@ -336,13 +336,17 @@ flyModule.destroyFlyApp = async (appName: string) => {
     if (typeof clerkUserId === "string" && clerkUserId) {
       const orgIdH = req.headers["x-test-clerk-org-id"];
       const orgRoleH = req.headers["x-test-clerk-org-role"];
+      const revAgeH = req.headers["x-test-clerk-reverification-age"];
       const clerkOrgId = Array.isArray(orgIdH) ? orgIdH[0] : (orgIdH as string | undefined);
       const clerkOrgRole = Array.isArray(orgRoleH) ? orgRoleH[0] : (orgRoleH as string | undefined);
+      const revAgeStr = Array.isArray(revAgeH) ? revAgeH[0] : (revAgeH as string | undefined);
+      const fva: [number, number] | undefined = revAgeStr !== undefined ? [parseInt(revAgeStr, 10), -1] : undefined;
       req.sscAuth = {
         type: "clerk",
         clerkUserId,
         ...(clerkOrgId ? { clerkOrgId } : {}),
         ...(clerkOrgRole ? { clerkOrgRole } : {}),
+        ...(fva !== undefined ? { factorVerificationAge: fva } : {}),
       };
       next();
       return;

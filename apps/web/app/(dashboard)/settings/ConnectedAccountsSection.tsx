@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { useUser } from "@clerk/nextjs";
+import { useUser, useReverification } from "@clerk/nextjs";
+import { ReverificationDialog } from "./ReverificationDialog";
 
 type ExternalAccountResource = NonNullable<ReturnType<typeof useUser>["user"]>["externalAccounts"][number];
 
@@ -74,6 +75,19 @@ const PROVIDERS: Provider[] = [
 export function ConnectedAccountsSection() {
   const { user, isLoaded } = useUser();
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [reverifCallbacks, setReverifCallbacks] = useState<{ cancel: () => void; complete: () => void } | null>(null);
+
+  // useReverification hooks before early returns (hook rules)
+  const reverifOpts = {
+    onNeedsReverification: ({ cancel, complete }: { cancel: () => void; complete: () => void }) => {
+      setReverifCallbacks({ cancel, complete });
+    },
+  };
+
+  const destroyAccountWithReverif = useReverification(
+    (account: ExternalAccountResource) => account.destroy(),
+    reverifOpts,
+  );
 
   if (!isLoaded || !user) return null;
 
@@ -111,7 +125,7 @@ export function ConnectedAccountsSection() {
     if (!canDisconnect(account)) return;
     setErrors((prev) => ({ ...prev, [account.provider]: "" }));
     try {
-      await account.destroy();
+      await destroyAccountWithReverif(account);
     } catch (err: unknown) {
       const msg = (err as { errors?: Array<{ message?: string }> }).errors?.[0]?.message ?? "Could not disconnect account.";
       setErrors((prev) => ({ ...prev, [account.provider]: msg }));
@@ -120,6 +134,13 @@ export function ConnectedAccountsSection() {
 
   return (
     <section aria-labelledby="connected-h" style={S.section}>
+      {reverifCallbacks && (
+        <ReverificationDialog
+          onVerified={() => { const cb = reverifCallbacks; setReverifCallbacks(null); cb?.complete(); }}
+          onCancel={() => { reverifCallbacks?.cancel(); setReverifCallbacks(null); }}
+        />
+      )}
+
       <h2 id="connected-h" style={S.h2}>Connected accounts</h2>
 
       <div style={S.card}>
