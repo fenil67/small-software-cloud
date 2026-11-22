@@ -56,6 +56,8 @@ export const ActivityEventType = {
   EMAIL_INVITE_FAILED:      "email.invite_failed",
 
   WORKSPACE_DELETED:        "workspace.deleted",
+
+  USER_ACCOUNT_DELETED:     "user.account_deleted",
 } as const;
 
 export type ActivityEventTypeValue = (typeof ActivityEventType)[keyof typeof ActivityEventType];

@@ -2,7 +2,7 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { apiFetch } from "../../../lib/api";
-import type { WorkspaceDeletePreview } from "../../../lib/api-types";
+import type { WorkspaceDeletePreview, DeleteMeResponse, DeleteMeBlockedResponse } from "../../../lib/api-types";
 
 export async function fetchDeletePreview(): Promise<
   { preview: WorkspaceDeletePreview } | { error: string }
@@ -40,5 +40,30 @@ export async function deleteWorkspace(
   } catch (e: unknown) {
     const code = (e as { code?: string }).code;
     return { error: code ?? "delete_failed" };
+  }
+}
+
+export async function deleteAccount(
+  confirmEmail: string,
+): Promise<{ error?: string; blocked?: DeleteMeBlockedResponse }> {
+  const { getToken } = await auth();
+  const token = await getToken();
+  if (!token) return { error: "not_authenticated" };
+
+  try {
+    await apiFetch<DeleteMeResponse>("/v1/me", {
+      method: "DELETE",
+      body: { confirm_email: confirmEmail },
+      token,
+    });
+    return {};
+  } catch (e: unknown) {
+    const err = e as { code?: string; status?: number };
+    // 409 → sole_admin_blocked; include the full body for workspace list
+    if (err.status === 409) {
+      const raw = e as { body?: DeleteMeBlockedResponse };
+      return { error: "sole_admin_blocked", blocked: raw.body };
+    }
+    return { error: err.code ?? "delete_failed" };
   }
 }

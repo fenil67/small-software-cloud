@@ -31,8 +31,8 @@ export async function apiFetch<T>(
     cache: "no-store",
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { error?: string };
-    throw Object.assign(new Error(err.error ?? "api_error"), { status: res.status, code: err.error });
+    const body = await res.json().catch(() => ({})) as { error?: string; [k: string]: unknown };
+    throw Object.assign(new Error(body.error ?? "api_error"), { status: res.status, code: body.error, body });
   }
   return res.json() as Promise<T>;
 }

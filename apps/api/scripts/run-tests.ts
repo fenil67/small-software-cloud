@@ -10056,17 +10056,17 @@ async function main(): Promise<void> {
           fail(`AR-T1: failed to insert event type "${evType}"`, String(e));
         }
       }
-      insertedCount === 33
-        ? ok("AR-T1: all 33 event types inserted into activity_events")
-        : fail(`AR-T1: expected 33 insertable event types, got ${insertedCount}`);
+      insertedCount === 34
+        ? ok("AR-T1: all 34 event types inserted into activity_events")
+        : fail(`AR-T1: expected 34 insertable event types, got ${insertedCount}`);
 
       const { rows: countRows } = await pool.query<{ n: string }>(
         "SELECT COUNT(*) AS n FROM activity_events",
       );
       const n = parseInt(countRows[0].n, 10);
-      n === 33
-        ? ok("AR-T1: activity_events has exactly 33 rows after seeding")
-        : fail(`AR-T1: expected 33 rows, got ${n}`);
+      n === 34
+        ? ok("AR-T1: activity_events has exactly 34 rows after seeding")
+        : fail(`AR-T1: expected 34 rows, got ${n}`);
     }
 
     // ── T2: Secrets never stored in any activity_events column ────────────────
@@ -14111,6 +14111,313 @@ async function main(): Promise<void> {
     // RD cleanup: rdUserId (all keys referencing rdUserId were cleaned in their sub-sections)
     await pool.query("DELETE FROM api_keys WHERE created_by=$1", [rdUserId]);
     await pool.query("DELETE FROM users WHERE id=$1", [rdUserId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section("ME: DELETE /v1/me — account deletion safety + cleanup");
+  // ════════════════════════════════════════════════════════════════════════════
+  //
+  // Tests DELETE /v1/me: auth gating, confirm_email validation, sole-member
+  // workspace cleanup, sole-admin-with-other-members 409, Clerk failure tolerance.
+  //
+  // Mutation kills:
+  //   M-ME-apikey: accepts API keys (remove clerk check) → ME-auth-apikey fails
+  //   M-ME-email:  skip confirm_email check → ME-email-mismatch fails
+  //   M-ME-admin:  skip sole-admin check → ME-admin-409 fails
+  //   M-ME-lastmethod: last sign-in method can be disconnected → web test fails
+  //   M-ME-primary: primary email can be removed → web test fails
+  //   (last two are web-layer mutations; API tests cover first three)
+  {
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    async function meInsertUser(clerkUserId: string, email: string): Promise<string> {
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO users (clerk_user_id, email)
+         VALUES ($1, $2)
+         ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email
+         RETURNING id`,
+        [clerkUserId, email],
+      );
+      return rows[0].id;
+    }
+
+    async function meInsertOrg(clerkOrgId: string, name: string, slug: string): Promise<string> {
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO orgs (clerk_org_id, name, slug)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (clerk_org_id) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id`,
+        [clerkOrgId, name, slug],
+      );
+      return rows[0].id;
+    }
+
+    async function meAddMember(orgId: string, userId: string, role: string): Promise<void> {
+      await pool.query(
+        `INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [orgId, userId, role],
+      );
+    }
+
+    function meClerkHeaders(clerkUserId: string): Record<string, string> {
+      return { "x-test-clerk-user-id": clerkUserId };
+    }
+
+    async function cleanupMe(userIds: string[], orgIds: string[]) {
+      for (const oid of orgIds) {
+        await pool.query("DELETE FROM org_members WHERE org_id = $1", [oid]);
+        await pool.query("DELETE FROM apps WHERE org_id = $1", [oid]);
+        await pool.query("DELETE FROM api_keys WHERE org_id = $1", [oid]);
+        await pool.query("DELETE FROM orgs WHERE id = $1", [oid]);
+      }
+      for (const uid of userIds) {
+        await pool.query("DELETE FROM api_keys WHERE created_by = $1", [uid]);
+        await pool.query("DELETE FROM org_members WHERE user_id = $1", [uid]);
+        await pool.query("DELETE FROM app_access WHERE user_id = $1", [uid]);
+        await pool.query("DELETE FROM users WHERE id = $1", [uid]);
+      }
+    }
+
+    // Reset Clerk user delete stub
+    await request("POST", "/test/set-clerk-delete-user-fail", { body: { fail: false } });
+
+    // ── ME-auth-apikey: API key → 403 (M-ME-apikey kill) ────────────────────
+    {
+      const { keyA } = await seed();
+      const r = await request("DELETE", "/v1/me", {
+        headers: authHeaders(keyA),
+        body: { confirm_email: "anyone@test.local" },
+      });
+      r.status === 403 && (r.body as { error?: string }).error === "clerk_session_required"
+        ? ok("ME-auth-apikey: API key → 403 clerk_session_required (M-ME-apikey kill)")
+        : fail("ME-auth-apikey: expected 403 clerk_session_required", `got ${r.status} ${JSON.stringify(r.body)}`);
+    }
+
+    // ── ME-auth-other: Clerk session for non-existent user → 404 ────────────
+    {
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders("clerk_me_ghost_user"),
+        body: { confirm_email: "ghost@test.local" },
+      });
+      r.status === 404
+        ? ok("ME-auth-other: non-existent user → 404")
+        : fail("ME-auth-other: expected 404", `got ${r.status}`);
+    }
+
+    // ── ME-email-mismatch: wrong confirm_email → 400 (M-ME-email kill) ──────
+    {
+      const uid = await meInsertUser("clerk_me_email1", "correct@test.local");
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders("clerk_me_email1"),
+        body: { confirm_email: "wrong@test.local" },
+      });
+      r.status === 400 && (r.body as { error?: string }).error === "email_mismatch"
+        ? ok("ME-email-mismatch: wrong email → 400 email_mismatch (M-ME-email kill)")
+        : fail("ME-email-mismatch: expected 400 email_mismatch", `got ${r.status} ${JSON.stringify(r.body)}`);
+      await cleanupMe([uid], []);
+    }
+
+    // ── ME-admin-409: sole admin with other members → 409, nothing deleted ──
+    // (M-ME-admin kill: remove the check → 200 instead of 409)
+    {
+      const admin1  = await meInsertUser("clerk_me_admin1", "admin1@test.local");
+      const member1 = await meInsertUser("clerk_me_member1", "member1@test.local");
+      const orgId1  = await meInsertOrg("clerk_me_org1", "ME Sole Admin Org", `me-sole-admin-${Date.now()}`);
+      await meAddMember(orgId1, admin1, "admin");
+      await meAddMember(orgId1, member1, "member");
+
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders("clerk_me_admin1"),
+        body: { confirm_email: "admin1@test.local" },
+      });
+      if (r.status === 409) {
+        const body = r.body as { error?: string; workspaces?: Array<{ id: string; name: string }> };
+        body.error === "sole_admin_blocked" && Array.isArray(body.workspaces) && body.workspaces.length === 1
+          ? ok("ME-admin-409: sole admin with members → 409 with workspace list (M-ME-admin kill)")
+          : fail("ME-admin-409: expected sole_admin_blocked with workspaces", JSON.stringify(body));
+      } else {
+        fail("ME-admin-409: expected 409", `got ${r.status}`);
+      }
+
+      // Verify nothing was deleted
+      const { rows: orgRows } = await pool.query("SELECT id FROM orgs WHERE id = $1", [orgId1]);
+      orgRows.length > 0
+        ? ok("ME-admin-409: org NOT deleted (delete nothing on 409)")
+        : fail("ME-admin-409: org was deleted despite 409 response");
+
+      await cleanupMe([admin1, member1], [orgId1]);
+    }
+
+    // ── ME-sole-member: sole-member workspace deleted + user deleted + Clerk deleted
+    {
+      const userClerkId = `clerk_me_sole_${Date.now()}`;
+      const orgClerkId  = `clerk_me_org_sole_${Date.now()}`;
+      const uid = await meInsertUser(userClerkId, "solemember@test.local");
+      const oid = await meInsertOrg(orgClerkId, "ME Sole Member Org", `me-sole-member-${Date.now()}`);
+      await meAddMember(oid, uid, "admin");
+
+      // Register org display name in Clerk stub so delete works
+      await request("POST", "/test/set-clerk-org-name", { body: { clerkOrgId: orgClerkId, name: "ME Sole Member Org" } });
+
+      // Drain clerk deleted users tracker before the call
+      await request("GET", "/test/get-clerk-deleted-users");
+
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders(userClerkId),
+        body: { confirm_email: "soleMember@test.local" }, // case-insensitive comparison
+      });
+      if (r.status === 200) {
+        const body = r.body as { deleted?: boolean };
+        body.deleted === true
+          ? ok("ME-sole-member: sole-member workspace deleted → 200")
+          : fail("ME-sole-member: expected deleted:true", JSON.stringify(body));
+      } else {
+        fail("ME-sole-member: expected 200", `got ${r.status} ${JSON.stringify(r.body)}`);
+      }
+
+      // Verify org is soft-deleted
+      const { rows: orgRows } = await pool.query(
+        "SELECT deleted_at FROM orgs WHERE id = $1",
+        [oid],
+      );
+      orgRows[0]?.deleted_at != null
+        ? ok("ME-sole-member: org soft-deleted after account deletion")
+        : fail("ME-sole-member: org not soft-deleted");
+
+      // Verify user no longer in users table
+      const { rows: userRows } = await pool.query(
+        "SELECT id FROM users WHERE id = $1",
+        [uid],
+      );
+      userRows.length === 0
+        ? ok("ME-sole-member: user row deleted from DB")
+        : fail("ME-sole-member: user row still in DB");
+
+      // Verify Clerk user was deleted
+      const deletedR = await request("GET", "/test/get-clerk-deleted-users");
+      const { users: deletedUsers } = deletedR.body as { users: string[] };
+      deletedUsers.includes(userClerkId)
+        ? ok("ME-sole-member: Clerk user deleted via backend API")
+        : fail("ME-sole-member: Clerk user not deleted via stub", `deleted=${JSON.stringify(deletedUsers)}`);
+
+      // No leftover org_members
+      const { rows: memberRows } = await pool.query(
+        "SELECT id FROM org_members WHERE org_id = $1",
+        [oid],
+      );
+      memberRows.length === 0
+        ? ok("ME-sole-member: org_members cleaned up")
+        : fail("ME-sole-member: leftover org_members rows");
+
+      // Cleanup org record (soft-deleted, need hard delete for test isolation)
+      await pool.query("DELETE FROM orgs WHERE id = $1", [oid]);
+    }
+
+    // ── ME-keys-revoked: API keys created by user are revoked on deletion ───
+    {
+      const userClerkId = `clerk_me_keys_${Date.now()}`;
+      const orgClerkId  = `clerk_me_org_keys_${Date.now()}`;
+      const uid = await meInsertUser(userClerkId, "keysuser@test.local");
+      const oid = await meInsertOrg(orgClerkId, "ME Keys Org", `me-keys-org-${Date.now()}`);
+      await meAddMember(oid, uid, "admin");
+
+      // Insert an API key created by this user
+      const { fullKey: meKey, keyPrefix: meKP, keyHash: meKH } = generateApiKey();
+      await pool.query(
+        `INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes)
+         VALUES ($1, $2, 'me-test-key', $3, $4, '{read}')`,
+        [oid, uid, meKP, meKH],
+      );
+
+      await request("POST", "/test/set-clerk-org-name", { body: { clerkOrgId: orgClerkId, name: "ME Keys Org" } });
+
+      // Verify key works before deletion
+      const authBefore = await request("GET", "/v1/auth/check", { headers: authHeaders(meKey) });
+      if (authBefore.status !== 200) {
+        fail("ME-keys-revoked: key should work before deletion", `got ${authBefore.status}`);
+      }
+
+      await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders(userClerkId),
+        body: { confirm_email: "keysuser@test.local" },
+      });
+
+      // Key should now be revoked
+      const authAfter = await request("GET", "/v1/auth/check", { headers: authHeaders(meKey) });
+      authAfter.status === 401
+        ? ok("ME-keys-revoked: user's API keys revoked on account deletion")
+        : fail("ME-keys-revoked: key should be revoked after deletion", `got ${authAfter.status}`);
+
+      // Cleanup
+      await pool.query("DELETE FROM api_keys WHERE key_hash = $1", [meKH]);
+      await pool.query("DELETE FROM orgs WHERE id = $1", [oid]);
+    }
+
+    // ── ME-clerk-fail: Clerk user delete fails → still 200 (no secret in log) ─
+    {
+      const userClerkId = `clerk_me_clerkfail_${Date.now()}`;
+      const uid = await meInsertUser(userClerkId, "clerkfail@test.local");
+
+      await request("POST", "/test/set-clerk-delete-user-fail", { body: { fail: true } });
+      await request("GET", "/test/drain-logs"); // clear any previous logs
+
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders(userClerkId),
+        body: { confirm_email: "clerkfail@test.local" },
+      });
+
+      await request("POST", "/test/set-clerk-delete-user-fail", { body: { fail: false } });
+
+      r.status === 200
+        ? ok("ME-clerk-fail: Clerk user delete failure still returns 200")
+        : fail("ME-clerk-fail: expected 200 even when Clerk fails", `got ${r.status}`);
+
+      const body = r.body as { deleted?: boolean; clerk_deleted?: boolean };
+      body.clerk_deleted === false
+        ? ok("ME-clerk-fail: clerk_deleted:false in response")
+        : fail("ME-clerk-fail: expected clerk_deleted:false", JSON.stringify(body));
+
+      // Verify no secret in logs
+      const logsR = await request("GET", "/test/drain-logs");
+      const { logs } = logsR.body as { logs: string[] };
+      const hasSecret = logs.some((l) =>
+        l.includes("sk_test_fake") || l.includes("sk_live_") || l.includes("CLERK_SECRET_KEY"),
+      );
+      !hasSecret
+        ? ok("ME-clerk-fail: no secret in error logs")
+        : fail("ME-clerk-fail: secret leaked in error log", logs.find((l) => l.includes("sk_")) ?? "");
+
+      // User row was already deleted (Clerk failure is after DB cleanup)
+      const { rows: userRows } = await pool.query("SELECT id FROM users WHERE id = $1", [uid]);
+      userRows.length === 0
+        ? ok("ME-clerk-fail: user deleted from DB despite Clerk failure")
+        : fail("ME-clerk-fail: user row still in DB");
+    }
+
+    // ── ME-activity: user.account_deleted activity event written ────────────
+    {
+      const userClerkId = `clerk_me_activity_${Date.now()}`;
+      const actEmail = `meactivity_${Date.now()}@test.local`;
+      const uid = await meInsertUser(userClerkId, actEmail);
+
+      const r = await request("DELETE", "/v1/me", {
+        headers: meClerkHeaders(userClerkId),
+        body: { confirm_email: actEmail },
+      });
+
+      const evRows = await waitForRow<{ event_type: string }>(
+        `SELECT event_type FROM activity_events
+         WHERE event_type = 'user.account_deleted'
+           AND actor_email = $1
+         ORDER BY occurred_at DESC LIMIT 1`,
+        [actEmail],
+        (rows) => rows.length > 0,
+        1000,
+      );
+      r.status === 200 && evRows.length > 0
+        ? ok("ME-activity: DELETE /v1/me writes user.account_deleted event")
+        : fail("ME-activity: expected 200 + activity event", `status=${r.status} events=${evRows.length}`);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════

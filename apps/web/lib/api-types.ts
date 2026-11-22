@@ -169,6 +169,17 @@ export interface WorkspaceDeletePreview {
   pending_invites: number;
 }
 
+export interface DeleteMeResponse {
+  deleted: boolean;
+  clerk_deleted: boolean;
+}
+
+export interface DeleteMeBlockedResponse {
+  error: "sole_admin_blocked";
+  message: string;
+  workspaces: Array<{ id: string; name: string }>;
+}
+
 export interface ActivitySummaryItem {
   event_type: string;
   count_24h: number;
