@@ -30,7 +30,10 @@ export async function checkOrgMembership(
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
   const base = clerkApiBase();
 
-  // Step 1: check the user still exists
+  // Step 1: check the user still exists.
+  // Only treat as "deleted" when Clerk returns 404 AND the body contains
+  // resource_not_found.  Any other status or a 404 without that code is
+  // treated as an API error so the caller does NOT revoke the key.
   try {
     await axios.get(`${base}/users/${clerkUserId}`, {
       headers: { Authorization: `Bearer ${clerkKey}` },
@@ -38,7 +41,13 @@ export async function checkOrgMembership(
   } catch (err) {
     const axErr = err as AxiosError;
     if (axErr.response?.status === 404) {
-      return { member: false, reason: "deleted" };
+      const body = axErr.response.data as { errors?: Array<{ code?: string }> } | undefined;
+      const code = body?.errors?.[0]?.code;
+      if (code === "resource_not_found") {
+        return { member: false, reason: "deleted" };
+      }
+      // 404 without resource_not_found — treat as API error, do not revoke
+      return null;
     }
     // Any other error (5xx, network) → caller must not revoke
     return null;

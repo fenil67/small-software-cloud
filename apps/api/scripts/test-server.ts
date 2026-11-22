@@ -75,6 +75,7 @@ import { intakeRouter } from "../src/routes/intake";
 // apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
 import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership } from "../src/lib/reaper";
+import { runReconcile, ClerkOrgCheck } from "../src/lib/reconcile";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
 import { requestIdMiddleware, errorHandlerMiddleware } from "../src/middleware/errorHandler";
@@ -698,6 +699,47 @@ app.post("/test/run-reaper", async (_req, res) => {
   }
 });
 
+// POST /test/run-reconcile
+// Runs runReconcile() with an injected clerkCheck so tests don't need a live Clerk API.
+//
+// Body:
+//   apply:       boolean  — whether to actually delete orphaned orgs
+//   max?:        number   — max orgs to clean (default 3)
+//   only?:       string[] — restrict to these internal org UUIDs
+//   yes?:        boolean  — skip confirmation (always true in tests)
+//   mockChecks?: Record<clerkOrgId, ClerkOrgCheck>
+//     Each entry overrides the default HTTP check for that clerkOrgId.
+//     Use { found: false, httpStatus: 404 } to simulate orphaned.
+//     Use { error: true, httpStatus: 401, message: "..." } to simulate errors.
+//     Use { error: true, httpStatus: 0, message: "timeout" } for network/timeout.
+//     Orgs not in mockChecks get { found: true, httpStatus: 200 } by default.
+app.post("/test/run-reconcile", async (req, res) => {
+  const { apply, max, only, mockChecks } = req.body as {
+    apply?: boolean;
+    max?: number;
+    only?: string[];
+    mockChecks?: Record<string, ClerkOrgCheck>;
+  };
+
+  const clerkCheck = async (clerkOrgId: string): Promise<ClerkOrgCheck> => {
+    if (mockChecks && Object.prototype.hasOwnProperty.call(mockChecks, clerkOrgId)) {
+      return mockChecks[clerkOrgId];
+    }
+    // Default: org exists in Clerk
+    return { found: true, httpStatus: 200 };
+  };
+
+  try {
+    const result = await runReconcile(
+      { apply: apply ?? false, max, only, yes: true },
+      clerkCheck,
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // POST /test/run-proxy-code-reaper
 // Runs reapExpiredProxyCodes() — used by AB tests to exercise the cleanup path.
 app.post("/test/run-proxy-code-reaper", async (_req, res) => {
@@ -922,14 +964,19 @@ const _clerkMembershipStubs = new Map<string, boolean>();
 let _clerkMembershipFailMode = false;
 
 // GET /clerk-stub/users/:id — fake Clerk GET /v1/users/:id
-// Returns 404 for any user not explicitly registered via POST /test/set-clerk-user so that
-// missing test setup fails loudly (500 from ensureUser) rather than silently storing "".
+// Returns 404 (with Clerk's resource_not_found body) for any user not explicitly
+// registered via POST /test/set-clerk-user so that missing test setup fails loudly
+// (500 from ensureUser) rather than silently storing "".
+// The resource_not_found body matches Clerk's actual 404 format so checkOrgMembership
+// correctly treats the user as deleted (vs. treating it as an API error).
 app.get("/clerk-stub/users/:id", (req, res) => {
   const stub = _clerkUserStubs.get(req.params.id);
   if (stub) {
     res.json(stub);
   } else {
-    res.status(404).json({ error: "not_found", message: `No stub registered for Clerk user ${req.params.id}` });
+    res.status(404).json({
+      errors: [{ code: "resource_not_found", message: `No stub registered for Clerk user ${req.params.id}` }],
+    });
   }
 });
 
@@ -937,13 +984,80 @@ app.get("/clerk-stub/users/:id", (req, res) => {
 // Well-known test orgs return deterministic human-readable names so ensureOrg()
 // doesn't overwrite the seeded "Org Alpha" / "Org Beta" names with the clerk_org_* ID.
 // Additional entries can be registered at runtime via POST /test/set-clerk-org-name.
+//
+// Per-org error overrides (registered via POST /test/set-clerk-org-error) let tests
+// simulate 401/403/429/500 and 404-without-resource_not_found responses.
 const _knownOrgNames: Map<string, { name: string; slug: string }> = new Map([
   ["clerk_org_aaa", { name: "Org Alpha", slug: "org-alpha" }],
   ["clerk_org_bbb", { name: "Org Beta",  slug: "org-beta"  }],
 ]);
+
+interface ClerkOrgError {
+  httpStatus: number;  // e.g. 401, 429, 500; 404 → 404 WITHOUT resource_not_found
+  message?: string;
+}
+// Per-org error overrides: httpStatus → error response (not a confirmed deletion).
+// 404 overrides intentionally omit resource_not_found so callers treat it as an error.
+const _clerkOrgErrors: Map<string, ClerkOrgError> = new Map();
+
+// Orgs marked as "deleted in Clerk" (returns 404 + resource_not_found on GET).
+// Set via POST /test/set-clerk-org-deleted { clerkOrgId }.
+const _clerkOrgsDeletedInClerk: Set<string> = new Set();
+
 app.get("/clerk-stub/organizations/:id", (req, res) => {
-  const known = _knownOrgNames.get(req.params.id);
-  res.json({ id: req.params.id, name: known?.name ?? req.params.id, slug: known?.slug ?? req.params.id });
+  const orgId = req.params.id;
+
+  // Per-org error override (401, 429, 500, or 404-without-resource_not_found)
+  const errorOverride = _clerkOrgErrors.get(orgId);
+  if (errorOverride) {
+    if (errorOverride.httpStatus === 404) {
+      // 404 without resource_not_found — caller treats as error, not orphaned
+      res.status(404).json({ errors: [{ code: "some_other_error", message: errorOverride.message ?? "not found" }] });
+    } else {
+      res.status(errorOverride.httpStatus).json({ errors: [{ code: "api_error", message: errorOverride.message ?? "error" }] });
+    }
+    return;
+  }
+
+  // Orgs explicitly marked deleted in Clerk → 404 + resource_not_found → orphaned
+  if (_clerkOrgsDeletedInClerk.has(orgId)) {
+    res.status(404).json({ errors: [{ code: "resource_not_found", message: "Organization not found" }] });
+    return;
+  }
+
+  const known = _knownOrgNames.get(orgId);
+  res.json({ id: orgId, name: known?.name ?? orgId, slug: known?.slug ?? orgId });
+});
+
+// POST /test/set-clerk-org-error { clerkOrgId, httpStatus, message? }
+// Makes GET /clerk-stub/organizations/:id return a non-200 error response.
+// httpStatus=404 returns a 404 WITHOUT resource_not_found (treated as error, not orphaned).
+// Pass httpStatus=0 to remove the override (back to 200).
+app.post("/test/set-clerk-org-error", (req, res) => {
+  const { clerkOrgId, httpStatus, message } = req.body as { clerkOrgId?: string; httpStatus?: number; message?: string };
+  if (!clerkOrgId || httpStatus === undefined) {
+    res.status(400).json({ error: "clerkOrgId and httpStatus required" }); return;
+  }
+  if (httpStatus === 0) {
+    _clerkOrgErrors.delete(clerkOrgId);
+  } else {
+    _clerkOrgErrors.set(clerkOrgId, { httpStatus, message });
+  }
+  res.json({ ok: true });
+});
+
+// POST /test/set-clerk-org-deleted { clerkOrgId, deleted: bool }
+// Marks an org as deleted in Clerk (GET returns 404 + resource_not_found → orphaned).
+// Pass deleted: false to restore 200 behavior.
+app.post("/test/set-clerk-org-deleted", (req, res) => {
+  const { clerkOrgId, deleted } = req.body as { clerkOrgId?: string; deleted?: boolean };
+  if (!clerkOrgId) { res.status(400).json({ error: "clerkOrgId required" }); return; }
+  if (deleted === false) {
+    _clerkOrgsDeletedInClerk.delete(clerkOrgId);
+  } else {
+    _clerkOrgsDeletedInClerk.add(clerkOrgId);
+  }
+  res.json({ ok: true });
 });
 
 // POST /test/set-clerk-org-name { clerkOrgId, name, slug? }
