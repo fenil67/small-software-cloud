@@ -3,6 +3,11 @@ import { auth, clerkClient } from "@clerk/nextjs/server";
 import { parseTheme } from "../../../lib/theme";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
 import { WorkspaceDeleteSection } from "./WorkspaceDeleteSection";
+import { ProfileSection } from "./ProfileSection";
+import { EmailSection } from "./EmailSection";
+import { ConnectedAccountsSection } from "./ConnectedAccountsSection";
+import { ActiveSessionsSection } from "./ActiveSessionsSection";
+import { DeleteAccountSection } from "./DeleteAccountSection";
 
 export const dynamic = "force-dynamic";
 
@@ -31,6 +36,19 @@ export default async function SettingsPage() {
         </h1>
       </header>
 
+      {/* 1. Profile */}
+      <ProfileSection />
+
+      {/* 2. Email addresses */}
+      <EmailSection />
+
+      {/* 3. Connected accounts */}
+      <ConnectedAccountsSection />
+
+      {/* 4. Active sessions */}
+      <ActiveSessionsSection />
+
+      {/* 5. Appearance */}
       <section aria-labelledby="appearance-h" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
         <h2 id="appearance-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
           Appearance
@@ -38,7 +56,11 @@ export default async function SettingsPage() {
         <ThemeSwitch initialTheme={initialTheme} />
       </section>
 
+      {/* 6. Workspace danger zone (admins only) */}
       {isAdmin && orgName && <WorkspaceDeleteSection orgName={orgName} />}
+
+      {/* 7. Delete account */}
+      <DeleteAccountSection />
     </div>
   );
 }

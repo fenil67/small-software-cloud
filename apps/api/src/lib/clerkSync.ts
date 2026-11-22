@@ -115,6 +115,18 @@ export async function deleteClerkOrg(clerkOrgId: string): Promise<void> {
 }
 
 /**
+ * Deletes a Clerk user via the Clerk backend API.
+ * Throws on network or API errors — callers should catch and decide whether
+ * to surface clerk_deleted: false or surface the error.
+ */
+export async function deleteClerkUser(clerkUserId: string): Promise<void> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  await axios.delete(`${clerkApiBase()}/users/${clerkUserId}`, {
+    headers: { Authorization: `Bearer ${clerkKey}` },
+  });
+}
+
+/**
  * Fetches the current display name of a Clerk organization.
  * Returns null on any error (network, 404, etc.) — callers should treat null as a 503.
  */

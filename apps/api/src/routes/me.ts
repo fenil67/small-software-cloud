@@ -11,7 +11,10 @@ import { asyncHandler } from "../lib/asyncHandler";
 import { pool } from "../db";
 import { isAdminId } from "./admin";
 import { normalizeAppUrl } from "../lib/appUrl";
-import { getUserOrgIds } from "../lib/clerkSync";
+import { getUserOrgIds, deleteClerkUser, deleteClerkOrg } from "../lib/clerkSync";
+import { deleteWorkspaceData, destroyWorkspaceFlyApps } from "../lib/workspaceDelete";
+import { deleteUserData } from "../lib/userDelete";
+import { safeErr } from "../lib/safeErr";
 
 export const meRouter = Router();
 meRouter.use(requireAuth);
@@ -152,5 +155,140 @@ meRouter.get(
     }));
 
     res.json(result);
+  }),
+);
+
+// ── DELETE /v1/me ─────────────────────────────────────────────────────────────
+//
+// Deletes the authenticated user's account.
+//
+// Auth: Clerk session only. API key → 403 (clerk_session_required).
+// Body: { confirm_email: string }  — must equal the user's primary email (else 400).
+//
+// Safety checks (all checked before any mutation):
+//   - User is sole admin of a workspace that has other members → 409 with workspace list.
+//     The user must make someone else admin first.
+//
+// Cleanup order:
+//   1. For each workspace where this user is the ONLY member:
+//      deleteWorkspaceData + deleteClerkOrg (async Fly cleanup post-commit).
+//   2. deleteUserData (revoke API keys, null FKs, delete user row + activity event).
+//   3. Delete Clerk user via backend API.
+// Returns 200.  Web must sign out and redirect to /sign-in.
+
+meRouter.delete(
+  "/",
+  asyncHandler(async (req: Request, res: Response) => {
+    if (req.sscAuth?.type !== "clerk") {
+      res.status(403).json({ error: "clerk_session_required" });
+      return;
+    }
+
+    const clerkUserId = req.sscAuth.clerkUserId!;
+
+    // Look up internal user record
+    const { rows: userRows } = await pool.query<{ id: string; email: string }>(
+      "SELECT id, email FROM users WHERE clerk_user_id = $1 LIMIT 1",
+      [clerkUserId],
+    );
+    if (!userRows[0]) {
+      res.status(404).json({ error: "user_not_found" });
+      return;
+    }
+    const internalUserId = userRows[0].id;
+    const userEmail = userRows[0].email;
+
+    // Confirm email must match
+    const body = req.body as Record<string, unknown>;
+    const confirmEmail = typeof body.confirm_email === "string" ? body.confirm_email.trim().toLowerCase() : "";
+    if (!confirmEmail || confirmEmail !== userEmail.toLowerCase()) {
+      res.status(400).json({ error: "email_mismatch" });
+      return;
+    }
+
+    // ── Safety check: sole-admin-with-other-members → 409 ──────────────────
+    // A workspace is blocked if this user is the only admin/owner AND other
+    // members exist.  We block before touching anything.
+    const { rows: blockedOrgs } = await pool.query<{ id: string; name: string }>(
+      `SELECT o.id, o.name
+       FROM orgs o
+       WHERE o.deleted_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM org_members om
+           WHERE om.org_id = o.id AND om.user_id = $1 AND om.role IN ('owner', 'admin')
+         )
+         AND EXISTS (
+           SELECT 1 FROM org_members om2
+           WHERE om2.org_id = o.id AND om2.user_id != $1
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM org_members om3
+           WHERE om3.org_id = o.id AND om3.user_id != $1 AND om3.role IN ('owner', 'admin')
+         )`,
+      [internalUserId],
+    );
+    if (blockedOrgs.length > 0) {
+      res.status(409).json({
+        error: "sole_admin_blocked",
+        message: "You are the only admin of one or more workspaces that have other members. Make someone else admin first.",
+        workspaces: blockedOrgs.map((o) => ({ id: o.id, name: o.name })),
+      });
+      return;
+    }
+
+    // ── Find sole-member workspaces to delete ──────────────────────────────
+    const { rows: soleOrgs } = await pool.query<{ id: string; clerk_org_id: string }>(
+      `SELECT o.id, o.clerk_org_id
+       FROM orgs o
+       WHERE o.deleted_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM org_members om WHERE om.org_id = o.id AND om.user_id = $1
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM org_members om2 WHERE om2.org_id = o.id AND om2.user_id != $1
+         )`,
+      [internalUserId],
+    );
+
+    // ── Clean sole-member workspaces ──────────────────────────────────────
+    const flyAppIds: Array<{ ids: string[]; orgId: string }> = [];
+    for (const org of soleOrgs) {
+      const result = await deleteWorkspaceData(org.id, {
+        userId: internalUserId,
+        email: userEmail,
+        requestId: `workspace.deleted:${org.id}`,
+      });
+      flyAppIds.push({ ids: result.fly_app_ids, orgId: org.id });
+
+      // Best-effort: delete the Clerk org.  Failure does not abort user deletion.
+      try {
+        await deleteClerkOrg(org.clerk_org_id);
+      } catch (err) {
+        console.error(`[me] Clerk org delete failed for org ${org.id.slice(0, 8)}…:`, safeErr(err));
+      }
+    }
+
+    // Post-commit Fly cleanup (fire-and-forget, never throws)
+    for (const { ids, orgId } of flyAppIds) {
+      destroyWorkspaceFlyApps(ids, orgId).catch(() => {});
+    }
+
+    // ── Delete user data (keys, FK nulls, user row, activity event) ────────
+    await deleteUserData(internalUserId, {
+      clerkUserId,
+      email: userEmail,
+      requestId: `user.account_deleted:${internalUserId}`,
+    });
+
+    // ── Delete Clerk user via backend API ───────────────────────────────────
+    let clerkDeleted = false;
+    try {
+      await deleteClerkUser(clerkUserId);
+      clerkDeleted = true;
+    } catch (err) {
+      console.error(`[me] Clerk user delete failed for ${clerkUserId.slice(0, 8)}…:`, safeErr(err));
+    }
+
+    res.json({ deleted: true, clerk_deleted: clerkDeleted });
   }),
 );

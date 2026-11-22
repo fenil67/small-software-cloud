@@ -77,6 +77,8 @@ vi.mock("@clerk/nextjs", () => ({
     signOut: mockSignOut,
     get session() { return { lastActiveOrganizationId: _mockSessionOrgId }; },
   })),
+  useSession: vi.fn(() => ({ session: null })),
+  useSessionList: vi.fn(() => ({ sessions: [], isLoaded: true })),
 }));
 
 vi.mock("next/image", () => ({

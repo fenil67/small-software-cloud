@@ -1072,6 +1072,28 @@ app.post("/test/set-clerk-org-name", (req, res) => {
   res.json({ ok: true, clerkOrgId, name });
 });
 
+// DELETE /clerk-stub/users/:id — fake Clerk DELETE /v1/users/:id
+// Succeeds by default. Configured to fail via POST /test/set-clerk-delete-user-fail.
+let _clerkDeleteUserFailMode = false;
+const _clerkDeletedUsers: Set<string> = new Set();
+app.delete("/clerk-stub/users/:id", (req, res) => {
+  if (_clerkDeleteUserFailMode) {
+    res.status(500).json({ error: "simulated clerk delete user error" }); return;
+  }
+  _clerkDeletedUsers.add(req.params.id);
+  res.status(200).json({ deleted: true });
+});
+
+app.post("/test/set-clerk-delete-user-fail", (req, res) => {
+  _clerkDeleteUserFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, clerkDeleteUserFailMode: _clerkDeleteUserFailMode });
+});
+
+app.get("/test/get-clerk-deleted-users", (_req, res) => {
+  res.json({ users: Array.from(_clerkDeletedUsers) });
+  _clerkDeletedUsers.clear();
+});
+
 // DELETE /clerk-stub/organizations/:id — fake Clerk DELETE /v1/organizations/:id
 // Succeeds by default. Configured to fail via POST /test/set-clerk-delete-org-fail.
 let _clerkDeleteOrgFailMode = false;

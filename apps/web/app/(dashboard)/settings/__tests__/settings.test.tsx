@@ -10,13 +10,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
+// vi.mock("@clerk/nextjs", …) is hoisted before all imports, so this gets the mock.
+import { useUser as clerkUseUser } from "@clerk/nextjs";
 
 // ── Mock Clerk client hooks ───────────────────────────────────────────────────
 
 const mockSetActive = vi.fn();
+const mockSignOut   = vi.fn();
 
 vi.mock("@clerk/nextjs", () => ({
-  useClerk: vi.fn(() => ({ setActive: mockSetActive })),
+  useClerk: vi.fn(() => ({ setActive: mockSetActive, signOut: mockSignOut })),
   useOrganization: vi.fn(() => ({ organization: { id: "current-org-id" } })),
   useOrganizationList: vi.fn(() => ({
     userMemberships: {
@@ -27,8 +30,10 @@ vi.mock("@clerk/nextjs", () => ({
       ],
     },
   })),
-  useUser: vi.fn(() => ({ user: null })),
+  useUser: vi.fn(() => ({ user: null, isLoaded: false })),
   useAuth: vi.fn(() => ({ getToken: vi.fn().mockResolvedValue("test-token") })),
+  useSession: vi.fn(() => ({ session: null })),
+  useSessionList: vi.fn(() => ({ sessions: [], isLoaded: true })),
 }));
 
 vi.mock("@clerk/nextjs/server", () => ({
@@ -63,11 +68,34 @@ vi.mock("next/navigation", () => ({
 // ── Mock server actions ───────────────────────────────────────────────────────
 
 const mockFetchDeletePreview = vi.fn();
-const mockDeleteWorkspace = vi.fn();
+const mockDeleteWorkspace    = vi.fn();
+const mockDeleteAccount      = vi.fn();
 
 vi.mock("../actions", () => ({
   fetchDeletePreview: (...args: unknown[]) => mockFetchDeletePreview(...args),
-  deleteWorkspace: (...args: unknown[]) => mockDeleteWorkspace(...args),
+  deleteWorkspace:    (...args: unknown[]) => mockDeleteWorkspace(...args),
+  deleteAccount:      (...args: unknown[]) => mockDeleteAccount(...args),
+}));
+
+vi.mock("../../../../components/auth/CodeStep", () => ({
+  CodeStep: ({ email, code, onChange, onSubmit, loading, submitLabel }: {
+    email: string;
+    code: string;
+    onChange: (v: string) => void;
+    onSubmit: () => void;
+    loading?: boolean;
+    submitLabel?: string;
+  }) => React.createElement(
+    "div",
+    null,
+    React.createElement("span", null, `code-step:${email}`),
+    React.createElement("input", {
+      "data-testid": "code-input",
+      value: code,
+      onChange: (e: React.ChangeEvent<HTMLInputElement>) => onChange(e.target.value),
+    }),
+    React.createElement("button", { onClick: onSubmit, disabled: loading }, submitLabel ?? "Verify"),
+  ),
 }));
 
 vi.mock("../../../../lib/api", () => ({
@@ -92,11 +120,13 @@ vi.mock("../../../../lib/navigate", () => ({
 
 beforeEach(() => {
   mockSetActive.mockReset();
+  mockSignOut.mockReset();
   mockPush.mockReset();
   mockFetchDeletePreview.mockReset();
   mockDeleteWorkspace.mockReset();
+  mockDeleteAccount.mockReset();
   mockNavigateHard.mockReset();
-  vi.restoreAllMocks();
+  (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: null, isLoaded: false });
 });
 
 afterEach(() => {
@@ -447,5 +477,365 @@ describe("SettingsPage admin guard", () => {
     // orgName must be the Clerk display name — NOT the slug
     expect(html).toContain("My Organization");
     expect(html).not.toContain("my-organization-abc123");
+  });
+});
+
+// ── ProfileSection ────────────────────────────────────────────────────────────
+
+import { ProfileSection } from "../ProfileSection";
+
+const mockUserUpdate = vi.fn();
+const mockSetProfileImage = vi.fn();
+
+function makeProfileUser(overrides?: Partial<Record<string, unknown>>) {
+  return {
+    id: "user_1",
+    firstName: "Jane",
+    lastName: "Doe",
+    username: "janedoe",
+    imageUrl: "https://img.clerk.com/test.jpg",
+    hasImage: true,
+    emailAddresses: [{ id: "ea1", emailAddress: "jane@test.com", verification: { status: "verified" } }],
+    update: mockUserUpdate,
+    setProfileImage: mockSetProfileImage,
+    ...overrides,
+  };
+}
+
+describe("ProfileSection", () => {
+  it("renders with current profile values", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    render(<ProfileSection />);
+    expect((screen.getByLabelText(/first name/i) as HTMLInputElement).value).toBe("Jane");
+    expect((screen.getByLabelText(/last name/i) as HTMLInputElement).value).toBe("Doe");
+  });
+
+  it("Save button disabled until a field changes", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    render(<ProfileSection />);
+    const btn = screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("Save button enabled after changing first name", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/first name/i), { target: { value: "Janet" } });
+    const btn = screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("maps Clerk username-taken error to plain message", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    mockUserUpdate.mockRejectedValueOnce({
+      errors: [{ message: "That username is already taken. Please choose another." }],
+    });
+    render(<ProfileSection />);
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "taken" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert.textContent).toContain("already taken");
+      expect(alert.textContent).not.toContain("Please choose another");
+    });
+  });
+
+  it("rejects non-image file with plain error message", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    render(<ProfileSection />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const pdfFile = new File(["content"], "doc.pdf", { type: "application/pdf" });
+    Object.defineProperty(fileInput, "files", { value: [pdfFile], writable: false });
+    fireEvent.change(fileInput);
+    expect(screen.getByRole("alert").textContent).toContain("image file");
+  });
+
+  it("rejects file over 10 MB with plain error message", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeProfileUser(), isLoaded: true });
+    render(<ProfileSection />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const bigFile = new File([new ArrayBuffer(11 * 1024 * 1024)], "big.jpg", { type: "image/jpeg" });
+    Object.defineProperty(fileInput, "files", { value: [bigFile], writable: false });
+    fireEvent.change(fileInput);
+    expect(screen.getByRole("alert").textContent).toContain("10 MB");
+  });
+});
+
+// ── EmailSection ──────────────────────────────────────────────────────────────
+
+import { EmailSection } from "../EmailSection";
+
+const mockEmailDestroy      = vi.fn();
+const mockEmailMakePrimary  = vi.fn();
+
+function makeEmailUser(opts?: { emails?: unknown[]; primaryId?: string }) {
+  const emails = opts?.emails ?? [
+    {
+      id: "ea_primary",
+      emailAddress: "primary@test.com",
+      verification: { status: "verified" },
+      destroy: mockEmailDestroy,
+      prepareVerification: vi.fn().mockResolvedValue(undefined),
+      attemptVerification: vi.fn().mockResolvedValue(undefined),
+      makeDefaultPrimary: mockEmailMakePrimary,
+    },
+    {
+      id: "ea_other",
+      emailAddress: "other@test.com",
+      verification: { status: "verified" },
+      destroy: mockEmailDestroy,
+      prepareVerification: vi.fn().mockResolvedValue(undefined),
+      attemptVerification: vi.fn().mockResolvedValue(undefined),
+      makeDefaultPrimary: mockEmailMakePrimary,
+    },
+  ];
+  return {
+    id: "user_1",
+    emailAddresses: emails,
+    primaryEmailAddressId: opts?.primaryId ?? "ea_primary",
+    createEmailAddress: vi.fn().mockResolvedValue({
+      emailAddress: "new@test.com",
+      prepareVerification: vi.fn().mockResolvedValue(undefined),
+      attemptVerification: vi.fn().mockResolvedValue(undefined),
+    }),
+    update: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+describe("EmailSection", () => {
+  it("renders email list with Primary and Verified badges", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeEmailUser(), isLoaded: true });
+    render(<EmailSection />);
+    expect(screen.getByText("primary@test.com")).toBeDefined();
+    expect(screen.getByText("other@test.com")).toBeDefined();
+    expect(screen.getByText("Primary")).toBeDefined();
+  });
+
+  it("cannot remove primary email (M-ME-primary kill: remove guard → remove button shown → test fails)", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeEmailUser(), isLoaded: true });
+    render(<EmailSection />);
+    // Primary email row should NOT have a Remove button
+    const primaryRow = screen.getByText("primary@test.com").closest("div")!.parentElement!;
+    const removeButtons = Array.from(primaryRow.querySelectorAll("button")).filter(
+      (b) => b.textContent?.toLowerCase().includes("remove"),
+    );
+    expect(removeButtons).toHaveLength(0);
+  });
+
+  it("cannot remove the only email", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: makeEmailUser({
+        emails: [{
+          id: "ea_only",
+          emailAddress: "only@test.com",
+          verification: { status: "verified" },
+          destroy: mockEmailDestroy,
+          prepareVerification: vi.fn().mockResolvedValue(undefined),
+          attemptVerification: vi.fn().mockResolvedValue(undefined),
+          makeDefaultPrimary: mockEmailMakePrimary,
+        }],
+        primaryId: "ea_only",
+      }),
+      isLoaded: true,
+    });
+    render(<EmailSection />);
+    const removeButtons = screen.queryAllByText("Remove");
+    expect(removeButtons).toHaveLength(0);
+  });
+
+  it("non-primary verified email shows Make primary and Remove buttons", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeEmailUser(), isLoaded: true });
+    render(<EmailSection />);
+    expect(screen.getByRole("button", { name: /make other@test.com primary/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /remove other@test.com/i })).toBeDefined();
+  });
+});
+
+// ── ConnectedAccountsSection ──────────────────────────────────────────────────
+
+import { ConnectedAccountsSection } from "../ConnectedAccountsSection";
+
+const mockExtDestroy = vi.fn();
+
+function makeConnectedUser(opts?: {
+  externalAccounts?: unknown[];
+  verifiedEmails?: number;
+}) {
+  const verifiedEmails = opts?.verifiedEmails ?? 1;
+  return {
+    id: "user_1",
+    externalAccounts: opts?.externalAccounts ?? [
+      {
+        id: "ext_google",
+        provider: "google",
+        emailAddress: "user@gmail.com",
+        destroy: mockExtDestroy,
+      },
+    ],
+    emailAddresses: Array.from({ length: verifiedEmails }, (_, i) => ({
+      id: `ea_${i}`,
+      emailAddress: `user${i}@test.com`,
+      verification: { status: "verified" },
+    })),
+    createExternalAccount: vi.fn().mockResolvedValue({
+      verification: { externalVerificationRedirectURL: null },
+    }),
+  };
+}
+
+describe("ConnectedAccountsSection", () => {
+  it("renders Google and GitHub rows", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeConnectedUser(), isLoaded: true });
+    render(<ConnectedAccountsSection />);
+    expect(screen.getByText("Google")).toBeDefined();
+    expect(screen.getByText("GitHub")).toBeDefined();
+  });
+
+  it("connected account shows Disconnect button", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeConnectedUser(), isLoaded: true });
+    render(<ConnectedAccountsSection />);
+    expect(screen.getByRole("button", { name: /disconnect.*google/i })).toBeDefined();
+  });
+
+  it("cannot disconnect last sign-in method (M-ME-lastmethod kill: remove guard → button enabled → test fails)", () => {
+    // User has ONLY Google connected and NO verified emails → Google is the last sign-in method
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: makeConnectedUser({ verifiedEmails: 0 }),
+      isLoaded: true,
+    });
+    render(<ConnectedAccountsSection />);
+    const disconnectBtn = screen.getByRole("button", { name: /disconnect.*google/i }) as HTMLButtonElement;
+    expect(disconnectBtn.disabled).toBe(true);
+  });
+
+  it("can disconnect when another sign-in method exists", () => {
+    // User has Google + a verified email → can disconnect Google
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: makeConnectedUser({ verifiedEmails: 1 }),
+      isLoaded: true,
+    });
+    render(<ConnectedAccountsSection />);
+    const disconnectBtn = screen.getByRole("button", { name: /disconnect.*google/i }) as HTMLButtonElement;
+    expect(disconnectBtn.disabled).toBe(false);
+  });
+
+  it("unconnected provider shows Connect button", () => {
+    // No external accounts → both Google and GitHub show Connect
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: makeConnectedUser({ externalAccounts: [], verifiedEmails: 1 }),
+      isLoaded: true,
+    });
+    render(<ConnectedAccountsSection />);
+    const connectBtns = screen.getAllByRole("button", { name: /^connect$/i });
+    expect(connectBtns.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ── DeleteAccountSection ──────────────────────────────────────────────────────
+
+import { DeleteAccountSection } from "../DeleteAccountSection";
+
+const PRIMARY_EMAIL = "owner@test.com";
+
+function makeDeleteUser() {
+  return {
+    id: "user_del",
+    primaryEmailAddress: { emailAddress: PRIMARY_EMAIL },
+    isLoaded: true,
+  };
+}
+
+describe("DeleteAccountSection", () => {
+  it("renders delete account button", () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    render(<DeleteAccountSection />);
+    expect(screen.getByRole("button", { name: /delete account/i })).toBeDefined();
+  });
+
+  it("dialog opens on click", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    render(<DeleteAccountSection />);
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+    expect(screen.getByRole("dialog").textContent).toContain(PRIMARY_EMAIL);
+  });
+
+  it("delete button disabled until email matches (M-confirm kill: remove guard → always enabled → fails)", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    render(<DeleteAccountSection />);
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    const dialog = screen.getByRole("dialog");
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete account"),
+    ) as HTMLButtonElement;
+    expect(submitBtn.disabled).toBe(true);
+
+    fireEvent.change(screen.getByPlaceholderText(PRIMARY_EMAIL), { target: { value: "wrong@test.com" } });
+    expect(submitBtn.disabled).toBe(true);
+
+    fireEvent.change(screen.getByPlaceholderText(PRIMARY_EMAIL), { target: { value: PRIMARY_EMAIL } });
+    expect(submitBtn.disabled).toBe(false);
+  });
+
+  it("calls deleteAccount with confirm email and navigates to /sign-in on success", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    mockDeleteAccount.mockResolvedValue({});
+    render(<DeleteAccountSection />);
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    fireEvent.change(screen.getByPlaceholderText(PRIMARY_EMAIL), { target: { value: PRIMARY_EMAIL } });
+    const dialog = screen.getByRole("dialog");
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete account"),
+    ) as HTMLButtonElement;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => expect(mockDeleteAccount).toHaveBeenCalledWith(PRIMARY_EMAIL));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/sign-in"));
+  });
+
+  it("shows sole_admin_blocked list when API returns 409", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    mockDeleteAccount.mockResolvedValue({
+      error: "sole_admin_blocked",
+      blocked: {
+        error: "sole_admin_blocked",
+        message: "Make someone else admin first.",
+        workspaces: [{ id: "ws1", name: "Acme Corp" }],
+      },
+    });
+    render(<DeleteAccountSection />);
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    fireEvent.change(screen.getByPlaceholderText(PRIMARY_EMAIL), { target: { value: PRIMARY_EMAIL } });
+    const dialog = screen.getByRole("dialog");
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Delete account"),
+    ) as HTMLButtonElement;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert.textContent).toContain("Acme Corp");
+    });
+  });
+
+  it("cancel button closes dialog", async () => {
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({ user: makeDeleteUser(), isLoaded: true });
+    render(<DeleteAccountSection />);
+    fireEvent.click(screen.getByRole("button", { name: /delete account/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+
+    const dialog = screen.getByRole("dialog");
+    const cancelBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Cancel",
+    ) as HTMLButtonElement;
+    fireEvent.click(cancelBtn);
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });
