@@ -137,7 +137,7 @@ beforeEach(() => {
   mockRouterReplace.mockReset();
   mockRedirect.mockReset();
   _mockSessionOrgId = "org_aaa";
-  mockServerAuth.mockReset().mockResolvedValue({ userId: "user_test", orgId: "org_test" });
+  mockServerAuth.mockReset().mockResolvedValue({ userId: "user_test", orgId: "org_test", getToken: vi.fn().mockResolvedValue(null) });
   mockCurrentUser.mockReset().mockResolvedValue({ firstName: null });
   mockCookies.mockReset().mockResolvedValue({ get: () => undefined });
   mockSetActive.mockReset().mockResolvedValue(undefined);

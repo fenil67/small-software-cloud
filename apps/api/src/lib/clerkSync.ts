@@ -191,6 +191,159 @@ export async function getUserOrgIds(clerkUserId: string): Promise<string[] | nul
   }
 }
 
+// ── Org membership and invitation helpers ─────────────────────────────────────
+
+export interface ClerkOrgMember {
+  userId: string;
+  role: string;
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  joinedAt: string;
+}
+
+/** Fetches all current members of a Clerk org (paginates until done). */
+export async function listOrgMembersAll(clerkOrgId: string): Promise<ClerkOrgMember[]> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  const base = clerkApiBase();
+  const limit = 100;
+  const all: ClerkOrgMember[] = [];
+  let offset = 0;
+  while (true) {
+    const { data } = await axios.get(`${base}/organizations/${clerkOrgId}/memberships`, {
+      params: { limit, offset },
+      headers: { Authorization: `Bearer ${clerkKey}` },
+    });
+    const page = ((data as { data?: unknown[] }).data ?? []) as Array<{
+      role: string;
+      created_at: number;
+      public_user_data: {
+        user_id: string;
+        identifier: string;
+        first_name: string | null;
+        last_name: string | null;
+      };
+    }>;
+    for (const m of page) {
+      all.push({
+        userId: m.public_user_data.user_id,
+        role: m.role,
+        email: m.public_user_data.identifier,
+        firstName: m.public_user_data.first_name ?? null,
+        lastName: m.public_user_data.last_name ?? null,
+        joinedAt: new Date(m.created_at).toISOString(),
+      });
+    }
+    if (page.length < limit) break;
+    offset += limit;
+  }
+  return all;
+}
+
+export interface ClerkOrgInvitation {
+  id: string;
+  emailAddress: string;
+  role: string;
+  createdAt: string;
+}
+
+/** Fetches all pending invitations for a Clerk org (paginates until done). */
+export async function listOrgInvitationsAll(clerkOrgId: string): Promise<ClerkOrgInvitation[]> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  const base = clerkApiBase();
+  const limit = 100;
+  const all: ClerkOrgInvitation[] = [];
+  let offset = 0;
+  while (true) {
+    const { data } = await axios.get(`${base}/organizations/${clerkOrgId}/invitations`, {
+      params: { status: "pending", limit, offset },
+      headers: { Authorization: `Bearer ${clerkKey}` },
+    });
+    const page = ((data as { data?: unknown[] }).data ?? []) as Array<{
+      id: string;
+      email_address: string;
+      role: string;
+      created_at: number;
+    }>;
+    for (const inv of page) {
+      all.push({
+        id: inv.id,
+        emailAddress: inv.email_address,
+        role: inv.role,
+        createdAt: new Date(inv.created_at).toISOString(),
+      });
+    }
+    if (page.length < limit) break;
+    offset += limit;
+  }
+  return all;
+}
+
+/** Creates a Clerk org invitation. Throws on API error. */
+export async function createOrgInvitationClerk(
+  clerkOrgId: string,
+  email: string,
+  role: string,
+  redirectUrl: string,
+): Promise<{ id: string }> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  const { data } = await axios.post(
+    `${clerkApiBase()}/organizations/${clerkOrgId}/invitations`,
+    { email_address: email, role, redirect_url: redirectUrl },
+    { headers: { Authorization: `Bearer ${clerkKey}` } },
+  );
+  return { id: (data as { id: string }).id };
+}
+
+/** Revokes a pending Clerk org invitation. Throws on API error. */
+export async function revokeOrgInvitationClerk(
+  clerkOrgId: string,
+  invitationId: string,
+): Promise<void> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  await axios.post(
+    `${clerkApiBase()}/organizations/${clerkOrgId}/invitations/${invitationId}/revoke`,
+    {},
+    { headers: { Authorization: `Bearer ${clerkKey}` } },
+  );
+}
+
+/** Updates a member's role in a Clerk org. Throws on API error. */
+export async function updateOrgMemberRoleClerk(
+  clerkOrgId: string,
+  userId: string,
+  role: string,
+): Promise<void> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  await axios.patch(
+    `${clerkApiBase()}/organizations/${clerkOrgId}/memberships/${userId}`,
+    { role },
+    { headers: { Authorization: `Bearer ${clerkKey}` } },
+  );
+}
+
+/** Removes a member from a Clerk org. Throws on API error. */
+export async function removeOrgMemberClerk(
+  clerkOrgId: string,
+  userId: string,
+): Promise<void> {
+  const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
+  await axios.delete(
+    `${clerkApiBase()}/organizations/${clerkOrgId}/memberships/${userId}`,
+    { headers: { Authorization: `Bearer ${clerkKey}` } },
+  );
+}
+
+/**
+ * Returns the count of org:admin members in a Clerk org.
+ * Fetches the first page (limit=1) and uses total_count if the API supports
+ * role filtering; otherwise falls back to listing all members client-side.
+ */
+export async function countOrgAdmins(clerkOrgId: string): Promise<number> {
+  const members = await listOrgMembersAll(clerkOrgId);
+  return members.filter((m) => m.role === "org:admin").length;
+}
+
 export async function ensureOrg(clerkOrgId: string): Promise<string> {
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
 

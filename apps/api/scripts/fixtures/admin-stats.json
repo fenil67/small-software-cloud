@@ -1,6 +1,6 @@
 {
-  "people": 25,
-  "people_joined_this_week": 25,
+  "people": 24,
+  "people_joined_this_week": 24,
   "workspaces": 1,
   "workspaces_with_teammates": 1,
   "apps": {
@@ -18,11 +18,6 @@
   "discord_configured": true,
   "email_sending_configured": true,
   "deploy_series": [
-    {
-      "date": "2026-11-09",
-      "succeeded": 0,
-      "failed": 0
-    },
     {
       "date": "2026-11-10",
       "succeeded": 0,
@@ -85,6 +80,11 @@
     },
     {
       "date": "2026-11-22",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-23",
       "succeeded": 1,
       "failed": 2
     }

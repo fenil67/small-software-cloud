@@ -58,6 +58,12 @@ export const ActivityEventType = {
   WORKSPACE_DELETED:        "workspace.deleted",
 
   USER_ACCOUNT_DELETED:     "user.account_deleted",
+
+  MEMBER_INVITED:           "member.invited",
+  MEMBER_INVITATION_REVOKED: "member.invitation_revoked",
+  MEMBER_ROLE_CHANGED:      "member.role_changed",
+  MEMBER_REMOVED:           "member.removed",
+  MEMBER_LEFT:              "member.left",
 } as const;
 
 export type ActivityEventTypeValue = (typeof ActivityEventType)[keyof typeof ActivityEventType];

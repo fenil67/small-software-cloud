@@ -185,3 +185,24 @@ export interface ActivitySummaryItem {
   count_24h: number;
   count_7d: number;
 }
+
+export interface WorkspaceMember {
+  userId: string;
+  role: string;
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  joinedAt: string;
+}
+
+export interface WorkspaceInvitation {
+  id: string;
+  emailAddress: string;
+  role: string;
+  createdAt: string;
+}
+
+export interface WorkspaceMembersResponse {
+  members: WorkspaceMember[];
+  invitations: WorkspaceInvitation[];
+}
