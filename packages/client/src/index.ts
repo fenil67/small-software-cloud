@@ -5,6 +5,8 @@ export type { SscConfig } from "./config";
 export type {
   App,
   Deployment,
+  DeploymentSummary,
+  BuildLog,
   DeployStatus,
   IntakeResponse,
   DeployOptions,

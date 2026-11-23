@@ -4,7 +4,7 @@ import { requireScope } from "../middleware/requireScope";
 import { pool } from "../db";
 import { destroyFlyApp } from "../services/flyClient";
 import { asyncHandler } from "../lib/asyncHandler";
-import { safeErr } from "../lib/safeErr";
+import { safeErr, scrubSecrets } from "../lib/safeErr";
 import { ensureOrg } from "../lib/clerkSync";
 import { ActivityEventType, recordActivityInTx } from "../lib/activityLog";
 
@@ -97,6 +97,47 @@ appsRouter.get("/:id/deployments", requireScope("read"), asyncHandler(async (req
     [req.params.id],
   );
   res.json(rows);
+}));
+
+// GET /v1/apps/:id/deployments/:deploymentId/logs — build log for a deployment
+// Access: workspace members only (Clerk org or API key with read scope).
+// Users who are only in app_access (shared viewers) have no org claim, so
+// getOrgId() returns null or mismatches the app's org_id — both → 404.
+// Suspended apps: logs are still visible (they document the last deploy).
+appsRouter.get("/:id/deployments/:deploymentId/logs", requireScope("read"), asyncHandler(async (req: Request, res: Response) => {
+  const orgId = await getOrgId(req);
+  if (!orgId) { res.status(400).json({ error: "no_active_org" }); return; }
+
+  // Verify app belongs to this org (deleted apps → 404)
+  const appCheck = await pool.query<{ id: string }>(
+    "SELECT id FROM apps WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    [req.params.id, orgId],
+  );
+  if (!appCheck.rows[0]) { res.status(404).json({ error: "app_not_found" }); return; }
+
+  // Verify deployment belongs to this app (prevents cross-app ID guessing)
+  const depCheck = await pool.query<{ id: string }>(
+    "SELECT id FROM deployments WHERE id = $1 AND app_id = $2",
+    [req.params.deploymentId, req.params.id],
+  );
+  if (!depCheck.rows[0]) { res.status(404).json({ error: "deployment_not_found" }); return; }
+
+  const { rows } = await pool.query<{ content: string; truncated: boolean; created_at: string }>(
+    "SELECT content, truncated, created_at FROM deployment_build_logs WHERE deployment_id = $1",
+    [req.params.deploymentId],
+  );
+  if (rows.length === 0) {
+    res.status(404).json({ error: "logs_not_found" });
+    return;
+  }
+
+  res.json({
+    // scrubSecrets again at read time as defence-in-depth (content is already
+    // scrubbed line-by-line before storage, but this is a no-cost safety net).
+    content: scrubSecrets(rows[0].content),
+    truncated: rows[0].truncated,
+    created_at: rows[0].created_at,
+  });
 }));
 
 // DELETE /v1/apps/:id

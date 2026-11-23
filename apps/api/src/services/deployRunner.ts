@@ -17,6 +17,7 @@ import { detectAppType } from "./appDetector";
 import { generateDeployFiles, sniffExposePort } from "./dockerfileGen";
 import { issueProxyToken } from "../lib/proxyCredentials";
 import { ActivityEventType, recordActivity } from "../lib/activityLog";
+import { saveBuildLog } from "../lib/buildLogs";
 
 const execFileP = promisify(execFile);
 
@@ -391,6 +392,21 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
   let workDir: string | null = null;
   let orgId: string | null = args.orgId ?? null; // captured in Step 3 for orphan recording
 
+  // Collect log events for build log persistence.
+  const _buildLogLines: string[] = [];
+  const _logEmitter = eventBus.getOrCreate(deploymentId);
+  const _collectLog = (event: unknown) => {
+    if (
+      event !== null && typeof event === "object" &&
+      "type" in event &&
+      (event as { type: string }).type === "log" &&
+      "message" in event
+    ) {
+      _buildLogLines.push((event as { type: string; message: string }).message);
+    }
+  };
+  _logEmitter.on("event", _collectLog);
+
   // Best-effort: record deploy.started
   recordActivity({
     eventType: ActivityEventType.DEPLOY_STARTED,
@@ -667,6 +683,11 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       console.error("[deploy] unexpected:", safeErr(err));
     }
   } finally {
+    _logEmitter.off("event", _collectLog);
+    // Best-effort: persist the build log (already scrubbed line-by-line in runFlyctlDeploy).
+    await saveBuildLog(deploymentId, _buildLogLines).catch((e) =>
+      console.error("[deploy] failed to save build log:", safeErr(e)),
+    );
     if (workDir) {
       fs.rm(workDir, { recursive: true, force: true }, () => {});
     }

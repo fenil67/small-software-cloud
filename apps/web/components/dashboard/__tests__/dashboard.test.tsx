@@ -47,6 +47,7 @@ vi.mock("next/headers", () => ({
 const mockSetActive = vi.fn();
 const mockSignOut = vi.fn();
 const mockCreateOrganization = vi.fn();
+const mockGetToken = vi.fn().mockResolvedValue("test-token");
 // _mockSessionOrgId is read by the useClerk().session getter — update it in tests
 // to simulate clerk.session (SignedInSessionResource.lastActiveOrganizationId) changing.
 let _mockSessionOrgId: string | null = "org_aaa";
@@ -82,6 +83,7 @@ vi.mock("@clerk/nextjs", () => ({
   useReverification: vi.fn((fetcher: (...args: unknown[]) => Promise<unknown>) => {
     return async (...args: unknown[]) => fetcher(...args);
   }),
+  useAuth: vi.fn(() => ({ getToken: mockGetToken })),
 }));
 
 vi.mock("next/image", () => ({
@@ -147,6 +149,7 @@ beforeEach(() => {
   mockCreateKey.mockReset();
   mockRevokeKey.mockReset().mockResolvedValue({});
   mockApiFetch.mockReset().mockResolvedValue([]);
+  mockGetToken.mockReset().mockResolvedValue("test-token");
   mockCreateOrganization.mockReset();
   if (typeof localStorage !== "undefined" && typeof localStorage.clear === "function") localStorage.clear();
   if (typeof sessionStorage !== "undefined" && typeof sessionStorage.clear === "function") sessionStorage.clear();
@@ -675,6 +678,7 @@ describe("DeploymentRow – failure_message XSS (Security 2c)", () => {
   it("<script> renders as text, not executed", () => {
     const { container } = render(
       <DeploymentRow
+        appId="app-test"
         deployment={{ ...failedDep, failure_message: "<script>alert('xss')</script>" }}
         isLatest={false}
       />,
@@ -689,6 +693,7 @@ describe("DeploymentRow – failure_message XSS (Security 2c)", () => {
   it("<img onerror> renders as text, not as an image", () => {
     const { container } = render(
       <DeploymentRow
+        appId="app-test"
         deployment={{ ...failedDep, failure_message: "<img src=x onerror=alert(1)>" }}
         isLatest={false}
       />,
@@ -703,7 +708,7 @@ describe("DeploymentRow – failure_message XSS (Security 2c)", () => {
   it("failure_message truncated to 500 chars", () => {
     const longMsg = "y".repeat(600);
     const { container } = render(
-      <DeploymentRow deployment={{ ...failedDep, failure_message: longMsg }} isLatest={false} />,
+      <DeploymentRow appId="app-test" deployment={{ ...failedDep, failure_message: longMsg }} isLatest={false} />,
     );
     const pre = container.querySelector("pre");
     expect(pre).not.toBeNull();
@@ -712,7 +717,7 @@ describe("DeploymentRow – failure_message XSS (Security 2c)", () => {
 
   it("null failure_message shows no details element", () => {
     const { container } = render(
-      <DeploymentRow deployment={{ ...failedDep, failure_message: null }} isLatest={false} />,
+      <DeploymentRow appId="app-test" deployment={{ ...failedDep, failure_message: null }} isLatest={false} />,
     );
     expect(container.querySelector("details")).toBeNull();
   });
@@ -1131,7 +1136,7 @@ describe("Contract: deployments fixture shape", () => {
   it("DeploymentRow renders with real fixture data", () => {
     const dep = (deploymentsFixture as unknown as DeploymentType[])[0];
     if (!dep) return; // empty fixture is acceptable (non-empty ensured by API test AQ1)
-    render(<DeploymentRow deployment={dep} isLatest={true} />);
+    render(<DeploymentRow appId="app-fixture" deployment={dep} isLatest={true} />);
     expect(document.body).toBeInTheDocument(); // render did not throw
   });
 });
@@ -1417,6 +1422,114 @@ describe("AppsPage – no_active_org redirect", () => {
     const result = await AppsPage();
     expect(mockRedirect).not.toHaveBeenCalledWith("/onboarding");
     expect(JSON.stringify(result)).toContain("could not load");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BuildLogDialog
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { BuildLogDialog } from "../../../app/(dashboard)/apps/[id]/BuildLogDialog";
+
+describe("BuildLogDialog", () => {
+  const mockOnClose = vi.fn();
+  const defaultProps = {
+    appId: "app-1",
+    deploymentId: "dep-1",
+    version: 3,
+    onClose: mockOnClose,
+  };
+
+  beforeEach(() => {
+    mockOnClose.mockReset();
+    // Mock fetch for log requests
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ content: "Build output here\nDone.", truncated: false }),
+    }));
+    // Mock clipboard
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("shows dialog with title", () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText(/Build log — v3/)).toBeInTheDocument();
+  });
+
+  it("shows loading state initially", () => {
+    // Make fetch pend forever
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    render(<BuildLogDialog {...defaultProps} />);
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
+  });
+
+  it("renders log content after fetch", async () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Build output here/)).toBeInTheDocument();
+    });
+  });
+
+  it("shows error when fetch returns 404", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: () => Promise.resolve({ error: "logs_not_found" }),
+    }));
+    render(<BuildLogDialog {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+    expect(screen.getByRole("alert").textContent).toMatch(/No build log available/);
+  });
+
+  it("shows truncation notice when truncated=true", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ content: "partial log", truncated: true }),
+    }));
+    render(<BuildLogDialog {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByText(/truncated/i)).toBeInTheDocument();
+    });
+  });
+
+  it("copy button is present after load and copies content", async () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /copy/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /copy/i }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Build output here\nDone.");
+  });
+
+  it("download button is present after load", async () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /download/i })).toBeInTheDocument();
+    });
+  });
+
+  it("close button calls onClose", () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+    expect(mockOnClose).toHaveBeenCalledOnce();
+  });
+
+  it("clicking backdrop calls onClose", () => {
+    render(<BuildLogDialog {...defaultProps} />);
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(dialog);
+    expect(mockOnClose).toHaveBeenCalledOnce();
   });
 });
 

@@ -1,5 +1,5 @@
 import { auth } from "@clerk/nextjs/server";
-import type { AppAccessResponse, Deployment, App } from "./api-types";
+import type { AppAccessResponse, Deployment, App, BuildLog } from "./api-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
@@ -57,4 +57,10 @@ export function isApp(val: unknown): val is App {
   if (val === null || typeof val !== "object") return false;
   const v = val as Record<string, unknown>;
   return typeof v.id === "string" && typeof v.name === "string";
+}
+
+export function isBuildLog(val: unknown): val is BuildLog {
+  if (val === null || typeof val !== "object") return false;
+  const v = val as Record<string, unknown>;
+  return typeof v.content === "string" && typeof v.truncated === "boolean";
 }

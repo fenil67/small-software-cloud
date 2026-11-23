@@ -28,6 +28,9 @@ export function scrubSecrets(s: string): string {
   // "Bearer <token>" — covers Authorization headers, query params, etc.
   out = out.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
 
+  // "FlyV1 <token>" — Fly.io org tokens sent without a "Bearer " prefix
+  out = out.replace(/FlyV1\s+\S+/g, "FlyV1 [REDACTED]");
+
   // "Authorization: <value>" or "Authorization=<value>"
   out = out.replace(/(Authorization\s*[:=]\s*)([^\s,}"'\]]+)/gi, "$1[REDACTED]");
 

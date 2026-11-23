@@ -16,6 +16,8 @@ import { zipDirectory } from "./zip";
 import type {
   App,
   Deployment,
+  DeploymentSummary,
+  BuildLog,
   IntakeResponse,
   DeployOptions,
   DeployEvent,
@@ -135,6 +137,30 @@ export class SscClient {
           ...(derivedName ? { app_name: derivedName } : {}),
         },
       );
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  // ─── Logs ─────────────────────────────────────────────────────────────────
+
+  /** List the last 50 deployments for an app, newest first. */
+  async listDeployments(appId: string): Promise<DeploymentSummary[]> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<DeploymentSummary[]>(`/v1/apps/${appId}/deployments`);
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  /** Fetch the build log for a specific deployment. */
+  async getBuildLog(appId: string, deploymentId: string): Promise<BuildLog> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<BuildLog>(`/v1/apps/${appId}/deployments/${deploymentId}/logs`);
       return data;
     } catch (err) {
       throw new Error(extractErrorMessage(err));

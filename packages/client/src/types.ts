@@ -34,6 +34,24 @@ export interface Deployment {
   stream_url: string;
 }
 
+/** Summary returned by GET /v1/apps/:id/deployments (last 50, newest first). */
+export interface DeploymentSummary {
+  id: string;
+  status: DeployStatus;
+  version: number;
+  started_at: string | null;
+  finished_at: string | null;
+  failure_stage: string | null;
+  failure_message: string | null;
+}
+
+/** Build log returned by GET /v1/apps/:id/deployments/:deploymentId/logs. */
+export interface BuildLog {
+  content: string;
+  truncated: boolean;
+  created_at: string;
+}
+
 export interface IntakeResponse {
   deployment_id: string;
   app_id: string;
