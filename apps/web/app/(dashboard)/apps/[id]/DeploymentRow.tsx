@@ -1,13 +1,22 @@
+"use client";
+
+import { useState } from "react";
 import type { Deployment } from "../../../../lib/api-types";
 import { deploymentFailureTitle } from "../../../../lib/status";
+import { BuildLogDialog } from "./BuildLogDialog";
 
 interface Props {
+  appId: string;
   deployment: Deployment;
   isLatest: boolean;
 }
 
-export function DeploymentRow({ deployment: d, isLatest }: Props) {
+const TERMINAL = new Set(["success", "failed", "cancelled"]);
+
+export function DeploymentRow({ appId, deployment: d, isLatest }: Props) {
   const isFailed = d.status === "failed";
+  const hasLog = TERMINAL.has(d.status);
+  const [showLog, setShowLog] = useState(false);
 
   return (
     <div
@@ -32,6 +41,24 @@ export function DeploymentRow({ deployment: d, isLatest }: Props) {
           )}
         </span>
         <span style={{ flex: 1 }} />
+        {hasLog && (
+          <button
+            type="button"
+            onClick={() => setShowLog(true)}
+            style={{
+              height: "24px",
+              padding: "0 8px",
+              borderRadius: "6px",
+              border: "1px solid var(--line-strong)",
+              background: "transparent",
+              color: "var(--fg-2)",
+              fontSize: "12px",
+              cursor: "pointer",
+            }}
+          >
+            View logs
+          </button>
+        )}
         {d.finished_at && (
           <span style={{ fontSize: "12px", color: "var(--fg-3)" }}>
             {formatRelative(d.finished_at)}
@@ -71,6 +98,15 @@ export function DeploymentRow({ deployment: d, isLatest }: Props) {
             </details>
           )}
         </div>
+      )}
+
+      {showLog && (
+        <BuildLogDialog
+          appId={appId}
+          deploymentId={d.id}
+          version={d.version}
+          onClose={() => setShowLog(false)}
+        />
       )}
     </div>
   );

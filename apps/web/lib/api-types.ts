@@ -208,3 +208,9 @@ export interface WorkspaceMembersResponse {
   members: WorkspaceMember[];
   invitations: WorkspaceInvitation[];
 }
+
+export interface BuildLog {
+  content: string;
+  truncated: boolean;
+  created_at: string;
+}

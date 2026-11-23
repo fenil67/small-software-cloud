@@ -74,6 +74,18 @@ export async function reapOrphanedFlyApps(): Promise<number> {
   return destroyed;
 }
 
+/** Delete build logs older than 30 days. */
+export async function reapOldBuildLogs(): Promise<number> {
+  const { rowCount } = await pool.query(
+    `DELETE FROM deployment_build_logs WHERE created_at < now() - INTERVAL '30 days'`,
+  );
+  const count = rowCount ?? 0;
+  if (count > 0) {
+    console.log(`[reaper] deleted ${count} old build log(s)`);
+  }
+  return count;
+}
+
 /** Delete proxy_codes rows whose expires_at is more than 1 hour in the past. */
 export async function reapExpiredProxyCodes(): Promise<number> {
   const { rowCount } = await pool.query(
@@ -163,6 +175,9 @@ export function startReaper(): void {
   reapExpiredProxyCodes().catch((err) =>
     console.error("[reaper] proxy-codes boot run failed:", safeErr(err)),
   );
+  reapOldBuildLogs().catch((err) =>
+    console.error("[reaper] build-logs boot run failed:", safeErr(err)),
+  );
   setInterval(() => {
     reapStalledDeployments().catch((err) =>
       console.error("[reaper] interval run failed:", safeErr(err)),
@@ -172,6 +187,9 @@ export function startReaper(): void {
     );
     reapExpiredProxyCodes().catch((err) =>
       console.error("[reaper] proxy-codes interval run failed:", safeErr(err)),
+    );
+    reapOldBuildLogs().catch((err) =>
+      console.error("[reaper] build-logs interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
 

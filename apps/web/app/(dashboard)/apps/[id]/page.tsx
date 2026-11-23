@@ -144,7 +144,7 @@ export default async function AppDetailPage({ params }: PageProps) {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
               {deployments.map((d, i) => (
-                <DeploymentRow key={d.id} deployment={d} isLatest={i === 0} />
+                <DeploymentRow key={d.id} appId={app.id} deployment={d} isLatest={i === 0} />
               ))}
             </div>
           )}

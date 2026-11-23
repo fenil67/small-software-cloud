@@ -74,7 +74,7 @@ import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
 // apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
-import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs } from "../src/lib/reaper";
 import { runReconcile, ClerkOrgCheck } from "../src/lib/reconcile";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
@@ -918,6 +918,39 @@ app.post("/test/run-email-outbox", async (_req, res) => {
   try {
     const sent = await runEmailOutboxSender();
     res.json({ ok: true, sent });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /test/set-build-log { deployment_id, content, truncated? }
+// Inserts (or replaces) a build log row directly — used by BL tests to seed
+// log content, including content with fake secrets to test scrubbing at read time.
+app.post("/test/set-build-log", async (req, res) => {
+  const { deployment_id, content, truncated = false } = req.body as {
+    deployment_id: string;
+    content: string;
+    truncated?: boolean;
+  };
+  try {
+    await pool.query(
+      `INSERT INTO deployment_build_logs (deployment_id, content, truncated)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (deployment_id) DO UPDATE
+         SET content = EXCLUDED.content, truncated = EXCLUDED.truncated`,
+      [deployment_id, content, truncated],
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /test/run-reap-build-logs — runs one build-log reaper pass synchronously
+app.post("/test/run-reap-build-logs", async (_req, res) => {
+  try {
+    const deleted = await reapOldBuildLogs();
+    res.json({ ok: true, deleted });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

@@ -15246,6 +15246,282 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // BL: Build Logs — storage, scrubbing, truncation, access control, reaper
+  //
+  // Mutation guards (run .bak mutations in the report to prove each one kills a test):
+  //   BL-M1: remove scrubSecrets() in GET handler → BL-3 (fake token in response)
+  //   BL-M2: remove org_id check in app lookup → BL-5/BL-6 (orgB gets 200)
+  //   BL-M3: remove app_id check in deployment lookup → BL-11 (cross-app 200)
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("BL: Build Logs");
+
+    // ── Seed ──────────────────────────────────────────────────────────────────
+    // Org A — the workspace that owns the app
+    const blOrgId = (await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('org_bl_test_a', 'BL Org A', 'bl-org-a')
+       ON CONFLICT (clerk_org_id) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+    )).rows[0].id;
+
+    // Org B — a different workspace used in access-control tests
+    const blOrgIdB = (await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('org_bl_test_b', 'BL Org B', 'bl-org-b')
+       ON CONFLICT (clerk_org_id) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+    )).rows[0].id;
+
+    // User B (shared viewer — has app_access but not in org A)
+    await pool.query(
+      `INSERT INTO users (clerk_user_id, email) VALUES ('user_bl_b', 'bl-b@test.local')
+       ON CONFLICT (clerk_user_id) DO NOTHING`,
+    );
+    const blUserBId = (await pool.query<{ id: string }>(
+      "SELECT id FROM users WHERE clerk_user_id = 'user_bl_b'",
+    )).rows[0].id;
+
+    // API keys
+    const blKeyReadData    = generateApiKey();
+    const blKeyNoScopeData = generateApiKey();
+    const blKeyBData       = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (key_prefix, key_hash, org_id, name, scopes)
+       VALUES ($1, $2, $3, 'bl-read',    ARRAY['read']::text[]),
+              ($4, $5, $3, 'bl-noscope', ARRAY[]::text[])`,
+      [blKeyReadData.keyPrefix, blKeyReadData.keyHash, blOrgId,
+       blKeyNoScopeData.keyPrefix, blKeyNoScopeData.keyHash],
+    );
+    await pool.query(
+      `INSERT INTO api_keys (key_prefix, key_hash, org_id, name, scopes)
+       VALUES ($1, $2, $3, 'bl-b-read', ARRAY['read']::text[])`,
+      [blKeyBData.keyPrefix, blKeyBData.keyHash, blOrgIdB],
+    );
+    const blReadHeaders    = { Authorization: `Bearer ${blKeyReadData.fullKey}` };
+    const blNoScopeHeaders = { Authorization: `Bearer ${blKeyNoScopeData.fullKey}` };
+    const blReadHeadersB   = { Authorization: `Bearer ${blKeyBData.fullKey}` };
+
+    // App and deployment for org A
+    const blAppId = (await pool.query<{ id: string }>(
+      `INSERT INTO apps (name, slug, org_id, source_type) VALUES ('bl-app', 'bl-app', $1, 'zip') RETURNING id`,
+      [blOrgId],
+    )).rows[0].id;
+    const blDepId = (await pool.query<{ id: string }>(
+      `INSERT INTO deployments (app_id, status, version, started_at, finished_at)
+       VALUES ($1, 'success', 1, now(), now()) RETURNING id`,
+      [blAppId],
+    )).rows[0].id;
+
+    // Seed the build log for the deployment
+    await request("POST", "/test/set-build-log", {
+      body: { deployment_id: blDepId, content: "Building image…\nDeploy complete." },
+    });
+
+    // ── BL-1: GET build log returns stored content ────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeaders,
+      });
+      r.status === 200
+        ? ok("BL-1: GET /deployments/:id/logs → 200")
+        : fail("BL-1: expected 200", String(r.status));
+      const body = r.body as { content?: string; truncated?: boolean; created_at?: string };
+      body.content?.includes("Deploy complete.")
+        ? ok("BL-1: content includes expected deploy output")
+        : fail("BL-1: content missing expected line", String(body.content?.slice(0, 100)));
+      body.truncated === false
+        ? ok("BL-1: truncated=false for small log")
+        : fail("BL-1: expected truncated=false", String(body.truncated));
+      typeof body.created_at === "string"
+        ? ok("BL-1: created_at present")
+        : fail("BL-1: created_at missing", JSON.stringify(body));
+    }
+
+    // ── BL-2: 404 when no log exists (in-progress deploy) ────────────────────
+    {
+      const depId2 = (await pool.query<{ id: string }>(
+        `INSERT INTO deployments (app_id, status, version, started_at)
+         VALUES ($1, 'building', 2, now()) RETURNING id`,
+        [blAppId],
+      )).rows[0].id;
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${depId2}/logs`, {
+        headers: blReadHeaders,
+      });
+      r.status === 404
+        ? ok("BL-2: no log yet → 404 logs_not_found")
+        : fail("BL-2: expected 404", String(r.status));
+      (r.body as { error?: string }).error === "logs_not_found"
+        ? ok("BL-2: error code logs_not_found")
+        : fail("BL-2: wrong error code", String((r.body as { error?: string }).error));
+    }
+
+    // ── BL-3: scrubbing — fake Fly token in stored content is redacted (BL-M1 killer) ──
+    {
+      const fakeToken = "FlyV1 fm2_fakesecrettokenvalue123456";
+      await request("POST", "/test/set-build-log", {
+        body: {
+          deployment_id: blDepId,
+          content: `Authenticating with token ${fakeToken}\nDeploy complete.`,
+        },
+      });
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeaders,
+      });
+      const body = r.body as { content?: string };
+      !body.content?.includes("fm2_fakesecrettokenvalue123456")
+        ? ok("BL-3: fake Fly token scrubbed from response (M1 killer)")
+        : fail("BL-3: fake token leaked in response — scrubbing missing", "token present");
+      body.content?.includes("[REDACTED]")
+        ? ok("BL-3: [REDACTED] marker present")
+        : fail("BL-3: [REDACTED] marker missing", String(body.content?.slice(0, 200)));
+      // Restore clean log
+      await request("POST", "/test/set-build-log", {
+        body: { deployment_id: blDepId, content: "Building image…\nDeploy complete." },
+      });
+    }
+
+    // ── BL-4: truncated flag is preserved ────────────────────────────────────
+    {
+      await request("POST", "/test/set-build-log", {
+        body: { deployment_id: blDepId, content: "big log", truncated: true },
+      });
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeaders,
+      });
+      (r.body as { truncated?: boolean }).truncated === true
+        ? ok("BL-4: truncated=true returned when log was truncated")
+        : fail("BL-4: expected truncated=true", String((r.body as { truncated?: boolean }).truncated));
+      // Restore
+      await request("POST", "/test/set-build-log", {
+        body: { deployment_id: blDepId, content: "Building image…\nDeploy complete." },
+      });
+    }
+
+    // ── BL-5: shared viewer denied — orgB user has app_access but different org (BL-M2 killer) ──
+    {
+      await pool.query(
+        `INSERT INTO app_access (app_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [blAppId, blUserBId],
+      );
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeadersB,
+      });
+      r.status === 404
+        ? ok("BL-5: orgB user with app_access denied → 404 (M2 killer)")
+        : fail("BL-5: expected 404 for shared viewer", String(r.status));
+      await pool.query(
+        "DELETE FROM app_access WHERE app_id = $1 AND user_id = $2",
+        [blAppId, blUserBId],
+      );
+    }
+
+    // ── BL-6: other workspace with no app_access → 404 (BL-M2 killer) ────────
+    {
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeadersB,
+      });
+      r.status === 404
+        ? ok("BL-6: other workspace → 404 (M2 killer)")
+        : fail("BL-6: expected 404 for other workspace", String(r.status));
+    }
+
+    // ── BL-7: read-scope key → 200 ────────────────────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeaders,
+      });
+      r.status === 200
+        ? ok("BL-7: read-scope key → 200")
+        : fail("BL-7: expected 200 for read-scope key", String(r.status));
+    }
+
+    // ── BL-8: no-scope key → 403 ─────────────────────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blNoScopeHeaders,
+      });
+      r.status === 403
+        ? ok("BL-8: no-scope key → 403")
+        : fail("BL-8: expected 403 for no-scope key", String(r.status));
+    }
+
+    // ── BL-9: suspended app — build logs still readable by workspace member ───
+    {
+      await pool.query("UPDATE apps SET suspended_at = now() WHERE id = $1", [blAppId]);
+      const r = await request("GET", `/v1/apps/${blAppId}/deployments/${blDepId}/logs`, {
+        headers: blReadHeaders,
+      });
+      r.status === 200
+        ? ok("BL-9: suspended app — build logs still readable")
+        : fail("BL-9: expected 200 for suspended app logs", String(r.status));
+      await pool.query("UPDATE apps SET suspended_at = NULL WHERE id = $1", [blAppId]);
+    }
+
+    // ── BL-10: reaper retention — logs older than 30 days are deleted ─────────
+    {
+      const depId3 = (await pool.query<{ id: string }>(
+        `INSERT INTO deployments (app_id, status, version, started_at, finished_at)
+         VALUES ($1, 'success', 3, now(), now()) RETURNING id`,
+        [blAppId],
+      )).rows[0].id;
+      await pool.query(
+        `INSERT INTO deployment_build_logs (deployment_id, content, truncated, created_at)
+         VALUES ($1, 'old log', false, now() - INTERVAL '31 days')`,
+        [depId3],
+      );
+      const beforeCount = (await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM deployment_build_logs WHERE deployment_id = $1",
+        [depId3],
+      )).rows[0].count;
+      const r = await request("POST", "/test/run-reap-build-logs");
+      const afterCount = (await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM deployment_build_logs WHERE deployment_id = $1",
+        [depId3],
+      )).rows[0].count;
+      beforeCount === "1" && afterCount === "0"
+        ? ok("BL-10: reaper deleted log older than 30 days")
+        : fail("BL-10: reaper retention", `before=${beforeCount} after=${afterCount}`);
+      typeof (r.body as { deleted?: number }).deleted === "number"
+        ? ok("BL-10: reaper returned deleted count")
+        : fail("BL-10: reaper response missing deleted count", JSON.stringify(r.body));
+    }
+
+    // ── BL-11: deployment from different app → 404 (BL-M3 killer) ────────────
+    {
+      // App B in same org A — deployment B has a build log
+      const appIdB = (await pool.query<{ id: string }>(
+        `INSERT INTO apps (name, slug, org_id, source_type) VALUES ('bl-app-b', 'bl-app-b', $1, 'zip') RETURNING id`,
+        [blOrgId],
+      )).rows[0].id;
+      const depIdB = (await pool.query<{ id: string }>(
+        `INSERT INTO deployments (app_id, status, version, started_at, finished_at)
+         VALUES ($1, 'success', 1, now(), now()) RETURNING id`,
+        [appIdB],
+      )).rows[0].id;
+      await request("POST", "/test/set-build-log", {
+        body: { deployment_id: depIdB, content: "other app log" },
+      });
+      // Try to access appB's deployment via blAppId — must 404
+      const r = await request(
+        "GET", `/v1/apps/${blAppId}/deployments/${depIdB}/logs`,
+        { headers: blReadHeaders },
+      );
+      r.status === 404
+        ? ok("BL-11: deployment from different app → 404 (M3 killer)")
+        : fail("BL-11: expected 404", String(r.status));
+      (r.body as { error?: string }).error === "deployment_not_found"
+        ? ok("BL-11: error code deployment_not_found")
+        : fail("BL-11: wrong error code", String((r.body as { error?: string }).error));
+      await pool.query("DELETE FROM apps WHERE id = $1", [appIdB]);
+    }
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    await pool.query("DELETE FROM apps WHERE org_id IN ($1, $2)", [blOrgId, blOrgIdB]);
+    await pool.query("DELETE FROM api_keys WHERE org_id IN ($1, $2)", [blOrgId, blOrgIdB]);
+    await pool.query(
+      `DELETE FROM users WHERE clerk_user_id IN ('user_bl_b')`,
+    );
+    await pool.query("DELETE FROM orgs WHERE id IN ($1, $2)", [blOrgId, blOrgIdB]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

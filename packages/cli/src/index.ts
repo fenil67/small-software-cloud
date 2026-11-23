@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { login } from "./commands/login";
 import { deploy } from "./commands/deploy";
 import { status } from "./commands/status";
+import { logs } from "./commands/logs";
 import { share } from "./commands/share";
 import { unshare } from "./commands/unshare";
 import { listAppAccess } from "./commands/access";
@@ -40,6 +41,14 @@ program
   .description("Print the current status of a deployment (JSON)")
   .action(async (deploymentId: string) => {
     await status(deploymentId);
+  });
+
+// ─── logs ─────────────────────────────────────────────────────────────────────
+program
+  .command("logs <app-id>")
+  .description("Print the build log for the latest completed deployment")
+  .action(async (appId: string) => {
+    await logs(appId);
   });
 
 // ─── share ────────────────────────────────────────────────────────────────────
