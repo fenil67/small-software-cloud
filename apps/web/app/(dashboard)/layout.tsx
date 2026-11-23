@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
-import { Sidebar } from "../../components/dashboard/Sidebar";
+import { DashboardShell } from "../../components/dashboard/DashboardShell";
 import { apiFetch } from "../../lib/api";
 import type { MeResponse } from "../../lib/api-types";
 
@@ -20,9 +20,8 @@ export default async function DashboardLayout({ children }: { children: React.Re
   }
 
   return (
-    <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "var(--bg)" }}>
-      <Sidebar isAdmin={isAdmin} openAlertCount={openAlertCount} />
-      <main style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>{children}</main>
-    </div>
+    <DashboardShell isAdmin={isAdmin} openAlertCount={openAlertCount}>
+      {children}
+    </DashboardShell>
   );
 }

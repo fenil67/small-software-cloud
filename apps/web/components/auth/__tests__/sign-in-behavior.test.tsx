@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { useRouter } from "next/navigation";
-import { useSignIn } from "@clerk/nextjs";
+import { useSignIn, useUser, useClerk } from "@clerk/nextjs";
 import SignInPage from "../../../app/(auth)/sign-in/page";
 
 // ─── Module mocks ─────────────────────────────────────────────────────────────
@@ -23,8 +23,12 @@ vi.mock("next/navigation", () => ({
   useSearchParams: vi.fn(() => ({ get: () => null })),
 }));
 
+const mockSignOut = vi.fn();
+
 vi.mock("@clerk/nextjs", () => ({
   useSignIn: vi.fn(),
+  useUser: vi.fn(() => ({ user: null, isLoaded: true })),
+  useClerk: vi.fn(() => ({ signOut: mockSignOut })),
 }));
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -101,5 +105,37 @@ describe("BUG 3(b) – stale attempt is retried; user reaches code step on succe
     submitEmail();
     // First attempt fails → component retries automatically; second succeeds → code step
     await waitFor(() => expect(screen.getByText(/We sent a 6 digit code to/i)).toBeInTheDocument());
+  });
+});
+
+// ── already signed in → shows signed-in card ─────────────────────────────────
+
+describe("already signed in → shows signed-in card", () => {
+  beforeEach(() => {
+    vi.mocked(useRouter).mockReturnValue({ replace: vi.fn() } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSignIn).mockReturnValue(
+      makeSignIn(() => Promise.resolve({})) as unknown as ReturnType<typeof useSignIn>,
+    );
+    vi.mocked(useUser).mockReturnValue({
+      user: { primaryEmailAddress: { emailAddress: "user@test.com" } },
+      isLoaded: true,
+    } as unknown as ReturnType<typeof useUser>);
+  });
+
+  it("shows 'You're already signed in' card when user is signed in", () => {
+    render(<SignInPage />);
+    expect(screen.getByText(/you're already signed in/i)).toBeInTheDocument();
+  });
+
+  it("Continue to Utir link goes to /apps", () => {
+    render(<SignInPage />);
+    const link = screen.getByRole("link", { name: /continue to utir/i });
+    expect(link).toHaveAttribute("href", "/apps");
+  });
+
+  it("Sign out button calls signOut", () => {
+    render(<SignInPage />);
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+    expect(mockSignOut).toHaveBeenCalled();
   });
 });

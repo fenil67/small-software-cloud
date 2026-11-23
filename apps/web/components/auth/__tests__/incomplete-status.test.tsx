@@ -28,6 +28,8 @@ vi.mock("next/navigation", () => ({
 vi.mock("@clerk/nextjs", () => ({
   useSignUp: vi.fn(),
   useSignIn: vi.fn(),
+  useUser: vi.fn(() => ({ user: null, isLoaded: true })),
+  useClerk: vi.fn(() => ({ signOut: vi.fn() })),
 }));
 
 // ─── Page imports (lazy, after vi.mock is hoisted) ────────────────────────────

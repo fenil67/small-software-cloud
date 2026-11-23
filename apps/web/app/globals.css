@@ -161,3 +161,126 @@ body {
     display: block;
   }
 }
+
+/* ── Dashboard responsive layout ──────────────────────────────────────────── */
+
+/* Top bar: hidden on desktop, shown on mobile */
+.dashboard-topbar {
+  display: none;
+  align-items: center;
+  padding: 0 16px;
+  height: 56px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+/* Menu button */
+.dashboard-menu-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+.dashboard-menu-btn:hover { background: var(--surface-3); }
+
+/* Sidebar panel: desktop fixed strip, mobile off-canvas */
+.sidebar-panel {
+  flex-shrink: 0;
+}
+
+/* Backdrop: only shown on mobile when sidebar is open */
+.sidebar-backdrop {
+  display: none;
+}
+
+/* Page content max-width container */
+.page-container {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 0 24px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Settings-style form containers narrower and centered */
+.settings-container {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+/* Below 900px: collapse sidebar to mobile overlay */
+@media (max-width: 900px) {
+  .dashboard-topbar {
+    display: flex;
+  }
+
+  .sidebar-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 260px;
+    z-index: 200;
+    transform: translateX(-100%);
+    transition: transform 200ms ease;
+    background: var(--bg);
+    border-right: 1px solid var(--line);
+  }
+
+  .sidebar-panel--open {
+    transform: translateX(0);
+  }
+
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 199;
+  }
+}
+
+/* Below 600px: tables become stacked rows */
+@media (max-width: 600px) {
+  /* Responsive table rows */
+  .table-responsive table,
+  .table-responsive thead,
+  .table-responsive tbody,
+  .table-responsive th,
+  .table-responsive td,
+  .table-responsive tr {
+    display: block;
+  }
+  .table-responsive thead tr {
+    display: none; /* hide header row */
+  }
+  .table-responsive td {
+    padding-left: 50%;
+    position: relative;
+    border-bottom: none;
+  }
+  .table-responsive td::before {
+    content: attr(data-label);
+    position: absolute;
+    left: 8px;
+    font-weight: 600;
+    color: var(--fg-3);
+    font-size: 12px;
+  }
+
+  /* Dialogs / modals fit screen */
+  dialog, [role="dialog"] {
+    max-width: calc(100vw - 32px);
+    margin: auto 16px;
+  }
+
+  .page-container {
+    padding: 0 12px;
+  }
+}
