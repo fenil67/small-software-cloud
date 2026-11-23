@@ -1,5 +1,5 @@
 /**
- * accept-invite/page.tsx — new button-driven state machine tests.
+ * accept-invite/page.tsx — button-driven state machine tests.
  *
  * Key states:
  *   not signed in → shows "ready" state with Accept button
@@ -8,14 +8,18 @@
  * Root cause tests:
  *   - setActive called with both session + org (KEY FIX)
  *   - signed-in already-member navigates without accept()
+ *   - detection runs at most once even with unstable object identities (loop fix)
+ *   - wrong-account renders and stays (loop fix)
+ *   - 15s timeout shows error state
  *
  * Mutation targets:
  *   M1: skip membership check in finishSignIn → M-not-member test fails
  *   M2: remove org-match filter in detectSignedInState → wrong invitation accepted
+ *   M3 (loop): remove hasRun ref → detection runs multiple times
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 import AcceptInvitePage from "../page";
 
@@ -108,6 +112,7 @@ function mockSignedIn(overrides: Record<string, unknown> = {}) {
     isLoaded: true,
     isSignedIn: true,
     user: {
+      id: "user_test_id",
       reload: mockUserReload,
       getOrganizationMemberships: mockGetOrganizationMemberships,
       getOrganizationInvitations: mockGetOrganizationInvitations,
@@ -121,6 +126,7 @@ function mockSignedIn(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.useRealTimers();
   mockSetActive.mockResolvedValue(undefined);
   mockUserReload.mockResolvedValue(undefined);
   mockTicket.mockResolvedValue({ error: null });
@@ -130,6 +136,12 @@ beforeEach(() => {
   mockAccept.mockResolvedValue({});
   mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
   mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+  // Clear sessionStorage between tests so the storage guard doesn't interfere
+  if (typeof sessionStorage !== "undefined") sessionStorage.clear();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 // ── 1. Not signed in → shows Accept button ────────────────────────────────────
@@ -311,5 +323,162 @@ describe("wrong account: sign out button calls signOut", () => {
     const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
     fireEvent.click(signOutBtn);
     expect(mockSignOut).toHaveBeenCalled();
+  });
+});
+
+// ── 11. Loop fix: detection runs once even when isLoaded toggles ─────────────
+// Root cause: when setActive fires after detecting signed-in state, Clerk
+// briefly sets isLoaded false→true, re-triggering the effect and re-running
+// detection. The hasRun ref prevents re-entry.
+// Mutation M3 (remove the hasRun check): this test must fail.
+
+describe("loop fix: detection runs once even when isLoaded toggles false→true again", () => {
+  it("getOrganizationInvitations called exactly once after isLoaded toggles", async () => {
+    const mockAcceptInv = vi.fn().mockResolvedValue({});
+
+    // Start: not loaded
+    mockUseUser.mockReturnValue({ isLoaded: false, isSignedIn: false, user: null });
+    mockGetOrganizationInvitations.mockResolvedValue({
+      data: [{ accept: mockAcceptInv, publicOrganizationData: { id: "org_xyz" } }],
+    });
+
+    const { rerender } = render(<AcceptInvitePage />);
+
+    // Clerk loads: signed in with matching invitation
+    mockSignedIn();
+    rerender(<AcceptInvitePage />);
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+
+    // Simulate Clerk toggling isLoaded false→true (happens after setActive)
+    mockUseUser.mockReturnValue({ isLoaded: false, isSignedIn: false, user: null });
+    rerender(<AcceptInvitePage />);
+
+    mockSignedIn(); // back to signed-in
+    rerender(<AcceptInvitePage />); // isLoaded true again — without guard would re-run detection
+
+    // Detection must have run exactly once despite the isLoaded toggle
+    expect(mockGetOrganizationInvitations).toHaveBeenCalledTimes(1);
+    expect(mockNavigateHard).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── 12. Loop fix: wrong-account renders immediately and stays ─────────────────
+
+describe("loop fix: wrong-account renders and does not loop", () => {
+  it("shows wrong_account card and stays there (navigateHard not called)", async () => {
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+
+    // Detection should run exactly once — wrong-account does not trigger a loop
+    expect(mockGetOrganizationInvitations).toHaveBeenCalledTimes(1);
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 13. 15-second timeout shows error state ───────────────────────────────────
+
+describe("15-second timeout shows error state with code timeout", () => {
+  it("shows error with code 'timeout' after 15 seconds in init state", async () => {
+    // Signed in, but detection hangs indefinitely (promise never resolves)
+    mockUseUser.mockReturnValue({ isLoaded: true, isSignedIn: true, user: {
+      id: "u1",
+      reload: mockUserReload,
+      getOrganizationMemberships: mockGetOrganizationMemberships,
+      getOrganizationInvitations: vi.fn(() => new Promise(() => { /* never resolves */ })),
+      primaryEmailAddress: { emailAddress: "user@test.com" },
+    }});
+
+    vi.useFakeTimers();
+
+    render(<AcceptInvitePage />);
+
+    // Advance past the 15s timeout
+    await act(async () => {
+      vi.advanceTimersByTime(15001);
+    });
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText(/timeout/i)).toBeInTheDocument();
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 14. URL-strip: history.replaceState strips ticket params on mount ──────────
+// Root cause fix: without this, Clerk's router.refresh() after setActive
+// re-fetches the current URL with the ticket, triggering the Clerk handshake
+// redirect which breaks the RSC fetch (Safari loop).
+// Mutation: comment out the history.replaceState useEffect → replaceState not called → test fails.
+
+describe("URL-strip: ticket params removed from address bar on mount", () => {
+  it("calls history.replaceState and the resulting path has no ticket params", async () => {
+    // Spy before render so we capture the call
+    const replaceState = vi.spyOn(history, "replaceState");
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    // The mount effect must call replaceState (ticket is non-empty per useSearchParams mock)
+    await waitFor(() => expect(replaceState).toHaveBeenCalled());
+
+    // Every call must NOT include the sensitive params in the URL argument (3rd arg)
+    for (const call of replaceState.mock.calls) {
+      const url = String(call[2] ?? "");
+      expect(url).not.toContain("__clerk_ticket");
+      expect(url).not.toContain("__clerk_invitation_token");
+      expect(url).not.toContain("__clerk_status");
+    }
+
+    replaceState.mockRestore();
+  });
+});
+
+// ── 15. sessionStorage "done": reload → navigate without calling Clerk ─────────
+// If the ticket was already processed successfully (e.g. from a prior load),
+// the page should navigate directly to /apps without re-running any Clerk calls.
+// Mutation: remove the ssGet "done" check in the detection effect → Clerk is called → test fails.
+
+describe("sessionStorage done: reload navigates without calling Clerk", () => {
+  it("navigates to /apps without calling any Clerk API when sessionStorage has 'done'", async () => {
+    mockNotSignedIn();
+
+    // Pre-seed sessionStorage as if this ticket was already successfully processed
+    sessionStorage.setItem("accept-invite-v1:ticket_abc", "done");
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+
+    // No Clerk ticket or invitation calls should be made
+    expect(mockTicket).not.toHaveBeenCalled();
+    expect(mockGetOrganizationInvitations).not.toHaveBeenCalled();
+  });
+});
+
+// ── 16. sessionStorage error: reload → shows error without calling Clerk ───────
+// If this ticket previously failed, show the same error immediately on reload
+// without re-attempting the Clerk API (prevents hammering an expired ticket).
+// Mutation: remove the ssGet "error:" check in the detection effect → Clerk is called → test fails.
+
+describe("sessionStorage error: reload shows error without calling Clerk", () => {
+  it("shows error state without calling Clerk when sessionStorage has an error record", async () => {
+    mockNotSignedIn();
+
+    // Pre-seed sessionStorage with a prior failure for this ticket
+    sessionStorage.setItem("accept-invite-v1:ticket_abc", "error:invitation_expired");
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("expired");
+
+    // No Clerk calls made
+    expect(mockTicket).not.toHaveBeenCalled();
+    expect(mockGetOrganizationInvitations).not.toHaveBeenCalled();
+    expect(mockNavigateHard).not.toHaveBeenCalled();
   });
 });

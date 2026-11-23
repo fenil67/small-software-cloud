@@ -8,12 +8,15 @@ import { navigateHard } from "../../../lib/navigate";
 
 type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error";
 
+const SS_PREFIX = "accept-invite-v1:";
+
 function ticketErrorMsg(code: string): string {
   if (code === "invitation_expired") return "This invitation has expired. Ask a workspace admin to resend it.";
   if (code === "invitation_revoked") return "This invitation was revoked. Contact your workspace admin.";
   if (code === "invitation_already_accepted") return "This invitation was already accepted.";
   if (code === "not_allowed_access") return "This invitation is not valid for your account.";
   if (code === "missing_requirements") return "Additional information is required to complete sign-up.";
+  if (code === "timeout") return "The request timed out. Please try again or contact your workspace admin.";
   return "Could not accept the invitation. Please try again or contact your workspace admin.";
 }
 
@@ -23,8 +26,25 @@ function extractCode(err: unknown): string {
   return e.errors?.[0]?.code ?? "";
 }
 
+function ssGet(key: string): string | null {
+  try {
+    return typeof sessionStorage !== "undefined" ? sessionStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function ssSet(key: string, value: string): void {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.setItem(key, value);
+  } catch { /* private browsing */ }
+}
+
 export default function AcceptInvitePage() {
   const params = useSearchParams();
+  // Read once from searchParams. history.replaceState (called on mount) does
+  // not trigger a Next.js router update, so these values remain stable.
+  // Even if they became empty, hasRun.current prevents the effect from re-running.
   const ticket = params.get("__clerk_ticket") ?? params.get("__clerk_invitation_token") ?? "";
   const targetOrgId = params.get("org") ?? "";
 
@@ -32,10 +52,7 @@ export default function AcceptInvitePage() {
   const { signUp } = useSignUp();
   const { setActive, signOut } = useClerk();
   const { user, isLoaded } = useUser();
-  // Keep a ref so async callbacks always access the latest user object.
-  // Updating a ref during render is intentional here: we want async callbacks
-  // (checkMembership) to see the latest user value after setActive triggers a re-render,
-  // without needing to re-invoke the callback.
+  // Stable ref to latest user — read inside async callbacks to avoid stale closures.
   const userRef = useRef(user);
   // eslint-disable-next-line react-hooks/refs
   userRef.current = user;
@@ -45,15 +62,62 @@ export default function AcceptInvitePage() {
   const [errorCode, setErrorCode] = useState<string>("");
   const [userEmail, setUserEmail] = useState<string>("");
 
+  // Run-once guard: prevents the detection effect from firing again if Clerk
+  // briefly toggles isLoaded false→true after setActive (which would loop).
+  const hasRun = useRef(false);
+
+  // Navigate-once guard: prevents double navigation from async races.
+  const navigated = useRef(false);
+
+  function safeNavigate(path: string) {
+    if (navigated.current) return;
+    navigated.current = true;
+    navigateHard(path);
+  }
+
   function showError(msg: string, code = "") {
     setErrorMsg(msg);
     setErrorCode(code);
     setState("error");
+    // Record failure in sessionStorage so a reload doesn't re-run the ticket.
+    if (ticket) ssSet(SS_PREFIX + ticket, `error:${code}`);
   }
+
+  // Strip ticket/org params from the address bar immediately on mount — BEFORE
+  // any async work. This ensures that when Clerk's ClerkProvider calls
+  // router.refresh() after setActive, the RSC re-fetch sees a clean URL and
+  // does not trigger the Clerk handshake redirect loop.
+  useEffect(() => {
+    if (!ticket) return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete("__clerk_ticket");
+    url.searchParams.delete("__clerk_invitation_token");
+    url.searchParams.delete("__clerk_status");
+    url.searchParams.delete("org");
+    // Use pathname+search (relative) so this is safe in all environments.
+    history.replaceState(null, "", url.pathname + url.search);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 15-second hard timeout: if still in a pending state, show error.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setState((s) => {
+        if (s === "init" || s === "accepting") {
+          setErrorMsg(ticketErrorMsg("timeout"));
+          setErrorCode("timeout");
+          if (ticket) ssSet(SS_PREFIX + ticket, "error:timeout");
+          return "error";
+        }
+        return s;
+      });
+    }, 15000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * Check whether the current user is a member of targetOrgId.
-   * Activates the given session first so the user data reflects the new membership.
    * Uses userRef to pick up the latest user even if a re-render occurred after setActive.
    */
   async function checkMembership(sessionId: string | null): Promise<boolean> {
@@ -63,7 +127,6 @@ export default function AcceptInvitePage() {
     } catch {
       // setActive may fail if session is already active — still try to check below
     }
-    // After setActive, pick up the freshest user reference
     const currentUser = userRef.current;
     if (!currentUser) return false;
     try {
@@ -76,13 +139,13 @@ export default function AcceptInvitePage() {
   }
 
   async function detectSignedInState() {
-    if (!user) return;
+    const currentUser = userRef.current;
+    if (!currentUser) return;
     try {
-      const { data: invitations } = await user.getOrganizationInvitations({ status: "pending" });
+      const { data: invitations } = await currentUser.getOrganizationInvitations({ status: "pending" });
       const matching = invitations.find((inv) => inv.publicOrganizationData.id === targetOrgId);
 
       if (matching) {
-        // Accept the matching invitation
         try {
           await matching.accept();
         } catch (err) {
@@ -92,30 +155,31 @@ export default function AcceptInvitePage() {
             showError(ticketErrorMsg(code), code);
             return;
           }
-          // already accepted/member — navigate anyway
         }
         setState("done");
+        ssSet(SS_PREFIX + ticket, "done");
         try {
           await setActive({ organization: targetOrgId });
         } catch { /* non-fatal */ }
-        navigateHard("/apps");
+        safeNavigate("/apps");
         return;
       }
 
       // No pending invitation — check if already a member
-      const { data: memberships } = await user.getOrganizationMemberships();
+      const { data: memberships } = await currentUser.getOrganizationMemberships();
       const isMember = memberships.some((m) => m.organization.id === targetOrgId);
       if (isMember) {
         setState("done");
+        ssSet(SS_PREFIX + ticket, "done");
         try {
           await setActive({ organization: targetOrgId });
         } catch { /* non-fatal */ }
-        navigateHard("/apps");
+        safeNavigate("/apps");
         return;
       }
 
-      // Wrong account
-      setUserEmail(user.primaryEmailAddress?.emailAddress ?? "");
+      // Wrong account — show card immediately, do not loop
+      setUserEmail(currentUser.primaryEmailAddress?.emailAddress ?? "");
       setState("wrong_account");
     } catch {
       showError(ticketErrorMsg(""), "");
@@ -128,7 +192,8 @@ export default function AcceptInvitePage() {
       const isMember = await checkMembership(sessionId);
       if (isMember) {
         setState("done");
-        navigateHard("/apps");
+        ssSet(SS_PREFIX + ticket, "done");
+        safeNavigate("/apps");
       } else {
         const code = extractCode(error);
         console.error("[accept-invite]", code);
@@ -137,10 +202,11 @@ export default function AcceptInvitePage() {
       return;
     }
     setState("done");
+    ssSet(SS_PREFIX + ticket, "done");
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    navigateHard("/apps");
+    safeNavigate("/apps");
   }
 
   async function finishSignUp(sessionId: string | null) {
@@ -152,10 +218,11 @@ export default function AcceptInvitePage() {
       return;
     }
     setState("done");
+    ssSet(SS_PREFIX + ticket, "done");
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    navigateHard("/apps");
+    safeNavigate("/apps");
   }
 
   async function handleAccept() {
@@ -199,21 +266,44 @@ export default function AcceptInvitePage() {
     }
   }
 
-  // Signed-in auto-detection
+  // Effect deps are stable primitives only (user?.id, isLoaded, ticket, targetOrgId).
+  // Using user?.id instead of user object prevents re-firing when Clerk returns
+  // a new object identity for the same user after setActive.
+  // hasRun ref ensures detection runs at most once per page load even if
+  // isLoaded briefly toggles false→true after setActive.
+  const userId = user?.id ?? null;
   useEffect(() => {
     if (!isLoaded) return;
+    if (hasRun.current) return;
+    hasRun.current = true;
+
     if (!ticket) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       showError("No invitation token found. This link may be invalid or expired.");
       return;
     }
-    if (user) {
+
+    // sessionStorage guard: if we already processed this ticket, skip re-running.
+    // Covers: (1) page reload after navigateHard, (2) Clerk RSC re-fetch causing
+    // a full reload before the new page has loaded.
+    const stored = ssGet(SS_PREFIX + ticket);
+    if (stored === "done") {
+      safeNavigate("/apps");
+      return;
+    }
+    if (stored?.startsWith("error:")) {
+      const code = stored.slice(6);
+      showError(ticketErrorMsg(code), code);
+      return;
+    }
+
+    if (userId) {
       void detectSignedInState();
     } else {
       setState("ready");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoaded, ticket]);
+  }, [isLoaded, userId, ticket, targetOrgId]);
 
   if (state === "init") {
     return (

@@ -127,7 +127,7 @@ git status                                  # only files for this task
 ## Known gotchas
 
 - Next.js 16: `proxy.ts` replaces `middleware.ts`; `cookies()` is async.
-- Clerk's provider calls `router.refresh()` after `setActive`; use `setActive({ organization, redirectUrl: "/apps" })` for normal switches and `navigateHard` after deletions.
+- Clerk's ClerkProvider calls `router.refresh()` after every `setActive`. If the current URL has Clerk ticket params, that re-fetch triggers a Clerk handshake redirect → RSC fetch fails → full reload → loop. Always call `history.replaceState` to strip ticket params BEFORE calling `setActive`. Use `setActive({ organization, redirectUrl: "/apps" })` for normal switches and `navigateHard` after deletions.
 - Clerk membership lists are paginated (default 10); always page.
 - flyctl in the API image is pinned (0.5.1); deploy args stay `deploy --remote-only --ha=false --app <name> --yes` with CI=true.
 - Fly images are private per org (that is why staging has its own proxy image copy).
@@ -137,10 +137,11 @@ git status                                  # only files for this task
 
 ## Current state (update at the end of every task)
 
-- Last updated: 2026-11-22. Work in progress on branch `feat/workspace-members` (from main, on staging, not yet on main). main = a2315d8. Tests: API 1244, web 373.
+- Last updated: 2026-11-23. Branch `feat/workspace-members` (from main). Tests: API 1244, web 379.
 - Live: auth (Google, GitHub, email code), workspaces (create, switch, delete with full cleanup), apps, sharing with invite emails, API keys with scopes, account settings (profile, emails, connected accounts, sessions, reverification, delete account), admin overview and activity, kill switch, watchdog, staging environment.
 - Added in this branch: workspace members and roles (invite by email/role, resend/revoke invitation, change role, remove member, leave workspace — last-admin guards on all), accept-invite page at `/accept-invite` (Clerk ticket strategy, existing + new users), Settings page Clerk 404 recovery (`WorkspaceGoneRedirect`), 5 new activity event types (member.invited/invitation_revoked/role_changed/removed/left). API routes: GET /v1/workspace/members, POST /v1/workspace/invitations, POST .../invitations/:id/resend, DELETE .../invitations/:id, PATCH /v1/workspace/members/:userId, DELETE .../members/:userId, POST /v1/workspace/leave. Member removal revokes API keys and app shares.
-- Fixed in this session (staging bugs): (1) accept-invite rebuilt as explicit state machine (init/ready/accepting/wrong_account/done/error); root cause of "accepted but not redirected" was setActive({ session }) without organization — fixed to setActive({ session, organization }); finalize() error checks membership before navigating; signed-in path matches only the org from ?org; wrong-account shows email + sign-out link; (2) sign-in and sign-up show "already signed in as {email}" card instead of silently redirecting; (3) responsive dashboard: DashboardShell component, sidebar collapses to hamburger overlay below 900px (focus trap, Escape, backdrop close), page-container max 1280px, settings-container max 880px, table stacking at 600px. New files: DashboardShell.tsx, sign-up-behavior.test.tsx.
+- Fixed (staging bugs): accept-invite rebuilt as explicit state machine; setActive({session, organization}); sign-in/sign-up "already signed in" card; responsive dashboard (DashboardShell, hamburger ≤900px); desktop sidebar height (.sidebar-panel display:flex + height:100%); keys table alignment (container padding on rows matches header).
+- Fixed (staging bugs 2): (1) accept-invite Safari RSC loop: root cause = Clerk's ClerkProvider calls router.refresh() after setActive, re-fetching the current URL which still had __clerk_ticket, triggering Clerk handshake redirect → RSC fetch failed → full reload → loop; fixed with history.replaceState on mount to strip ticket params before setActive is ever called; (2) sessionStorage outcome guard per ticket (key "accept-invite-v1:<ticket>") prevents re-processing on reload; (3) hasRun ref prevents effect re-entry when isLoaded toggles after setActive.
 - Next (see Notion Work Board): app logs → environment variables and secrets → admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
 - Open: move off railway.toml before 2026-12-01; book the external pen test.
 

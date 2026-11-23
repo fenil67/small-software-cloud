@@ -432,11 +432,14 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
 
         {keys.map((k) => {
           const isRevoked = !!k.revoked_at;
-          const cellStyle: React.CSSProperties = {
-            padding: "14px 24px",
-            borderTop: "1px solid var(--line)",
+          // Row uses container padding (same as the header grid above) so both
+          // header and row compute column track widths from the same available
+          // width (container_width − 48px), keeping header and cell text aligned.
+          const baseCell: React.CSSProperties = {
             display: "flex",
             alignItems: "center",
+            minWidth: 0,
+            overflow: "hidden",
             fontSize: "13px",
             color: isRevoked ? "var(--fg-3)" : "var(--fg)",
           };
@@ -447,12 +450,14 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
                 display: "grid",
                 gridTemplateColumns: colTemplate,
                 gap: "16px",
+                padding: "14px 24px",
+                borderTop: "1px solid var(--line)",
                 alignItems: "center",
               }}
             >
-              <div style={cellStyle}>
-                <span style={{ display: "flex", flexDirection: "column" }}>
-                  <span style={{ fontSize: "14px", fontWeight: 500, textDecoration: isRevoked ? "line-through" : "none" }}>
+              <div style={baseCell}>
+                <span style={{ display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
+                  <span style={{ fontSize: "14px", fontWeight: 500, textDecoration: isRevoked ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {k.name}
                   </span>
                   <span
@@ -466,25 +471,30 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
                   </span>
                 </span>
               </div>
-              <div style={{ ...cellStyle, color: "var(--fg-2)" }}>
+              <div style={{ ...baseCell, color: "var(--fg-2)" }}>
                 {formatScopesDisplay(k.scopes)}
               </div>
               {isAdmin && (
-                <div style={{ ...cellStyle, color: "var(--fg-2)", fontSize: "12px" }}>
-                  {k.created_by_email ?? "—"}
+                <div style={{ ...baseCell, color: "var(--fg-2)", fontSize: "12px" }}>
+                  <span
+                    style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    title={k.created_by_email ?? "—"}
+                  >
+                    {k.created_by_email ?? "—"}
+                  </span>
                 </div>
               )}
-              <div style={{ ...cellStyle, color: "var(--fg-2)" }}>
+              <div style={{ ...baseCell, color: "var(--fg-2)" }}>
                 {formatDate(k.created_at)}
               </div>
-              <div style={{ ...cellStyle, color: "var(--fg-2)" }}>
+              <div style={{ ...baseCell, color: "var(--fg-2)" }}>
                 {isRevoked && k.revoked_at
                   ? `Revoked ${formatDate(k.revoked_at)}`
                   : k.last_used_at
                   ? formatDate(k.last_used_at)
                   : "—"}
               </div>
-              <div style={{ ...cellStyle, justifyContent: "flex-end" }}>
+              <div style={{ ...baseCell, justifyContent: "flex-end" }}>
                 {!isRevoked && (
                   <button
                     type="button"
@@ -501,6 +511,7 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
                       fontWeight: 500,
                       cursor: revoking === k.id ? "wait" : "pointer",
                       padding: "0 12px",
+                      flexShrink: 0,
                     }}
                   >
                     Revoke
