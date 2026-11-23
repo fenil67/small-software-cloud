@@ -49,8 +49,11 @@ only people the owner shared it with can open it. Product name in all user-facin
 | Email (Resend) | off | off (no RESEND_API_KEY) | on, from notifications@mail.utir.dev |
 | Alerts | — | Discord #staging | Discord alerts channel |
 
-Railway: api service Root Directory `/apps/api`, Config file path `/apps/api/railway.toml` (Dockerfile build,
-migrations as preDeployCommand, `/health` checks the DB and gates deploys). Web service has no root directory,
+Railway: no config files (Config as Code ended 2026-12-01; `railway.toml` was removed 2026-11-23). Settings live in each
+environment's service settings and must match in staging and production (only the branch differs): api Root Directory
+`/apps/api`, Dockerfile builder, start `node dist/index.js`, pre-deploy `node dist/db/migrate.js` (migrations), health
+check `/health` timeout 120 (checks the DB and gates deploys), restart on failure max 3; branch `staging` / `main`.
+Change a setting in staging first, then production. Check with `railway config migrate status`. Web service has no root directory,
 builds from repo root with Railpack (Node 20, pnpm 9, `pnpm install --frozen-lockfile`, `pnpm --filter web build`).
 
 ## How every change ships (no exceptions)
@@ -132,7 +135,7 @@ git status                                  # only files for this task
 - flyctl in the API image is pinned (0.5.1); deploy args stay `deploy --remote-only --ha=false --app <name> --yes` with CI=true.
 - Fly images are private per org (that is why staging has its own proxy image copy).
 - Watchdog Discord alert `metrics_unavailable ETIMEDOUT` = Fly Prometheus was slow; act only if it persists.
-- Railway config-as-code (`railway.toml`) support ends 2026-12-01: migrations and the config path live there. Open item.
+- Railway deploy settings are in the dashboard, not the repo. If migrations stop running, check the api pre-deploy command first.
 - Fly org token for Railway expires 2027-02-09: renew before then.
 
 ## Current state (update at the end of every task)
@@ -142,7 +145,7 @@ git status                                  # only files for this task
 - Added in this branch (feat/ui-polish): (1) API keys — removed side card, added "Create key" button in header that opens a dialog (name + scope checkboxes → key-once reveal → Done); (2) unified `.page-container` CSS class handles all page padding (48px desktop / 32px tablet / 16px mobile, 40px top / 64px bottom, max-width 1200px) — all per-page inline padding and maxWidth removed; (3) sidebar bottom group: WorkspaceSwitcher + user card in one `display:flex gap:4px` wrapper (was 32px apart); (4) DashboardShell layout (`.dashboard-shell`, `.dashboard-layout-row`, `.dashboard-main`) moved from inline styles to CSS classes so `@media (max-width: 900px)` can override without inline specificity blocking.
 - Fixed (staging bugs): accept-invite rebuilt as explicit state machine; setActive({session, organization}); sign-in/sign-up "already signed in" card; responsive dashboard (DashboardShell, hamburger ≤900px); desktop sidebar height (.sidebar-panel display:flex + height:100%); keys table alignment (container padding on rows matches header). Accept-invite Safari RSC loop (history.replaceState + sessionStorage + hasRun).
 - Next (see Notion Work Board): app logs → environment variables and secrets → admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
-- Open: move off railway.toml before 2026-12-01; book the external pen test.
+- Open: book the external pen test.
 
 ## Keeping this file current
 
