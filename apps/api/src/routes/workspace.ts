@@ -290,7 +290,7 @@ workspaceRouter.post(
 
       // Create the Clerk invitation
       const webUrl = process.env.WEB_URL ?? "";
-      const redirectUrl = `${webUrl}/accept-invite`;
+      const redirectUrl = `${webUrl}/accept-invite?org=${encodeURIComponent(clerkOrgId)}`;
       let invitation: { id: string };
       try {
         invitation = await createOrgInvitationClerk(clerkOrgId, inviteEmail, inviteRole, redirectUrl);
@@ -354,9 +354,10 @@ workspaceRouter.post(
 
     // Revoke and re-create
     const webUrl = process.env.WEB_URL ?? "";
-    const redirectUrl = `${webUrl}/accept-invite`;
+    const redirectUrl = `${webUrl}/accept-invite?org=${encodeURIComponent(clerkOrgId)}`;
+    const requestingClerkUserId = req.sscAuth!.clerkUserId ?? null;
     try {
-      await revokeOrgInvitationClerk(clerkOrgId, invitationId);
+      await revokeOrgInvitationClerk(clerkOrgId, invitationId, requestingClerkUserId);
       const newInv = await createOrgInvitationClerk(
         clerkOrgId,
         invitation.emailAddress,
@@ -396,8 +397,9 @@ workspaceRouter.delete(
       return;
     }
 
+    const requestingClerkUserId = req.sscAuth!.clerkUserId ?? null;
     try {
-      await revokeOrgInvitationClerk(clerkOrgId, invitationId);
+      await revokeOrgInvitationClerk(clerkOrgId, invitationId, requestingClerkUserId);
     } catch (err) {
       console.error("[workspace] revokeInvitation failed:", safeErr(err));
       res.status(503).json({ error: "clerk_unavailable" });

@@ -8394,6 +8394,143 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Section AK-vis: API key visibility — member vs admin scope
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("AK-vis: API key visibility — member sees own, admin sees all with creator email");
+
+    // Set up fresh users and org for this section
+    const akVisClerkOrgId = "clerk_org_akvis";
+    const akVisAdminClerkId = "clerk_akvis_admin";
+    const akVisMemberClerkId = "clerk_akvis_member";
+    const akVisAdminEmail = "akvis-admin@test.local";
+    const akVisMemberEmail = "akvis-member@test.local";
+
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: akVisAdminClerkId, email: akVisAdminEmail, verified: true },
+    });
+    await request("POST", "/test/set-clerk-user", {
+      body: { clerkUserId: akVisMemberClerkId, email: akVisMemberEmail, verified: true },
+    });
+
+    // Insert DB rows
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,'AKVis Admin') ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email",
+      [akVisAdminClerkId, akVisAdminEmail],
+    );
+    await pool.query(
+      "INSERT INTO users (clerk_user_id, email, display_name) VALUES ($1,$2,'AKVis Member') ON CONFLICT (clerk_user_id) DO UPDATE SET email=EXCLUDED.email",
+      [akVisMemberClerkId, akVisMemberEmail],
+    );
+    const { rows: akVisOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,'AKVis Org','akvis-org') ON CONFLICT (clerk_org_id) DO UPDATE SET name=EXCLUDED.name RETURNING id",
+      [akVisClerkOrgId],
+    );
+    const akVisOrgId = akVisOrgRows[0].id;
+    const { rows: akVisAdminUserRows } = await pool.query<{ id: string }>(
+      "SELECT id FROM users WHERE clerk_user_id = $1", [akVisAdminClerkId],
+    );
+    const akVisAdminUserId = akVisAdminUserRows[0].id;
+    const { rows: akVisMemberUserRows } = await pool.query<{ id: string }>(
+      "SELECT id FROM users WHERE clerk_user_id = $1", [akVisMemberClerkId],
+    );
+    const akVisMemberUserId = akVisMemberUserRows[0].id;
+
+    // Insert two API keys: one owned by admin, one owned by member
+    const { fullKey: akAdminFullKey, keyPrefix: akAdminKP, keyHash: akAdminKH } = generateApiKey();
+    const { rows: akAdminKeyRows } = await pool.query<{ id: string }>(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'akvis-admin-key',$3,$4,'{read}') RETURNING id",
+      [akVisOrgId, akVisAdminUserId, akAdminKP, akAdminKH],
+    );
+    const akAdminKeyId = akAdminKeyRows[0].id;
+
+    const { fullKey: akMemberFullKey, keyPrefix: akMemberKP, keyHash: akMemberKH } = generateApiKey();
+    const { rows: akMemberKeyRows } = await pool.query<{ id: string }>(
+      "INSERT INTO api_keys (org_id, created_by, name, key_prefix, key_hash, scopes) VALUES ($1,$2,'akvis-member-key',$3,$4,'{read}') RETURNING id",
+      [akVisOrgId, akVisMemberUserId, akMemberKP, akMemberKH],
+    );
+    const akMemberKeyId = akMemberKeyRows[0].id;
+
+    void akAdminFullKey; void akMemberFullKey; // used for seeding only
+
+    const akAdminHeaders = {
+      "x-test-clerk-user-id": akVisAdminClerkId,
+      "x-test-clerk-org-id": akVisClerkOrgId,
+      "x-test-clerk-org-role": "org:admin",
+    };
+    const akMemberHeaders = {
+      "x-test-clerk-user-id": akVisMemberClerkId,
+      "x-test-clerk-org-id": akVisClerkOrgId,
+      "x-test-clerk-org-role": "org:member",
+    };
+
+    // ── AK-vis-1: member GET → sees only own key ──────────────────────────────
+    {
+      const r = await request("GET", "/v1/api-keys", { headers: akMemberHeaders });
+      const keys = r.body as Array<{ id: string; created_by_email?: string }>;
+      r.status === 200
+        ? ok("AK-vis-1: member GET /v1/api-keys → 200")
+        : fail("AK-vis-1: expected 200", String(r.status));
+      const hasOwnKey = keys.some((k) => k.id === akMemberKeyId);
+      const hasAdminKey = keys.some((k) => k.id === akAdminKeyId);
+      hasOwnKey
+        ? ok("AK-vis-1: member sees own key")
+        : fail("AK-vis-1: member's own key missing");
+      !hasAdminKey
+        ? ok("AK-vis-1: member does NOT see admin's key")
+        : fail("AK-vis-1: member should not see admin key");
+    }
+
+    // ── AK-vis-2: admin GET → sees all keys with created_by_email ─────────────
+    {
+      const r = await request("GET", "/v1/api-keys", { headers: akAdminHeaders });
+      const keys = r.body as Array<{ id: string; created_by_email?: string | null }>;
+      r.status === 200
+        ? ok("AK-vis-2: admin GET /v1/api-keys → 200")
+        : fail("AK-vis-2: expected 200", String(r.status));
+      const adminKeyEntry = keys.find((k) => k.id === akAdminKeyId);
+      const memberKeyEntry = keys.find((k) => k.id === akMemberKeyId);
+      (adminKeyEntry && memberKeyEntry)
+        ? ok("AK-vis-2: admin sees both keys")
+        : fail("AK-vis-2: admin missing a key", `admin=${!!adminKeyEntry} member=${!!memberKeyEntry}`);
+      adminKeyEntry?.created_by_email === akVisAdminEmail
+        ? ok("AK-vis-2: admin key has correct created_by_email")
+        : fail("AK-vis-2: wrong created_by_email on admin key", String(adminKeyEntry?.created_by_email));
+      memberKeyEntry?.created_by_email === akVisMemberEmail
+        ? ok("AK-vis-2: member key has correct created_by_email")
+        : fail("AK-vis-2: wrong created_by_email on member key", String(memberKeyEntry?.created_by_email));
+    }
+
+    // ── AK-vis-3: member DELETE someone else's key → 404 ─────────────────────
+    {
+      const r = await request("DELETE", `/v1/api-keys/${akAdminKeyId}`, { headers: akMemberHeaders });
+      r.status === 404
+        ? ok("AK-vis-3: member DELETE admin's key → 404")
+        : fail("AK-vis-3: expected 404", `got ${r.status}`);
+    }
+
+    // ── AK-vis-4: member can revoke own key ───────────────────────────────────
+    {
+      const r = await request("DELETE", `/v1/api-keys/${akMemberKeyId}`, { headers: akMemberHeaders });
+      r.status === 200
+        ? ok("AK-vis-4: member can revoke own key → 200")
+        : fail("AK-vis-4: expected 200", `got ${r.status}`);
+    }
+
+    // Cleanup
+    await pool.query("DELETE FROM api_keys WHERE org_id = $1", [akVisOrgId]);
+    const akVisCleanupClient = await pool.connect();
+    try {
+      await akVisCleanupClient.query("BEGIN");
+      await akVisCleanupClient.query("SET LOCAL ssc.allow_erase = 'on'");
+      await akVisCleanupClient.query("DELETE FROM activity_events WHERE org_id = $1", [akVisOrgId]);
+      await akVisCleanupClient.query("COMMIT");
+    } finally { akVisCleanupClient.release(); }
+    await pool.query("DELETE FROM orgs WHERE id = $1", [akVisOrgId]);
+    await pool.query("DELETE FROM users WHERE clerk_user_id IN ($1, $2)", [akVisAdminClerkId, akVisMemberClerkId]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Section AJ — Backlog fixes: Node version, build failure summary, UUID 404,
   //              reuse failed first deploy, WATCHDOG_PROBE_SECONDS
   // ════════════════════════════════════════════════════════════════════════════
@@ -9771,8 +9908,8 @@ async function main(): Promise<void> {
       const bakPath = apiKeysPath + ".bak";
       const originalSrc = fs.readFileSync(apiKeysPath, "utf8");
 
-      const ORIGINAL_SELECT = "SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at";
-      const MUTATED_SELECT  = "SELECT id, name, key_prefix, key_hash, scopes, created_at, last_used_at, revoked_at";
+      const ORIGINAL_SELECT = "SELECT k.id, k.name, k.key_prefix, k.scopes, k.created_at, k.last_used_at, k.revoked_at,";
+      const MUTATED_SELECT  = "SELECT k.id, k.name, k.key_prefix, k.key_hash, k.scopes, k.created_at, k.last_used_at, k.revoked_at,";
       const mutatedSrc = originalSrc.replace(ORIGINAL_SELECT, MUTATED_SELECT);
 
       if (mutatedSrc === originalSrc) {
@@ -14742,9 +14879,9 @@ async function main(): Promise<void> {
       const inv = await request("GET", "/test/get-last-invite", {});
       const { redirectUrl } = inv.body as { redirectUrl?: string };
       const expectedBase = process.env.TEST_PORT ? `http://localhost:${process.env.TEST_PORT}` : "";
-      const expectedUrl = `${expectedBase}/accept-invite`;
+      const expectedUrl = `${expectedBase}/accept-invite?org=${encodeURIComponent(wmClerkOrgId)}`;
       redirectUrl === expectedUrl
-        ? ok("WM-5b: redirect URL is server-fixed WEB_URL/accept-invite")
+        ? ok("WM-5b: redirect URL is server-fixed WEB_URL/accept-invite with org param")
         : fail("WM-5b: redirect URL not server-fixed", `got=${redirectUrl} want=${expectedUrl}`);
     }
 
@@ -14780,6 +14917,15 @@ async function main(): Promise<void> {
       evRows.length > 0
         ? ok("WM-7: member.invitation_revoked activity event written")
         : fail("WM-7: missing member.invitation_revoked activity event");
+    }
+
+    // ── WM-7b: revoke sends requesting_user_id = admin's Clerk user ID ──────────
+    {
+      const lastRevoke = await request("GET", "/test/get-last-revoke", {});
+      const { requestingUserId } = lastRevoke.body as { requestingUserId?: string | null };
+      requestingUserId === wmAdminClerkId
+        ? ok("WM-7b: revoke sends requesting_user_id = admin's Clerk user ID")
+        : fail("WM-7b: revoke did not send correct requesting_user_id", `got=${String(requestingUserId)} want=${wmAdminClerkId}`);
     }
 
     // ── WM-8: DELETE /invitations/:id not found → 404 ─────────────────────────

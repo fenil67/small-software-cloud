@@ -29,6 +29,12 @@ function actor(e: ActivityEventFields): string {
   return e.actor_email ?? 'Someone';
 }
 
+function roleLabel(role: string): string {
+  if (role === 'org:admin') return 'Admin';
+  if (role === 'org:member') return 'Member';
+  return role || 'Unknown role';
+}
+
 function appName(e: ActivityEventFields): string {
   if (typeof e.app_name === 'string' && e.app_name) return e.app_name;
   // legacy fallback: metadata.app_name (pre-enrichment responses)
@@ -71,6 +77,11 @@ export const EVENT_META: Record<string, EventMeta> = {
   'admin.activity_exported': { chip: 'Admin',    label: 'Admin',       sentence: e => `${actor(e)} exported the activity log` },
   'admin.person_erased':     { chip: 'Admin',    label: 'Admin',       sentence: e => `${actor(e)} erased a person` },
   'workspace.deleted':       { chip: 'Workspace', label: 'Workspace',  labelColor: '--red', labelWeight: 500, sentence: e => `${actor(e)} deleted the workspace` },
+  'member.invited':            { chip: 'People',    label: 'People',      sentence: e => `${actor(e)} invited ${String(e.metadata.invitee_email ?? 'someone')} as ${roleLabel(String(e.metadata.role ?? ''))}` },
+  'member.invitation_revoked': { chip: 'People',    label: 'People',      sentence: e => `${actor(e)} revoked invitation for ${String(e.metadata.invitee_email ?? 'someone')}` },
+  'member.role_changed':       { chip: 'People',    label: 'People',      sentence: e => `${actor(e)} changed a member's role to ${roleLabel(String(e.metadata.new_role ?? ''))}` },
+  'member.removed':            { chip: 'People',    label: 'People',      sentence: e => `${actor(e)} removed a member from the workspace` },
+  'member.left':               { chip: 'People',    label: 'People',      sentence: e => `${actor(e)} left the workspace` },
 };
 
 export const CHIP_EVENT_TYPES: Record<EventChip, string[]> = {
@@ -78,7 +89,7 @@ export const CHIP_EVENT_TYPES: Record<EventChip, string[]> = {
   'Refused':  ['access.refused'],
   'Deploys':  ['deploy.started', 'deploy.succeeded', 'deploy.failed'],
   'Sharing':  ['access.granted', 'access.revoked', 'access.pending_claimed', 'email.invite_queued', 'email.invite_sent', 'email.invite_failed'],
-  'People':   ['user.signed_in', 'clerk.user_created', 'clerk.user_updated', 'clerk.user_deleted', 'clerk.org_created', 'clerk.org_updated', 'clerk.org_deleted', 'clerk.membership_created', 'clerk.membership_updated', 'clerk.membership_deleted'],
+  'People':   ['user.signed_in', 'clerk.user_created', 'clerk.user_updated', 'clerk.user_deleted', 'clerk.org_created', 'clerk.org_updated', 'clerk.org_deleted', 'clerk.membership_created', 'clerk.membership_updated', 'clerk.membership_deleted', 'member.invited', 'member.invitation_revoked', 'member.role_changed', 'member.removed', 'member.left'],
   'API keys': ['key.created', 'key.revoked', 'key.auth_failed'],
   'Watchdog': ['app.suspended', 'app.unsuspended', 'watchdog.alert'],
   'Admin':    ['app.created', 'app.deleted', 'admin.activity_searched', 'admin.activity_exported', 'admin.person_erased'],

@@ -36,12 +36,12 @@ export function KeysClient({ keys, isAdmin }: Props) {
         >
           <div style={{ padding: "20px 24px" }}>
             <h2 id="keys-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
-              Your keys
+              {isAdmin ? "All keys" : "Your keys"}
             </h2>
           </div>
           {!isAdmin && (
             <p style={{ fontSize: "13px", color: "var(--fg-3)", margin: "0 24px 20px" }}>
-              Only admins can create or revoke API keys.
+              You can revoke your own keys. Only admins can create keys or revoke others&apos; keys.
             </p>
           )}
           {keys.length === 0 ? (
@@ -396,14 +396,19 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
     });
   }
 
+  // Column layout changes if admin (adds "Created by" column)
+  const colTemplate = isAdmin
+    ? "minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) 110px 120px 96px"
+    : "minmax(0, 1.4fr) minmax(0, 1.2fr) 110px 120px 96px";
+
   return (
     <div style={{ overflowX: "auto" }}>
       {error && <p role="alert" style={{ margin: "0 24px 8px", fontSize: "12px", color: "var(--red)" }}>{error}</p>}
-      <div style={{ minWidth: "620px" }}>
+      <div style={{ minWidth: isAdmin ? "740px" : "620px" }}>
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1.2fr) 110px 120px 96px",
+            gridTemplateColumns: colTemplate,
             gap: "16px",
             padding: "12px 24px",
             fontSize: "12px",
@@ -415,6 +420,7 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
         >
           <span>Name</span>
           <span>Can</span>
+          {isAdmin && <span>Created by</span>}
           <span>Created</span>
           <span>Last used</span>
           <span>
@@ -439,7 +445,7 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
               key={k.id}
               style={{
                 display: "grid",
-                gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1.2fr) 110px 120px 96px",
+                gridTemplateColumns: colTemplate,
                 gap: "16px",
                 alignItems: "center",
               }}
@@ -463,6 +469,11 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
               <div style={{ ...cellStyle, color: "var(--fg-2)" }}>
                 {formatScopesDisplay(k.scopes)}
               </div>
+              {isAdmin && (
+                <div style={{ ...cellStyle, color: "var(--fg-2)", fontSize: "12px" }}>
+                  {k.created_by_email ?? "—"}
+                </div>
+              )}
               <div style={{ ...cellStyle, color: "var(--fg-2)" }}>
                 {formatDate(k.created_at)}
               </div>
@@ -474,7 +485,7 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
                   : "—"}
               </div>
               <div style={{ ...cellStyle, justifyContent: "flex-end" }}>
-                {isAdmin && !isRevoked && (
+                {!isRevoked && (
                   <button
                     type="button"
                     disabled={revoking === k.id}

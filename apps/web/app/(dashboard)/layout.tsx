@@ -20,9 +20,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
   }
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "var(--bg)" }}>
+    <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "var(--bg)" }}>
       <Sidebar isAdmin={isAdmin} openAlertCount={openAlertCount} />
-      <main style={{ flex: 1, minWidth: 0, overflow: "auto" }}>{children}</main>
+      <main style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>{children}</main>
     </div>
   );
 }

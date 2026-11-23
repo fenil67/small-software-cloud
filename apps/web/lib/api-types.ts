@@ -47,6 +47,8 @@ export interface ApiKey {
   created_at: string;
   last_used_at: string | null;
   revoked_at: string | null;
+  /** Admin-only: email of the user who created the key */
+  created_by_email?: string | null;
 }
 
 export interface ApiKeyCreated extends ApiKey {

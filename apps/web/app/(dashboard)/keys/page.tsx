@@ -15,14 +15,12 @@ export default async function KeysPage() {
 
   let keys: ApiKey[] = [];
   let error: string | null = null;
-  if (isAdmin) {
-    try {
-      keys = await apiFetch<ApiKey[]>("/v1/api-keys", { token });
-    } catch (e: unknown) {
-      const status = (e as { status?: number }).status ?? 0;
-      console.error(`[keys] GET /v1/api-keys failed with status ${status}`);
-      error = "We could not load your API keys. Try again in a moment.";
-    }
+  try {
+    keys = await apiFetch<ApiKey[]>("/v1/api-keys", { token });
+  } catch (e: unknown) {
+    const status = (e as { status?: number }).status ?? 0;
+    console.error(`[keys] GET /v1/api-keys failed with status ${status}`);
+    error = "We could not load your API keys. Try again in a moment.";
   }
 
   return (
