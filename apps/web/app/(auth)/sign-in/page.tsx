@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { useSignIn } from "@clerk/nextjs";
+import { useSignIn, useUser, useClerk } from "@clerk/nextjs";
 import { AuthCard } from "../../../components/auth/AuthCard";
 import { OAuthButtons } from "../../../components/auth/OAuthButtons";
 import { EmailStep } from "../../../components/auth/EmailStep";
@@ -33,6 +33,8 @@ function warnClerkCode(err: unknown) {
 
 export default function SignInPage() {
   const router = useRouter();
+  const { user: currentUser, isLoaded: userLoaded } = useUser();
+  const { signOut } = useClerk();
   const { signIn, fetchStatus } = useSignIn();
 
   const [step, setStep] = useState<Step>("email");
@@ -150,6 +152,26 @@ export default function SignInPage() {
     setCode("");
     setCodeError(undefined);
     setFormError(undefined);
+  }
+
+  if (userLoaded && currentUser) {
+    const userEmail = currentUser.primaryEmailAddress?.emailAddress ?? "";
+    return (
+      <AuthCard title="You're already signed in">
+        <p className="mb-4 text-sm text-fg-2 text-center">Signed in as {userEmail}.</p>
+        {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+        <a href="/apps" className="mt-2 w-full block rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg text-center transition-opacity hover:opacity-90">
+          Continue to Utir
+        </a>
+        <button
+          type="button"
+          onClick={() => void signOut({ redirectUrl: "/sign-in" })}
+          className="mt-3 w-full rounded-xl bg-surface-2 border border-line px-4 py-2.5 text-sm font-medium text-fg transition-opacity hover:opacity-90"
+        >
+          Sign out and use another account
+        </button>
+      </AuthCard>
+    );
   }
 
   return (

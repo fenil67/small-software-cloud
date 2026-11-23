@@ -1161,6 +1161,54 @@ describe("Contract: app-detail fixture shape", () => {
   });
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// DashboardShell – responsive layout
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { DashboardShell } from "../DashboardShell";
+
+describe("DashboardShell responsive layout", () => {
+  it("renders menu button with aria-label 'Open navigation'", () => {
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    expect(screen.getByRole("button", { name: /open navigation/i })).toBeInTheDocument();
+  });
+
+  it("menu button click sets mobileOpen state (aria-expanded changes to true)", () => {
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    const btn = screen.getByRole("button", { name: /open navigation/i });
+    expect(btn).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(btn);
+    expect(btn).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("page-container class applied to content wrapper", () => {
+    const { container } = render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div data-testid="child">content</div>
+      </DashboardShell>,
+    );
+    const pageContainer = container.querySelector(".page-container");
+    expect(pageContainer).toBeInTheDocument();
+  });
+
+  it("sidebar-panel class present", () => {
+    const { container } = render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    expect(container.querySelector(".sidebar-panel")).toBeInTheDocument();
+  });
+});
+
 // ── BUG B – workspace creation try/finally guarantees navigation ─────────────
 
 describe("OnboardingClient – BUG B v2: setActive/session errors do not block navigation", () => {

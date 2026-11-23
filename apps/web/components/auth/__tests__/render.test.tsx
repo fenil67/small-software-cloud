@@ -38,6 +38,8 @@ vi.mock("@clerk/nextjs", () => ({
       },
     },
   })),
+  useUser: vi.fn(() => ({ user: null, isLoaded: true })),
+  useClerk: vi.fn(() => ({ signOut: vi.fn() })),
 }));
 
 vi.mock("next/navigation", () => ({
