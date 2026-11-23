@@ -25,7 +25,7 @@ only people the owner shared it with can open it. Product name in all user-facin
 | `apps/api/scripts` | `run-suite.sh`, `run-tests.ts`, `test-server.ts`, `fixtures/` | test-only code lives ONLY here |
 | `apps/api/src/scripts` | one-off ops scripts (e.g. `reconcile-deleted-orgs.ts`) | dry run by default |
 | `apps/web` | Next.js 16 dashboard | **pnpm**; read `apps/web/AGENTS.md` (Next 16 differs from training data) |
-| `apps/web/app/(auth)` | custom sign-in / sign-up / sso-callback | built on Clerk APIs, not Clerk UI |
+| `apps/web/app/(auth)` | custom sign-in / sign-up / sso-callback / accept-invite | built on Clerk APIs, not Clerk UI |
 | `apps/web/app/(dashboard)` | apps, app detail, keys, settings, admin | |
 | `apps/web/app/(onboarding)` | create first workspace | `?new=1` for additional ones |
 | `apps/web/lib` | api client + type guards, theme, safe-redirect, navigate (navigateHard), app-url, activity-events | |
@@ -137,9 +137,10 @@ git status                                  # only files for this task
 
 ## Current state (update at the end of every task)
 
-- Last updated: 2026-11-22. `main` = `staging` = 33777af. Tests: API 1192, web 331.
+- Last updated: 2026-11-22. Branch `feat/workspace-members` (from `wip/cli-mcp`). Tests: API 1234, web 343.
 - Live: auth (Google, GitHub, email code), workspaces (create, switch, delete with full cleanup), apps, sharing with invite emails, API keys with scopes, account settings (profile, emails, connected accounts, sessions, reverification, delete account), admin overview and activity, kill switch, watchdog, staging environment.
-- Next (see Notion Work Board): workspace members and roles → app logs → environment variables and secrets → admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
+- Added in this branch: workspace members and roles (invite by email/role, resend/revoke invitation, change role, remove member, leave workspace — last-admin guards on all), accept-invite page at `/accept-invite` (Clerk ticket strategy, existing + new users), Settings page Clerk 404 recovery (`WorkspaceGoneRedirect`), 5 new activity event types (member.invited/invitation_revoked/role_changed/removed/left). API routes: GET /v1/workspace/members, POST /v1/workspace/invitations, POST .../invitations/:id/resend, DELETE .../invitations/:id, PATCH /v1/workspace/members/:userId, DELETE .../members/:userId, POST /v1/workspace/leave. Member removal revokes API keys and app shares.
+- Next (see Notion Work Board): app logs → environment variables and secrets → admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
 - Open: move off railway.toml before 2026-12-01; book the external pen test.
 
 ## Keeping this file current

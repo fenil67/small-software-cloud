@@ -77,10 +77,25 @@ const mockFetchDeletePreview = vi.fn();
 const mockDeleteWorkspace    = vi.fn();
 const mockDeleteAccount      = vi.fn();
 
+const mockFetchWorkspaceMembers = vi.fn();
+const mockInviteMember           = vi.fn();
+const mockRevokeInvitation       = vi.fn();
+const mockResendInvitation       = vi.fn();
+const mockChangeMemberRole       = vi.fn();
+const mockRemoveMember           = vi.fn();
+const mockLeaveWorkspace         = vi.fn();
+
 vi.mock("../actions", () => ({
-  fetchDeletePreview: (...args: unknown[]) => mockFetchDeletePreview(...args),
-  deleteWorkspace:    (...args: unknown[]) => mockDeleteWorkspace(...args),
-  deleteAccount:      (...args: unknown[]) => mockDeleteAccount(...args),
+  fetchDeletePreview:       (...args: unknown[]) => mockFetchDeletePreview(...args),
+  deleteWorkspace:          (...args: unknown[]) => mockDeleteWorkspace(...args),
+  deleteAccount:            (...args: unknown[]) => mockDeleteAccount(...args),
+  fetchWorkspaceMembers:    (...args: unknown[]) => mockFetchWorkspaceMembers(...args),
+  inviteMember:             (...args: unknown[]) => mockInviteMember(...args),
+  revokeInvitation:         (...args: unknown[]) => mockRevokeInvitation(...args),
+  resendInvitation:         (...args: unknown[]) => mockResendInvitation(...args),
+  changeMemberRole:         (...args: unknown[]) => mockChangeMemberRole(...args),
+  removeMember:             (...args: unknown[]) => mockRemoveMember(...args),
+  leaveWorkspace:           (...args: unknown[]) => mockLeaveWorkspace(...args),
 }));
 
 vi.mock("../../../../components/auth/CodeStep", () => ({
@@ -941,6 +956,194 @@ describe("ReverificationDialog", () => {
     render(<ReverificationDialog onVerified={vi.fn()} onCancel={mockCancel} />);
     fireEvent.click(screen.getByRole("button", { name: /cancel reverification/i }));
     expect(mockCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Settings page — Clerk 404 / error handling ───────────────────────────────
+
+describe("SettingsPage Clerk org error handling", () => {
+  it("renders WorkspaceGoneRedirect when getOrganization throws resource_not_found 404 (M-org-gone: skip redirect → Settings h1 shown → test fails)", async () => {
+    const { clerkClient } = await import("@clerk/nextjs/server");
+    vi.mocked(clerkClient).mockResolvedValueOnce({
+      organizations: {
+        getOrganization: vi.fn().mockRejectedValue(
+          Object.assign(new Error("not found"), {
+            status: 404,
+            errors: [{ code: "resource_not_found" }],
+          }),
+        ),
+      },
+    } as unknown as Awaited<ReturnType<typeof clerkClient>>);
+
+    const result = await SettingsPage();
+    const html = JSON.stringify(result);
+    // WorkspaceDeleteSection NOT rendered (no orgName prop in tree)
+    expect(html).not.toContain('"orgName"');
+    // The full settings page h1 is NOT shown — only the redirect component
+    expect(html).not.toContain("Settings");
+  });
+
+  it("renders 'Could not load workspace settings' when getOrganization throws a non-404 error", async () => {
+    const { clerkClient } = await import("@clerk/nextjs/server");
+    vi.mocked(clerkClient).mockResolvedValueOnce({
+      organizations: {
+        getOrganization: vi.fn().mockRejectedValue(
+          Object.assign(new Error("server error"), { status: 503 }),
+        ),
+      },
+    } as unknown as Awaited<ReturnType<typeof clerkClient>>);
+
+    const result = await SettingsPage();
+    const html = JSON.stringify(result);
+    expect(html).toContain("Could not load workspace settings");
+    // WorkspaceDeleteSection NOT rendered (fetch failed)
+    expect(html).not.toContain('"orgName"');
+  });
+
+  it("renders normally when getOrganization succeeds", async () => {
+    const { clerkClient } = await import("@clerk/nextjs/server");
+    vi.mocked(clerkClient).mockResolvedValueOnce({
+      organizations: {
+        getOrganization: vi.fn().mockResolvedValue({ name: "Acme Corp" }),
+      },
+    } as unknown as Awaited<ReturnType<typeof clerkClient>>);
+
+    const result = await SettingsPage();
+    const html = JSON.stringify(result);
+    expect(html).toContain("Acme Corp");
+    expect(html).not.toContain("Could not load workspace settings");
+  });
+});
+
+// ── MembersSection ────────────────────────────────────────────────────────────
+
+import { MembersSection } from "../MembersSection";
+
+describe("MembersSection", () => {
+  const members = [
+    { userId: "user_a", role: "org:admin", email: "admin@test.com", firstName: "Alice", lastName: "Admin", joinedAt: new Date().toISOString() },
+    { userId: "user_b", role: "org:member", email: "bob@test.com", firstName: "Bob", lastName: "Member", joinedAt: new Date().toISOString() },
+  ];
+  const invitations = [
+    { id: "inv_1", emailAddress: "carol@test.com", role: "org:member", createdAt: new Date().toISOString() },
+  ];
+
+  beforeEach(() => {
+    mockFetchWorkspaceMembers.mockReset();
+    mockInviteMember.mockReset();
+    mockRevokeInvitation.mockReset();
+    mockResendInvitation.mockReset();
+    mockChangeMemberRole.mockReset();
+    mockRemoveMember.mockReset();
+    mockLeaveWorkspace.mockReset();
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: { id: "user_a" },
+      isLoaded: true,
+    });
+  });
+
+  it("renders member list with emails and roles", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => {
+      expect(screen.getByText("admin@test.com")).toBeDefined();
+      expect(screen.getByText("bob@test.com")).toBeDefined();
+    });
+  });
+
+  it("renders pending invitation", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations });
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => {
+      expect(screen.getByText("carol@test.com")).toBeDefined();
+      expect(screen.getByText("Pending")).toBeDefined();
+    });
+  });
+
+  it("hides Invite button for non-admin (M-admin-controls: shown to everyone → non-admin sees button → test fails)", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    render(<MembersSection isAdmin={false} />);
+    await waitFor(() => expect(screen.getByText("admin@test.com")).toBeDefined());
+    expect(screen.queryByRole("button", { name: /invite/i })).toBeNull();
+  });
+
+  it("shows Invite button for admin", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => expect(screen.getByText("admin@test.com")).toBeDefined());
+    expect(screen.getByRole("button", { name: /invite/i })).toBeDefined();
+  });
+
+  it("hides Revoke button for non-admin (M-admin-controls: shown to everyone → test fails)", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations });
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: { id: "user_b" },
+      isLoaded: true,
+    });
+    render(<MembersSection isAdmin={false} />);
+    await waitFor(() => expect(screen.getByText("carol@test.com")).toBeDefined());
+    expect(screen.queryByRole("button", { name: /revoke/i })).toBeNull();
+  });
+
+  it("shows invite dialog when Invite button is clicked", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /invite/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /invite/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+    expect(screen.getByLabelText(/email address/i)).toBeDefined();
+  });
+
+  it("invite dialog calls inviteMember action and reloads on success", async () => {
+    mockFetchWorkspaceMembers
+      .mockResolvedValueOnce({ members, invitations: [] }) // initial load
+      .mockResolvedValueOnce({ members, invitations: [] }); // reload
+    mockInviteMember.mockResolvedValueOnce({ id: "inv_new" });
+
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /invite/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /invite/i }));
+
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+    fireEvent.change(screen.getByLabelText(/email address/i), { target: { value: "new@test.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /send invite/i }));
+
+    await waitFor(() => expect(mockInviteMember).toHaveBeenCalledWith("new@test.com", "org:member"));
+  });
+
+  it("shows already_member error in invite dialog", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    mockInviteMember.mockResolvedValueOnce({ error: "already_member" });
+
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /invite/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /invite/i }));
+
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
+    fireEvent.change(screen.getByLabelText(/email address/i), { target: { value: "bob@test.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /send invite/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("already a member");
+    });
+  });
+
+  it("last_admin error shown when remove fails (M-admin-controls: guard removed → test fails)", async () => {
+    mockFetchWorkspaceMembers.mockResolvedValueOnce({ members, invitations: [] });
+    mockRemoveMember.mockResolvedValueOnce({ error: "last_admin" });
+
+    (vi.mocked(clerkUseUser) as any).mockReturnValue({
+      user: { id: "user_a" },
+      isLoaded: true,
+    });
+
+    render(<MembersSection isAdmin={true} />);
+    await waitFor(() => expect(screen.queryAllByRole("button", { name: /remove/i }).length).toBeGreaterThan(0));
+    fireEvent.click(screen.queryAllByRole("button", { name: /remove/i })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("last admin");
+    });
   });
 });
 

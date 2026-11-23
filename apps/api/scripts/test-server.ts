@@ -1122,18 +1122,177 @@ app.get("/test/get-clerk-deleted-orgs", (_req, res) => {
   _clerkDeletedOrgs.clear();
 });
 
-// GET /clerk-stub/organizations/:orgId/memberships?user_id=:userId
-// Returns { total_count: 1 } if the user is a member, { total_count: 0 } if not.
+// GET /clerk-stub/organizations/:orgId/memberships?user_id=:userId  (reconcile path)
+// GET /clerk-stub/organizations/:orgId/memberships?limit=N&offset=N (list-all path)
 // 500 when _clerkMembershipFailMode is true (simulates API error).
+//
+// Full member list is stored in _clerkOrgMembersMap and controlled via
+// POST /test/set-clerk-org-members.  When user_id is supplied, falls back to
+// _clerkMembershipStubs for backward-compat with existing reconcile tests.
+interface ClerkMemberStub {
+  userId: string;
+  role: string;
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  joinedAt: string;
+}
+const _clerkOrgMembersMap = new Map<string, ClerkMemberStub[]>(); // orgId → members
+
 app.get("/clerk-stub/organizations/:orgId/memberships", (req, res) => {
   if (_clerkMembershipFailMode) {
     res.status(500).json({ error: "simulated clerk api error" }); return;
   }
   const { orgId } = req.params;
   const userId = (req.query.user_id as string) ?? "";
-  const key = `${orgId}:${userId}`;
-  const isMember = _clerkMembershipStubs.get(key) ?? false;
-  res.json({ total_count: isMember ? 1 : 0, data: [] });
+
+  if (userId) {
+    // Legacy reconcile path: single-user membership check
+    const key = `${orgId}:${userId}`;
+    const isMember = _clerkMembershipStubs.get(key) ?? false;
+    res.json({ total_count: isMember ? 1 : 0, data: [] });
+    return;
+  }
+
+  // Full member list path
+  const members = _clerkOrgMembersMap.get(orgId) ?? [];
+  const limit = parseInt((req.query.limit as string) ?? "100", 10);
+  const offset = parseInt((req.query.offset as string) ?? "0", 10);
+  const page = members.slice(offset, offset + limit);
+  const data = page.map((m) => ({
+    role: m.role,
+    created_at: new Date(m.joinedAt).getTime(),
+    public_user_data: {
+      user_id: m.userId,
+      identifier: m.email,
+      first_name: m.firstName,
+      last_name: m.lastName,
+    },
+  }));
+  res.json({ data, total_count: members.length });
+});
+
+// POST /test/set-clerk-org-members { clerkOrgId, members: ClerkMemberStub[] }
+// Configures the full member list for a given org.
+app.post("/test/set-clerk-org-members", (req, res) => {
+  const { clerkOrgId, members } = req.body as { clerkOrgId?: string; members?: ClerkMemberStub[] };
+  if (!clerkOrgId || !Array.isArray(members)) {
+    res.status(400).json({ error: "clerkOrgId and members[] required" }); return;
+  }
+  _clerkOrgMembersMap.set(clerkOrgId, members);
+  res.json({ ok: true, clerkOrgId, count: members.length });
+});
+
+// ── Clerk org invitations stubs ───────────────────────────────────────────────
+
+interface ClerkInvitationStub {
+  id: string;
+  emailAddress: string;
+  role: string;
+  createdAt: string;
+  redirectUrl: string;
+}
+const _clerkOrgInvitationsMap = new Map<string, ClerkInvitationStub[]>(); // orgId → invitations
+let _clerkInvitationFailMode = false;
+let _lastCreatedInvitation: ClerkInvitationStub | null = null;
+
+// GET /clerk-stub/organizations/:orgId/invitations?status=pending&limit=N&offset=N
+app.get("/clerk-stub/organizations/:orgId/invitations", (req, res) => {
+  if (_clerkInvitationFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId } = req.params;
+  const invitations = _clerkOrgInvitationsMap.get(orgId) ?? [];
+  const limit = parseInt((req.query.limit as string) ?? "100", 10);
+  const offset = parseInt((req.query.offset as string) ?? "0", 10);
+  const page = invitations.slice(offset, offset + limit);
+  const data = page.map((i) => ({
+    id: i.id,
+    email_address: i.emailAddress,
+    role: i.role,
+    created_at: new Date(i.createdAt).getTime(),
+  }));
+  res.json({ data, total_count: invitations.length });
+});
+
+// POST /clerk-stub/organizations/:orgId/invitations — create invitation
+app.post("/clerk-stub/organizations/:orgId/invitations", (req, res) => {
+  if (_clerkInvitationFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId } = req.params;
+  const { email_address, role, redirect_url } = req.body as { email_address?: string; role?: string; redirect_url?: string };
+  if (!email_address) { res.status(422).json({ errors: [{ code: "missing_email" }] }); return; }
+
+  // Check if already a member
+  const members = _clerkOrgMembersMap.get(orgId) ?? [];
+  if (members.some((m) => m.email.toLowerCase() === (email_address ?? "").toLowerCase())) {
+    res.status(422).json({ errors: [{ code: "already_a_member" }] }); return;
+  }
+
+  const inv: ClerkInvitationStub = {
+    id: `inv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    emailAddress: email_address,
+    role: role ?? "org:member",
+    createdAt: new Date().toISOString(),
+    redirectUrl: redirect_url ?? "",
+  };
+  const existing = _clerkOrgInvitationsMap.get(orgId) ?? [];
+  _clerkOrgInvitationsMap.set(orgId, [...existing, inv]);
+  _lastCreatedInvitation = inv;
+  res.status(200).json({ id: inv.id, email_address: inv.emailAddress, role: inv.role });
+});
+
+// POST /clerk-stub/organizations/:orgId/invitations/:id/revoke
+app.post("/clerk-stub/organizations/:orgId/invitations/:id/revoke", (req, res) => {
+  if (_clerkInvitationFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId, id } = req.params;
+  const existing = _clerkOrgInvitationsMap.get(orgId) ?? [];
+  const idx = existing.findIndex((i) => i.id === id);
+  if (idx === -1) { res.status(404).json({ errors: [{ code: "resource_not_found" }] }); return; }
+  _clerkOrgInvitationsMap.set(orgId, existing.filter((_, i) => i !== idx));
+  res.json({ revoked: true });
+});
+
+// PATCH /clerk-stub/organizations/:orgId/memberships/:userId — update role
+app.patch("/clerk-stub/organizations/:orgId/memberships/:userId", (req, res) => {
+  if (_clerkMembershipFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId, userId } = req.params;
+  const { role } = req.body as { role?: string };
+  const members = _clerkOrgMembersMap.get(orgId) ?? [];
+  const idx = members.findIndex((m) => m.userId === userId);
+  if (idx === -1) { res.status(404).json({ errors: [{ code: "resource_not_found" }] }); return; }
+  members[idx] = { ...members[idx], role: role ?? members[idx].role };
+  _clerkOrgMembersMap.set(orgId, members);
+  res.json({ id: userId, role: members[idx].role });
+});
+
+// DELETE /clerk-stub/organizations/:orgId/memberships/:userId — remove member
+app.delete("/clerk-stub/organizations/:orgId/memberships/:userId", (req, res) => {
+  if (_clerkMembershipFailMode) {
+    res.status(500).json({ error: "simulated clerk api error" }); return;
+  }
+  const { orgId, userId } = req.params;
+  const members = _clerkOrgMembersMap.get(orgId) ?? [];
+  const idx = members.findIndex((m) => m.userId === userId);
+  if (idx === -1) { res.status(404).json({ errors: [{ code: "resource_not_found" }] }); return; }
+  _clerkOrgMembersMap.set(orgId, members.filter((_, i) => i !== idx));
+  res.json({ deleted: true });
+});
+
+// POST /test/set-clerk-invitation-fail { fail: bool }
+app.post("/test/set-clerk-invitation-fail", (req, res) => {
+  _clerkInvitationFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true, clerkInvitationFailMode: _clerkInvitationFailMode });
+});
+
+// GET /test/get-last-invite — returns { redirectUrl } of the most recently created invitation
+app.get("/test/get-last-invite", (_req, res) => {
+  res.json({ redirectUrl: _lastCreatedInvitation?.redirectUrl ?? null });
 });
 
 // POST /test/set-clerk-user { clerkUserId, email, verified }
