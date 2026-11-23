@@ -190,8 +190,16 @@ body {
 .dashboard-menu-btn:hover { background: var(--surface-3); }
 
 /* Sidebar panel: desktop fixed strip, mobile off-canvas */
+/* display:flex + height:100% let the <nav> inside (which uses flex:1 and a
+   spacer div) fill the viewport height and pin user card to the bottom.
+   These rules are outside any media query so they only apply on desktop;
+   the @media (max-width: 900px) block below overrides them for mobile. */
 .sidebar-panel {
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
 }
 
 /* Backdrop: only shown on mobile when sidebar is open */
