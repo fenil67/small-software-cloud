@@ -96,43 +96,91 @@ apiKeysRouter.post("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, 
   });
 }));
 
-apiKeysRouter.get("/", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
+apiKeysRouter.get("/", asyncHandler(async (req: Request, res: Response) => {
   const sscAuth = req.sscAuth!;
-  const orgId = await ensureOrg(sscAuth.clerkOrgId!);
+  if (sscAuth.type !== "clerk") {
+    res.status(403).json({ error: "clerk_session_required", message: "API key management requires a Clerk session." });
+    return;
+  }
+  if (!sscAuth.clerkOrgId) {
+    res.status(403).json({ error: "no_active_org", message: "No active organization in session." });
+    return;
+  }
 
-  const { rows } = await pool.query(
-    `SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at
-     FROM api_keys WHERE org_id = $1 ORDER BY created_at DESC`,
-    [orgId],
-  );
-  res.json(rows);
+  const orgId = await ensureOrg(sscAuth.clerkOrgId);
+  const isAdmin = sscAuth.clerkOrgRole === "org:admin";
+
+  if (isAdmin) {
+    // Admins see all keys in the org with the creator's email
+    const { rows } = await pool.query(
+      `SELECT k.id, k.name, k.key_prefix, k.scopes, k.created_at, k.last_used_at, k.revoked_at,
+              u.email AS created_by_email
+       FROM api_keys k
+       LEFT JOIN users u ON u.id = k.created_by
+       WHERE k.org_id = $1
+       ORDER BY k.created_at DESC`,
+      [orgId],
+    );
+    res.json(rows);
+  } else {
+    // Members see only their own keys
+    const userId = await ensureUser(sscAuth.clerkUserId!);
+    const { rows } = await pool.query(
+      `SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at
+       FROM api_keys WHERE org_id = $1 AND created_by = $2 ORDER BY created_at DESC`,
+      [orgId, userId],
+    );
+    res.json(rows);
+  }
 }));
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-apiKeysRouter.delete("/:id", requireClerkOrgAdmin, asyncHandler(async (req: Request, res: Response) => {
+apiKeysRouter.delete("/:id", asyncHandler(async (req: Request, res: Response) => {
   if (!UUID_RE.test(req.params.id)) {
     res.status(404).json({ error: "not_found" });
     return;
   }
 
   const sscAuth = req.sscAuth!;
-  const orgId = await ensureOrg(sscAuth.clerkOrgId!);
+  if (sscAuth.type !== "clerk") {
+    res.status(403).json({ error: "clerk_session_required", message: "API key management requires a Clerk session." });
+    return;
+  }
+  if (!sscAuth.clerkOrgId) {
+    res.status(403).json({ error: "no_active_org", message: "No active organization in session." });
+    return;
+  }
+
+  const orgId = await ensureOrg(sscAuth.clerkOrgId);
+  const isAdmin = sscAuth.clerkOrgRole === "org:admin";
+  // For members, resolve userId before the query (needed for the created_by filter).
+  // For admins, defer ensureUser until after the rowCount check so a UUID-not-in-DB
+  // request returns 404 without calling the Clerk API unnecessarily.
+  const memberUserId = isAdmin ? null : await ensureUser(sscAuth.clerkUserId!);
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const { rowCount } = await client.query(
-      `UPDATE api_keys SET revoked_at = now()
-       WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL`,
-      [req.params.id, orgId],
-    );
+    // Admins can revoke any key in the org; members can only revoke their own
+    const { rowCount } = isAdmin
+      ? await client.query(
+          `UPDATE api_keys SET revoked_at = now()
+           WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL`,
+          [req.params.id, orgId],
+        )
+      : await client.query(
+          `UPDATE api_keys SET revoked_at = now()
+           WHERE id = $1 AND org_id = $2 AND created_by = $3 AND revoked_at IS NULL`,
+          [req.params.id, orgId, memberUserId],
+        );
     if (!rowCount) {
       await client.query("ROLLBACK");
       res.status(404).json({ error: "key_not_found" });
       return;
     }
-    const userId = await ensureUser(sscAuth.clerkUserId!);
+    // Resolve actor for activity log (admin path: now safe to call after key exists)
+    const userId = memberUserId ?? (await ensureUser(sscAuth.clerkUserId!));
     const { rows: ke2 } = await client.query<{ email: string }>(
       "SELECT email FROM users WHERE id = $1", [userId]);
     const revokeActorEmail = ke2[0]?.email ?? null;

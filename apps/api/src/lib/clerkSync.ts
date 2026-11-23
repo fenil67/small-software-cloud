@@ -299,11 +299,12 @@ export async function createOrgInvitationClerk(
 export async function revokeOrgInvitationClerk(
   clerkOrgId: string,
   invitationId: string,
+  requestingUserId?: string | null,
 ): Promise<void> {
   const clerkKey = process.env.CLERK_SECRET_KEY ?? "";
   await axios.post(
     `${clerkApiBase()}/organizations/${clerkOrgId}/invitations/${invitationId}/revoke`,
-    {},
+    requestingUserId ? { requesting_user_id: requestingUserId } : {},
     { headers: { Authorization: `Bearer ${clerkKey}` } },
   );
 }

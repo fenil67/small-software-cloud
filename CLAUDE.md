@@ -137,9 +137,10 @@ git status                                  # only files for this task
 
 ## Current state (update at the end of every task)
 
-- Last updated: 2026-11-22. Branch `feat/workspace-members` (from `wip/cli-mcp`). Tests: API 1234, web 343.
+- Last updated: 2026-11-22. Branch `feat/profile-settings` (from `wip/cli-mcp`). Tests: API 1244, web 362.
 - Live: auth (Google, GitHub, email code), workspaces (create, switch, delete with full cleanup), apps, sharing with invite emails, API keys with scopes, account settings (profile, emails, connected accounts, sessions, reverification, delete account), admin overview and activity, kill switch, watchdog, staging environment.
 - Added in this branch: workspace members and roles (invite by email/role, resend/revoke invitation, change role, remove member, leave workspace — last-admin guards on all), accept-invite page at `/accept-invite` (Clerk ticket strategy, existing + new users), Settings page Clerk 404 recovery (`WorkspaceGoneRedirect`), 5 new activity event types (member.invited/invitation_revoked/role_changed/removed/left). API routes: GET /v1/workspace/members, POST /v1/workspace/invitations, POST .../invitations/:id/resend, DELETE .../invitations/:id, PATCH /v1/workspace/members/:userId, DELETE .../members/:userId, POST /v1/workspace/leave. Member removal revokes API keys and app shares.
+- Fixed in this session (staging bugs + corrections): (1) accept-invite: finalize() failure checks membership (navigate only if confirmed member of invited org; show error otherwise); already-signed-in accepts only the org-matching invitation; no-match shows "not for this account" with sign-out link; invitation redirectUrl now includes ?org=<clerkOrgId>; (2) revoke invitation sends requesting_user_id to Clerk; (3) API keys: member sees own only, admin sees all with created_by_email, member can only revoke own; (4) activity feed shows human sentences for all 5 member.* event types; (5) sidebar fixed, main content scrolls independently.
 - Next (see Notion Work Board): app logs → environment variables and secrets → admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
 - Open: move off railway.toml before 2026-12-01; book the external pen test.
 

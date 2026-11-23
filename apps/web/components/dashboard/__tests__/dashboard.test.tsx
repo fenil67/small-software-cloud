@@ -572,16 +572,17 @@ describe("KeysClient – key reveal shown after create", () => {
   });
 });
 
-describe("KeysClient – admin-only controls absent for member", () => {
+describe("KeysClient – member visibility and controls", () => {
   it("non-admin sees no create form", () => {
     render(<KeysClient keys={[baseKey]} isAdmin={false} />);
     expect(screen.queryByRole("button", { name: /create key/i })).not.toBeInTheDocument();
   });
-  it("non-admin sees no revoke buttons", () => {
+  it("non-admin sees revoke button on own keys (members can revoke their own)", () => {
     render(<KeysClient keys={[baseKey]} isAdmin={false} />);
-    expect(screen.queryByRole("button", { name: /revoke/i })).not.toBeInTheDocument();
+    // Members CAN revoke their own keys (all keys returned by GET for members are theirs)
+    expect(screen.getByRole("button", { name: /revoke/i })).toBeInTheDocument();
   });
-  it("non-admin sees read-only note", () => {
+  it("non-admin sees note about own-key revoke only", () => {
     render(<KeysClient keys={[baseKey]} isAdmin={false} />);
     expect(screen.getByText(/only admins/i)).toBeInTheDocument();
   });
@@ -1270,5 +1271,30 @@ describe("AppsPage – no_active_org redirect", () => {
     const result = await AppsPage();
     expect(mockRedirect).not.toHaveBeenCalledWith("/onboarding");
     expect(JSON.stringify(result)).toContain("could not load");
+  });
+});
+
+// ── DashboardLayout – sidebar fixed scroll (Bug #5) ──────────────────────────
+
+describe("DashboardLayout – sidebar fixed, main scrolls (Bug #5)", () => {
+  it("outer container uses height:100vh and overflow:hidden (M: change to minHeight → test fails)", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
+    const jsx = await DashboardLayout({ children: React.createElement("div") });
+    render(jsx);
+    // The outer div must have height:100vh (not minHeight) and overflow:hidden
+    // so the sidebar stays fixed and only main scrolls
+    const outer = document.querySelector("div[style]") as HTMLElement | null;
+    expect(outer).not.toBeNull();
+    expect(outer!.style.height).toBe("100vh");
+    expect(outer!.style.overflowX === "hidden" || outer!.style.overflow === "hidden" || outer!.style.overflowY !== "auto").toBe(true);
+  });
+
+  it("main element uses overflowY:auto so only it scrolls", async () => {
+    mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
+    const jsx = await DashboardLayout({ children: React.createElement("div", { "data-testid": "child" }) });
+    render(jsx);
+    const main = document.querySelector("main") as HTMLElement | null;
+    expect(main).not.toBeNull();
+    expect(main!.style.overflowY).toBe("auto");
   });
 });

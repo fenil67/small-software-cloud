@@ -82,6 +82,86 @@ describe("appName()", () => {
   });
 });
 
+// ── member event sentences ────────────────────────────────────────────────────
+
+describe("member event sentences", () => {
+  it("member.invited includes invitee email and role label", () => {
+    const e = makeEvent({
+      event_type: "member.invited",
+      actor_email: "admin@example.com",
+      metadata: { invitee_email: "user@example.com", role: "org:member" },
+    });
+    const sentence = EVENT_META["member.invited"].sentence(e);
+    expect(sentence).toContain("admin@example.com");
+    expect(sentence).toContain("user@example.com");
+    expect(sentence).toContain("Member");
+  });
+
+  it("member.invited shows Admin role label for org:admin", () => {
+    const e = makeEvent({
+      event_type: "member.invited",
+      actor_email: "admin@example.com",
+      metadata: { invitee_email: "boss@example.com", role: "org:admin" },
+    });
+    const sentence = EVENT_META["member.invited"].sentence(e);
+    expect(sentence).toContain("Admin");
+    expect(sentence).not.toContain("org:admin");
+  });
+
+  it("member.invitation_revoked includes invitee email", () => {
+    const e = makeEvent({
+      event_type: "member.invitation_revoked",
+      actor_email: "admin@example.com",
+      metadata: { invitee_email: "user@example.com" },
+    });
+    const sentence = EVENT_META["member.invitation_revoked"].sentence(e);
+    expect(sentence).toContain("admin@example.com");
+    expect(sentence).toContain("user@example.com");
+  });
+
+  it("member.role_changed includes new role label", () => {
+    const e = makeEvent({
+      event_type: "member.role_changed",
+      actor_email: "admin@example.com",
+      metadata: { old_role: "org:member", new_role: "org:admin" },
+    });
+    const sentence = EVENT_META["member.role_changed"].sentence(e);
+    expect(sentence).toContain("admin@example.com");
+    expect(sentence).toContain("Admin");
+    expect(sentence).not.toContain("org:admin");
+  });
+
+  it("member.removed includes actor", () => {
+    const e = makeEvent({
+      event_type: "member.removed",
+      actor_email: "admin@example.com",
+      metadata: { removed_role: "org:member" },
+    });
+    const sentence = EVENT_META["member.removed"].sentence(e);
+    expect(sentence).toContain("admin@example.com");
+    expect(sentence).toContain("workspace");
+  });
+
+  it("member.left includes actor", () => {
+    const e = makeEvent({
+      event_type: "member.left",
+      actor_email: "user@example.com",
+      metadata: { left_role: "org:member" },
+    });
+    const sentence = EVENT_META["member.left"].sentence(e);
+    expect(sentence).toContain("user@example.com");
+    expect(sentence).toContain("left");
+  });
+
+  it("all 5 member event types are present in EVENT_META", () => {
+    const events = ["member.invited", "member.invitation_revoked", "member.role_changed", "member.removed", "member.left"];
+    for (const ev of events) {
+      expect(EVENT_META[ev]).toBeDefined();
+      expect(EVENT_META[ev].chip).toBe("People");
+    }
+  });
+});
+
 // ── activity.json fixture contract ────────────────────────────────────────────
 
 describe("activity fixture contract", () => {

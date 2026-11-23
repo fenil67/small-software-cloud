@@ -1244,16 +1244,23 @@ app.post("/clerk-stub/organizations/:orgId/invitations", (req, res) => {
 });
 
 // POST /clerk-stub/organizations/:orgId/invitations/:id/revoke
+let _lastRevokeRequestingUserId: string | null = null;
 app.post("/clerk-stub/organizations/:orgId/invitations/:id/revoke", (req, res) => {
   if (_clerkInvitationFailMode) {
     res.status(500).json({ error: "simulated clerk api error" }); return;
   }
   const { orgId, id } = req.params;
+  _lastRevokeRequestingUserId = (req.body as { requesting_user_id?: string }).requesting_user_id ?? null;
   const existing = _clerkOrgInvitationsMap.get(orgId) ?? [];
   const idx = existing.findIndex((i) => i.id === id);
   if (idx === -1) { res.status(404).json({ errors: [{ code: "resource_not_found" }] }); return; }
   _clerkOrgInvitationsMap.set(orgId, existing.filter((_, i) => i !== idx));
   res.json({ revoked: true });
+});
+
+// GET /test/get-last-revoke — returns { requestingUserId } from most recent revoke call
+app.get("/test/get-last-revoke", (_req, res) => {
+  res.json({ requestingUserId: _lastRevokeRequestingUserId });
 });
 
 // PATCH /clerk-stub/organizations/:orgId/memberships/:userId — update role

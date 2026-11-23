@@ -46,6 +46,7 @@ export function Sidebar({ isAdmin = false, openAlertCount = 0 }: SidebarProps) {
         padding: "24px 16px",
         gap: "32px",
         boxSizing: "border-box",
+        overflowY: "auto",
       }}
     >
       {/* Logo */}
