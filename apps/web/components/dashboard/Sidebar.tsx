@@ -85,32 +85,33 @@ export function Sidebar({ isAdmin = false, openAlertCount = 0 }: SidebarProps) {
 
       <div style={{ flex: 1 }} />
 
-      {/* Workspace switcher */}
-      <WorkspaceSwitcher
-        currentOrgName={organization?.name ?? null}
-        currentOrgId={organization?.id ?? null}
-        memberships={(userMemberships?.data ?? []).map((m) => ({
-          id: m.organization.id,
-          name: m.organization.name,
-        }))}
-        onSwitch={async (orgId) => {
-          try {
-            await setActive?.({ organization: orgId, redirectUrl: "/apps" });
-          } catch {
-            navigateHard("/apps");
-          }
-        }}
-      />
+      {/* Bottom group: workspace switcher + user card, close together */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+        <WorkspaceSwitcher
+          currentOrgName={organization?.name ?? null}
+          currentOrgId={organization?.id ?? null}
+          memberships={(userMemberships?.data ?? []).map((m) => ({
+            id: m.organization.id,
+            name: m.organization.name,
+          }))}
+          onSwitch={async (orgId) => {
+            try {
+              await setActive?.({ organization: orgId, redirectUrl: "/apps" });
+            } catch {
+              navigateHard("/apps");
+            }
+          }}
+        />
 
-      {/* User block */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "12px",
-          padding: "8px",
-        }}
-      >
+        {/* User card */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            padding: "8px",
+          }}
+        >
         <span
           aria-hidden="true"
           style={{
@@ -169,6 +170,7 @@ export function Sidebar({ isAdmin = false, openAlertCount = 0 }: SidebarProps) {
         >
           <SignOutIcon />
         </button>
+        </div>
       </div>
     </nav>
   );
@@ -236,7 +238,7 @@ function WorkspaceSwitcher({
   }
 
   return (
-    <div style={{ position: "relative", marginBottom: "4px" }}>
+    <div style={{ position: "relative" }}>
       <button
         ref={triggerRef}
         type="button"

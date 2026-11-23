@@ -132,7 +132,7 @@ export function AdminOverviewClient({ stats, apps, statsError, appsError }: Admi
   }
 
   return (
-    <div style={{ padding: "40px 48px 64px", maxWidth: "1200px" }}>
+    <div>
       {/* Header */}
       <div style={{ marginBottom: "32px" }}>
         <h1 style={{ fontSize: "30px", fontWeight: 600, color: "var(--fg)", margin: 0, marginBottom: "8px" }}>

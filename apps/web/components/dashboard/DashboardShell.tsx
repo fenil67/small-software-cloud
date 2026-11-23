@@ -34,7 +34,7 @@ export function DashboardShell({ isAdmin, openAlertCount, children }: DashboardS
   }, [mobileOpen]);
 
   return (
-    <div style={{ height: "100vh", overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--bg)" }}>
+    <div className="dashboard-shell">
       {/* Mobile top bar — hidden above 900px */}
       <div className="dashboard-topbar">
         <button
@@ -52,7 +52,7 @@ export function DashboardShell({ isAdmin, openAlertCount, children }: DashboardS
       </div>
 
       {/* Layout row */}
-      <div style={{ flex: 1, display: "flex", overflow: "hidden", position: "relative" }}>
+      <div className="dashboard-layout-row">
         {/* Overlay backdrop (mobile only, when open) */}
         {mobileOpen && (
           <div
@@ -68,7 +68,7 @@ export function DashboardShell({ isAdmin, openAlertCount, children }: DashboardS
         </div>
 
         {/* Main scrollable area */}
-        <main id="main-content" style={{ flex: 1, minWidth: 0, overflowY: "auto" }} tabIndex={-1}>
+        <main id="main-content" className="dashboard-main" tabIndex={-1}>
           {/* Max-width container for all content */}
           <div className="page-container">
             {children}

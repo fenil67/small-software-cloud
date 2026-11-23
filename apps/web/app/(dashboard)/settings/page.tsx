@@ -50,7 +50,7 @@ export default async function SettingsPage() {
   }
 
   return (
-    <div style={{ padding: "40px 48px 64px", maxWidth: "680px", display: "flex", flexDirection: "column", gap: "32px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "32px" }}>
       <header style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
         <h1 style={{ margin: 0, fontSize: "30px", lineHeight: "36px", fontWeight: 600, letterSpacing: "-0.02em" }}>
           Settings

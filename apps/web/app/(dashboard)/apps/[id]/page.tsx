@@ -39,7 +39,7 @@ export default async function AppDetailPage({ params }: PageProps) {
 
   if (appError || !app) {
     return (
-      <div style={{ padding: "32px 40px" }}>
+      <div>
         <ErrorCard message={appError ?? "We could not load this app. Try again in a moment."} />
       </div>
     );
@@ -76,7 +76,7 @@ export default async function AppDetailPage({ params }: PageProps) {
   const appUrl = normalizeAppUrl(app.subdomain);
 
   return (
-    <div style={{ padding: "32px 40px", maxWidth: "1100px" }}>
+    <div>
       {/* Breadcrumb */}
       <nav aria-label="Breadcrumb" style={{ marginBottom: "16px", fontSize: "13px", color: "var(--fg-3)" }}>
         <Link href="/apps" style={{ color: "var(--fg-3)", textDecoration: "none" }}>Apps</Link>

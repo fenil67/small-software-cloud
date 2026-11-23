@@ -196,7 +196,7 @@ export function ActivityClient({ initialSummary }: ActivityClientProps) {
   const chips: Array<EventChip | null> = [null, "Visits", "Refused", "Deploys", "Sharing", "People", "API keys", "Watchdog", "Admin"];
 
   return (
-    <div style={{ padding: "40px 48px 64px", maxWidth: "1400px" }}>
+    <div>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "24px", flexWrap: "wrap", gap: "12px" }}>
         <div>

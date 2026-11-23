@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useTransition } from "react";
+import React, { useState, useTransition, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import type { ApiKey, ApiKeyCreated } from "../../../lib/api-types";
 import { createKey, revokeKey } from "./actions";
@@ -11,76 +11,268 @@ interface Props {
 }
 
 export function KeysClient({ keys, isAdmin }: Props) {
+  const router = useRouter();
+  const [dialogOpen, setDialogOpen] = useState(false);
   const [revealedKey, setRevealedKey] = useState<ApiKeyCreated | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  function openDialog() {
+    setRevealedKey(null);
+    setDialogOpen(true);
+  }
+
+  function closeDialog() {
+    if (revealedKey) router.refresh();
+    setDialogOpen(false);
+    setRevealedKey(null);
+    setTimeout(() => triggerRef.current?.focus(), 0);
+  }
+
+  function handleDone() {
+    setDialogOpen(false);
+    setRevealedKey(null);
+    router.refresh();
+    setTimeout(() => triggerRef.current?.focus(), 0);
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "32px" }}>
-      {/* One-time reveal box */}
-      {revealedKey && (
-        <KeyRevealBox keyData={revealedKey} onDismiss={() => setRevealedKey(null)} />
-      )}
-
-      {/* Two-column layout: keys list + create form */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "24px", alignItems: "flex-start" }}>
-        {/* Keys list */}
-        <section
-          aria-labelledby="keys-h"
-          style={{
-            flex: "2 1 520px",
-            minWidth: 0,
-            borderRadius: "16px",
-            background: "var(--surface)",
-            border: "1px solid var(--line)",
-            overflow: "hidden",
-          }}
-        >
-          <div style={{ padding: "20px 24px" }}>
-            <h2 id="keys-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
-              {isAdmin ? "All keys" : "Your keys"}
-            </h2>
-          </div>
-          {!isAdmin && (
-            <p style={{ fontSize: "13px", color: "var(--fg-3)", margin: "0 24px 20px" }}>
-              You can revoke your own keys. Only admins can create keys or revoke others&apos; keys.
-            </p>
-          )}
-          {keys.length === 0 ? (
-            <p style={{ color: "var(--fg-3)", fontSize: "14px", margin: "0 24px 20px" }}>
-              No API keys yet.
-            </p>
-          ) : (
-            <KeysTable keys={keys} isAdmin={isAdmin} />
-          )}
-        </section>
-
-        {/* Create form — admin only */}
-        {isAdmin && (
-          <section
-            aria-labelledby="create-h"
+      {/* Page header */}
+      <header
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "flex-end",
+          justifyContent: "space-between",
+          gap: "16px",
+        }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+          <h1
             style={{
-              flex: "1 1 320px",
-              minWidth: 0,
-              borderRadius: "16px",
-              background: "var(--surface)",
-              border: "1px solid var(--line)",
-              padding: "20px 24px 24px",
-              display: "flex",
-              flexDirection: "column",
-              gap: "16px",
+              margin: 0,
+              fontSize: "30px",
+              lineHeight: "36px",
+              fontWeight: 600,
+              letterSpacing: "-0.02em",
             }}
           >
-            <h2 id="create-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
-              Create a key
-            </h2>
-            <CreateKeyForm onCreated={(k) => setRevealedKey(k)} />
-          </section>
+            API keys
+          </h1>
+          <p style={{ margin: 0, fontSize: "14px", lineHeight: "20px", color: "var(--fg-2)" }}>
+            Keys let the Utir command line and your AI assistant deploy for you.
+          </p>
+        </div>
+        {isAdmin && (
+          <button
+            ref={triggerRef}
+            type="button"
+            onClick={openDialog}
+            aria-haspopup="dialog"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              height: "40px",
+              padding: "0 16px",
+              borderRadius: "10px",
+              border: 0,
+              background: "var(--btn-bg)",
+              color: "var(--btn-fg)",
+              fontSize: "14px",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            Create key
+          </button>
+        )}
+      </header>
+
+      {/* Keys table — full width */}
+      <section
+        aria-labelledby="keys-h"
+        style={{
+          borderRadius: "16px",
+          background: "var(--surface)",
+          border: "1px solid var(--line)",
+          overflow: "hidden",
+        }}
+      >
+        <div style={{ padding: "20px 24px" }}>
+          <h2 id="keys-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
+            {isAdmin ? "All keys" : "Your keys"}
+          </h2>
+        </div>
+        {!isAdmin && (
+          <p style={{ fontSize: "13px", color: "var(--fg-3)", margin: "0 24px 20px" }}>
+            You can revoke your own keys. Only admins can create keys or revoke others&apos; keys.
+          </p>
+        )}
+        {keys.length === 0 ? (
+          <p style={{ color: "var(--fg-3)", fontSize: "14px", margin: "0 24px 20px" }}>
+            No API keys yet.
+          </p>
+        ) : (
+          <KeysTable keys={keys} isAdmin={isAdmin} />
+        )}
+      </section>
+
+      {/* Create key dialog */}
+      {isAdmin && dialogOpen && (
+        <CreateKeyDialog
+          revealedKey={revealedKey}
+          onCreated={setRevealedKey}
+          onDone={handleDone}
+          onClose={closeDialog}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── CreateKeyDialog ───────────────────────────────────────────────────────────
+
+interface CreateKeyDialogProps {
+  revealedKey: ApiKeyCreated | null;
+  onCreated: (k: ApiKeyCreated) => void;
+  onDone: () => void;
+  onClose: () => void;
+}
+
+function CreateKeyDialog({ revealedKey, onCreated, onDone, onClose }: CreateKeyDialogProps) {
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    const first = panel.querySelector<HTMLElement>(
+      "button:not([disabled]), input:not([disabled])",
+    );
+    first?.focus();
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") { onClose(); return; }
+      if (e.key !== "Tab") return;
+      const container = panelRef.current;
+      if (!container) return;
+      const focusable = Array.from(
+        container.querySelectorAll<HTMLElement>(
+          "button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])",
+        ),
+      );
+      if (focusable.length === 0) return;
+      const first2 = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first2) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first2.focus();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      role="presentation"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1000,
+        padding: "24px",
+        boxSizing: "border-box",
+      }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-key-h"
+        style={{
+          width: "100%",
+          maxWidth: "480px",
+          background: "var(--surface)",
+          border: "1px solid var(--line-strong)",
+          borderRadius: "20px",
+          padding: "24px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "20px",
+        }}
+      >
+        {revealedKey ? (
+          <KeyRevealContent keyData={revealedKey} onDone={onDone} />
+        ) : (
+          <>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+              }}
+            >
+              <h2
+                id="create-key-h"
+                style={{ margin: 0, fontSize: "18px", lineHeight: "28px", fontWeight: 600 }}
+              >
+                Create a key
+              </h2>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "32px",
+                  height: "32px",
+                  borderRadius: "8px",
+                  border: 0,
+                  background: "transparent",
+                  color: "var(--fg-3)",
+                  cursor: "pointer",
+                  fontSize: "18px",
+                  lineHeight: 1,
+                  flexShrink: 0,
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <CreateKeyForm onCreated={onCreated} />
+          </>
         )}
       </div>
     </div>
   );
 }
 
-function KeyRevealBox({ keyData, onDismiss }: { keyData: ApiKeyCreated; onDismiss: () => void }) {
+// ── KeyRevealContent ──────────────────────────────────────────────────────────
+
+function KeyRevealContent({ keyData, onDone }: { keyData: ApiKeyCreated; onDone: () => void }) {
   const [copied, setCopied] = useState(false);
 
   function handleCopy() {
@@ -94,19 +286,14 @@ function KeyRevealBox({ keyData, onDismiss }: { keyData: ApiKeyCreated; onDismis
     <section
       role="status"
       aria-live="polite"
-      aria-labelledby="new-key-h"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: "16px",
-        padding: "24px",
-        borderRadius: "16px",
-        background: "var(--surface)",
-        border: "1px solid var(--line-strong)",
-      }}
+      aria-labelledby="create-key-h"
+      style={{ display: "flex", flexDirection: "column", gap: "16px" }}
     >
       <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-        <h2 id="new-key-h" style={{ margin: 0, fontSize: "16px", lineHeight: "24px", fontWeight: 600 }}>
+        <h2
+          id="create-key-h"
+          style={{ margin: 0, fontSize: "18px", lineHeight: "28px", fontWeight: 600 }}
+        >
           Copy your new key now
         </h2>
         <p style={{ margin: 0, fontSize: "14px", lineHeight: "20px", color: "var(--fg-2)" }}>
@@ -198,7 +385,7 @@ function KeyRevealBox({ keyData, onDismiss }: { keyData: ApiKeyCreated; onDismis
       <div>
         <button
           type="button"
-          onClick={onDismiss}
+          onClick={onDone}
           aria-label="Dismiss"
           style={{
             height: "32px",
@@ -217,6 +404,8 @@ function KeyRevealBox({ keyData, onDismiss }: { keyData: ApiKeyCreated; onDismis
     </section>
   );
 }
+
+// ── CreateKeyForm ─────────────────────────────────────────────────────────────
 
 function CreateKeyForm({ onCreated }: { onCreated: (k: ApiKeyCreated) => void }) {
   const [name, setName] = useState("");
@@ -243,8 +432,6 @@ function CreateKeyForm({ onCreated }: { onCreated: (k: ApiKeyCreated) => void })
       if (result.error) {
         setError("Could not create key.");
       } else if (result.key) {
-        setName("");
-        setScopes(new Set(["read", "deploy"]));
         onCreated(result.key);
       }
     });
@@ -325,11 +512,13 @@ function CreateKeyForm({ onCreated }: { onCreated: (k: ApiKeyCreated) => void })
           cursor: pending ? "wait" : "pointer",
         }}
       >
-        {pending ? "Creating..." : "Create key"}
+        {pending ? "Creating…" : "Create key"}
       </button>
     </form>
   );
 }
+
+// ── ScopeCheckbox ─────────────────────────────────────────────────────────────
 
 interface ScopeCheckboxProps {
   id: string;
@@ -369,6 +558,8 @@ function ScopeCheckbox({ id, label, description, checked, disabled, onChange }: 
   );
 }
 
+// ── KeysTable ─────────────────────────────────────────────────────────────────
+
 function formatScopesDisplay(scopes: string[] | undefined): string {
   if (!scopes || scopes.length === 0) return "Read";
   const order = ["read", "deploy", "manage"];
@@ -396,7 +587,6 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
     });
   }
 
-  // Column layout changes if admin (adds "Created by" column)
   const colTemplate = isAdmin
     ? "minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) 110px 120px 96px"
     : "minmax(0, 1.4fr) minmax(0, 1.2fr) 110px 120px 96px";
@@ -432,9 +622,6 @@ function KeysTable({ keys, isAdmin }: { keys: ApiKey[]; isAdmin: boolean }) {
 
         {keys.map((k) => {
           const isRevoked = !!k.revoked_at;
-          // Row uses container padding (same as the header grid above) so both
-          // header and row compute column track widths from the same available
-          // width (container_width − 48px), keeping header and cell text aligned.
           const baseCell: React.CSSProperties = {
             display: "flex",
             alignItems: "center",

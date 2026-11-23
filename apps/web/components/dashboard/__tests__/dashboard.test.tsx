@@ -515,9 +515,15 @@ const createdKey: ApiKeyCreated = {
 
 async function createKeyAndWait() {
   render(<KeysClient keys={[]} isAdmin={true} />);
-  fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "New Key" } });
+  // Open the create dialog
+  fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+  // Fill name in dialog form
+  fireEvent.change(await screen.findByLabelText(/name/i), { target: { value: "New Key" } });
+  // Submit via the form's submit button
   await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+    const form = (screen.getByLabelText(/name/i) as HTMLElement).closest("form")!;
+    const submitBtn = form.querySelector("button[type='submit']") as HTMLElement;
+    fireEvent.click(submitBtn);
   });
   await waitFor(() => screen.getByRole("status"));
 }
@@ -561,9 +567,14 @@ describe("KeysClient – key reveal shown after create", () => {
 
   it("reveal box gone after re-mount", async () => {
     const { unmount } = render(<KeysClient keys={[]} isAdmin={true} />);
-    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "New Key" } });
+    // Open the dialog
+    fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+    // Fill name and submit
+    fireEvent.change(await screen.findByLabelText(/name/i), { target: { value: "New Key" } });
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+      const form = (screen.getByLabelText(/name/i) as HTMLElement).closest("form")!;
+      const submitBtn = form.querySelector("button[type='submit']") as HTMLElement;
+      fireEvent.click(submitBtn);
     });
     await waitFor(() => screen.getByRole("status"));
     unmount();
@@ -585,6 +596,53 @@ describe("KeysClient – member visibility and controls", () => {
   it("non-admin sees note about own-key revoke only", () => {
     render(<KeysClient keys={[baseKey]} isAdmin={false} />);
     expect(screen.getByText(/only admins/i)).toBeInTheDocument();
+  });
+});
+
+describe("KeysClient – Create key dialog", () => {
+  beforeEach(() => {
+    mockCreateKey.mockResolvedValue({ key: createdKey });
+  });
+
+  it("'Create key' button is present for admin", () => {
+    render(<KeysClient keys={[]} isAdmin={true} />);
+    expect(screen.getByRole("button", { name: /create key/i })).toBeInTheDocument();
+  });
+
+  it("dialog opens when Create key button clicked", async () => {
+    render(<KeysClient keys={[]} isAdmin={true} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("dialog shows Create a key form with name input", async () => {
+    render(<KeysClient keys={[]} isAdmin={true} />);
+    fireEvent.click(screen.getByRole("button", { name: /create key/i }));
+    expect(await screen.findByLabelText(/name/i)).toBeInTheDocument();
+    expect(screen.getByText(/create a key/i)).toBeInTheDocument();
+  });
+
+  it("after create, dialog shows key reveal with full key", async () => {
+    await createKeyAndWait();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("status").textContent).toContain("ssc_new");
+  });
+
+  it("Done button closes dialog and calls router.refresh", async () => {
+    await createKeyAndWait();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mockRouterRefresh).toHaveBeenCalled();
+  });
+
+  it("backdrop click closes dialog (key was created → router.refresh called)", async () => {
+    await createKeyAndWait();
+    const backdrop = document.querySelector("[role='presentation']")!;
+    fireEvent.click(backdrop);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mockRouterRefresh).toHaveBeenCalled();
   });
 });
 
@@ -1207,6 +1265,46 @@ describe("DashboardShell responsive layout", () => {
     );
     expect(container.querySelector(".sidebar-panel")).toBeInTheDocument();
   });
+
+  it("sidebar-panel gets sidebar-panel--open class when menu button clicked", () => {
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    const btn = screen.getByRole("button", { name: /open navigation/i });
+    expect(document.querySelector(".sidebar-panel--open")).not.toBeInTheDocument();
+    fireEvent.click(btn);
+    expect(document.querySelector(".sidebar-panel--open")).toBeInTheDocument();
+  });
+
+  it("backdrop click closes sidebar", () => {
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    expect(document.querySelector(".sidebar-panel--open")).toBeInTheDocument();
+    // The backdrop is the aria-hidden overlay div
+    const backdrop = document.querySelector(".sidebar-backdrop")!;
+    fireEvent.click(backdrop);
+    expect(document.querySelector(".sidebar-panel--open")).not.toBeInTheDocument();
+  });
+
+  it("layout row div has no inline display, overflow, or position styles (CSS class handles layout)", () => {
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+    const layoutRow = document.querySelector(".dashboard-layout-row")!;
+    expect(layoutRow).toBeInTheDocument();
+    // Inline styles must NOT override the CSS class — if they did, media queries couldn't override them
+    expect(layoutRow.getAttribute("style") ?? "").not.toMatch(/display\s*:/);
+    expect(layoutRow.getAttribute("style") ?? "").not.toMatch(/overflow\s*:/);
+    expect(layoutRow.getAttribute("style") ?? "").not.toMatch(/position\s*:/);
+  });
 });
 
 // ── BUG B – workspace creation try/finally guarantees navigation ─────────────
@@ -1325,24 +1423,23 @@ describe("AppsPage – no_active_org redirect", () => {
 // ── DashboardLayout – sidebar fixed scroll (Bug #5) ──────────────────────────
 
 describe("DashboardLayout – sidebar fixed, main scrolls (Bug #5)", () => {
-  it("outer container uses height:100vh and overflow:hidden (M: change to minHeight → test fails)", async () => {
+  it("outer container uses dashboard-shell class (height:100vh overflow:hidden via CSS)", async () => {
     mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
     const jsx = await DashboardLayout({ children: React.createElement("div") });
     render(jsx);
-    // The outer div must have height:100vh (not minHeight) and overflow:hidden
-    // so the sidebar stays fixed and only main scrolls
-    const outer = document.querySelector("div[style]") as HTMLElement | null;
+    // The outer container must use the dashboard-shell CSS class which sets
+    // height:100vh and overflow:hidden — inline styles were moved to CSS so
+    // that media queries can override them
+    const outer = document.querySelector(".dashboard-shell") as HTMLElement | null;
     expect(outer).not.toBeNull();
-    expect(outer!.style.height).toBe("100vh");
-    expect(outer!.style.overflowX === "hidden" || outer!.style.overflow === "hidden" || outer!.style.overflowY !== "auto").toBe(true);
   });
 
-  it("main element uses overflowY:auto so only it scrolls", async () => {
+  it("main element uses dashboard-main class (overflowY:auto via CSS)", async () => {
     mockServerAuth.mockResolvedValue({ userId: "user_123", orgId: "org_123" });
     const jsx = await DashboardLayout({ children: React.createElement("div", { "data-testid": "child" }) });
     render(jsx);
     const main = document.querySelector("main") as HTMLElement | null;
     expect(main).not.toBeNull();
-    expect(main!.style.overflowY).toBe("auto");
+    expect(main!.className).toContain("dashboard-main");
   });
 });

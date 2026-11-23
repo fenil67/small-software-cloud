@@ -36,7 +36,7 @@ export default async function AppsPage() {
   if (noActiveOrg) redirect("/onboarding");
 
   return (
-    <div style={{ padding: "40px 48px 64px", maxWidth: "1200px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "32px" }}>
       {error ? (
         <ErrorCard message={error} />
       ) : (
