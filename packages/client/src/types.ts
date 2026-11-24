@@ -83,6 +83,18 @@ export interface AccessList {
   pending: PendingGrant[];
 }
 
+// ─── Env var types ────────────────────────────────────────────────────────────
+
+export interface AppEnvVar {
+  name: string;
+  updated_at: string;
+  updated_by_email: string | null;
+}
+
+export interface EnvApplyResult {
+  updated: number;
+}
+
 // ─── SSE event types ──────────────────────────────────────────────────────────
 
 export type DeployEvent =

@@ -63,6 +63,17 @@ console.error = (...args: unknown[]) => {
   _origConsoleError(...args);
 };
 
+// ── Info/stdout log capture (for ENV value-leak mutation test) ────────────────
+const _recentInfoLogs: string[] = [];
+const _origConsoleLog = console.log.bind(console);
+console.log = (...args: unknown[]) => {
+  _recentInfoLogs.push(
+    args.map((a) => (typeof a === "string" ? a : String(a))).join(" "),
+  );
+  if (_recentInfoLogs.length > 200) _recentInfoLogs.shift();
+  _origConsoleLog(...args);
+};
+
 import os from "os";
 import path from "path";
 import fs from "fs";
@@ -287,6 +298,41 @@ flyModule.destroyMachine = async (appName: string, machineId: string) => {
   _flyCallLog.push({ fn: "destroyMachine", arg: appName, body: { machineId } });
   if (_destroyMachineFailMode) throw new Error("destroyMachine failed (test mode)");
 };
+// ── Fly secret stubs ──────────────────────────────────────────────────────────
+let _setFlySecretFailMode = false;
+let _unsetFlySecretFailMode = false;
+let _updateFlyMachineFailMode = false;
+
+flyModule.setFlySecret = async (appName: string, name: string) => {
+  _flyCallLog.push({ fn: "setFlySecret", arg: appName, body: { name } });
+  if (_setFlySecretFailMode) throw new Error("setFlySecret failed (test mode)");
+};
+flyModule.unsetFlySecret = async (appName: string, name: string) => {
+  _flyCallLog.push({ fn: "unsetFlySecret", arg: appName, body: { name } });
+  if (_unsetFlySecretFailMode) throw new Error("unsetFlySecret failed (test mode)");
+};
+flyModule.getMachine = async (appName: string, machineId: string) => {
+  _flyCallLog.push({ fn: "getMachine", arg: appName, body: { machineId } });
+  // Return a minimal machine config (the real code passes this straight to updateFlyMachine)
+  return { id: machineId, config: { image: "placeholder" } };
+};
+flyModule.updateFlyMachine = async (appName: string, machineId: string) => {
+  _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId } });
+  if (_updateFlyMachineFailMode) throw new Error("updateFlyMachine failed (test mode)");
+};
+// updateFlyMachines is stubbed to avoid real HTTP calls while still recording
+// each machine UPDATE call so ENV-24 can assert updateFlyMachine was invoked.
+flyModule.updateFlyMachines = async (appName: string) => {
+  _flyCallLog.push({ fn: "updateFlyMachines", arg: appName });
+  if (_updateFlyMachineFailMode) throw new Error("updateFlyMachine failed (test mode)");
+  for (const m of _listMachinesResult) {
+    // Record individual machine UPDATE calls so tests can verify the pattern.
+    _flyCallLog.push({ fn: "getMachine", arg: appName, body: { machineId: m.id } });
+    _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId: m.id } });
+  }
+  return { updated: _listMachinesResult.length };
+};
+
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
 
@@ -360,6 +406,7 @@ flyModule.destroyFlyApp = async (appName: string) => {
 const { appsRouter } = require("../src/routes/apps") as typeof import("../src/routes/apps");
 const { proxyRouter } = require("../src/routes/proxy") as typeof import("../src/routes/proxy");
 const { appAccessRouter } = require("../src/routes/appAccess") as typeof import("../src/routes/appAccess");
+const { appEnvRouter } = require("../src/routes/appEnv") as typeof import("../src/routes/appEnv");
 const { apiKeysRouter } = require("../src/routes/apiKeys") as typeof import("../src/routes/apiKeys");
 const { webhookRouter } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
 const { verifyClerkWebhookSignature } = require("../src/routes/webhooks") as typeof import("../src/routes/webhooks");
@@ -640,8 +687,8 @@ app.get("/test/get-flyctl-calls", (_req, res) => {
 // appPort is passed through for the "dockerfile" kind to test port pass-through.
 // packageJson: written as package.json to the tmpDir before calling generateDeployFiles.
 app.post("/test/gen-fly-toml", async (req, res) => {
-  const { appName, appId, kind, appPort, packageJson } = req.body as {
-    appName?: string; appId?: string; kind?: string; appPort?: number; packageJson?: unknown;
+  const { appName, appId, kind, appPort, packageJson, appSecretNames } = req.body as {
+    appName?: string; appId?: string; kind?: string; appPort?: number; packageJson?: unknown; appSecretNames?: string[];
   };
   if (!appName || !appId) { res.status(400).json({ error: "appName and appId required" }); return; }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssc-gen-toml-"));
@@ -668,7 +715,7 @@ app.post("/test/gen-fly-toml", async (req, res) => {
       fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify(packageJson), "utf8");
     }
 
-    const { nodeVersionLog } = await generateDeployFiles(tmpDir, appName, appType, appId, typeof appPort === "number" ? appPort : undefined);
+    const { nodeVersionLog } = await generateDeployFiles(tmpDir, appName, appType, appId, typeof appPort === "number" ? appPort : undefined, appSecretNames ?? []);
 
     const flyToml = fs.readFileSync(path.join(tmpDir, "fly.toml"), "utf8");
     const nginxConf = kind === "static" && fs.existsSync(path.join(tmpDir, "ssc-nginx.conf"))
@@ -759,6 +806,30 @@ app.post("/test/run-proxy-code-reaper", async (_req, res) => {
 // Returns and clears the captured console.error log lines.
 app.get("/test/drain-logs", (_req, res) => {
   res.json({ logs: _recentErrorLogs.splice(0) });
+});
+
+// GET /test/drain-info-logs
+// Returns and clears the captured console.log lines (for ENV value-leak mutation test).
+app.get("/test/drain-info-logs", (_req, res) => {
+  res.json({ logs: _recentInfoLogs.splice(0) });
+});
+
+// POST /test/set-fly-secret-fail { fail: bool }
+app.post("/test/set-fly-secret-fail", (req, res) => {
+  _setFlySecretFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true });
+});
+
+// POST /test/set-unset-fly-secret-fail { fail: bool }
+app.post("/test/set-unset-fly-secret-fail", (req, res) => {
+  _unsetFlySecretFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true });
+});
+
+// POST /test/set-update-fly-machine-fail { fail: bool }
+app.post("/test/set-update-fly-machine-fail", (req, res) => {
+  _updateFlyMachineFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true });
 });
 
 // POST /test/set-clerk-membership { clerkOrgId, clerkUserId, isMember }
@@ -1610,6 +1681,7 @@ const { orgsRouter } = require("../src/routes/orgs") as typeof import("../src/ro
 app.use("/health", healthRouter);
 app.use("/v1/auth", authRouter);
 app.use("/v1/apps/:id/access", appAccessRouter);
+app.use("/v1/apps/:id/env", appEnvRouter);
 app.use("/v1/apps", appsRouter);
 app.use("/v1/orgs", orgsRouter);
 app.use("/v1/api-keys", apiKeysRouter);

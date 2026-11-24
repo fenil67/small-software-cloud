@@ -8,6 +8,7 @@ import { share } from "./commands/share";
 import { unshare } from "./commands/unshare";
 import { listAppAccess } from "./commands/access";
 import { destroy } from "./commands/destroy";
+import { envList, envSet, envUnset, envApply } from "./commands/env";
 
 const program = new Command();
 
@@ -82,6 +83,40 @@ program
   .option("--confirm <name>", "App name to confirm deletion (skips interactive prompt)")
   .action(async (appId: string, flags: { confirm?: string }) => {
     await destroy(appId, flags);
+  });
+
+// ─── env ──────────────────────────────────────────────────────────────────────
+const envCmd = program
+  .command("env")
+  .description("Manage environment variables for an app");
+
+envCmd
+  .command("list <app-id>")
+  .description("List environment variable names (never values)")
+  .action(async (appId: string) => {
+    await envList(appId);
+  });
+
+envCmd
+  .command("set <app-id> <name>")
+  .description("Set or replace an environment variable (value read from prompt or stdin, never from CLI argument)")
+  .allowExcessArguments(false)
+  .action(async (appId: string, name: string) => {
+    await envSet(appId, name);
+  });
+
+envCmd
+  .command("unset <app-id> <name>")
+  .description("Remove an environment variable")
+  .action(async (appId: string, name: string) => {
+    await envUnset(appId, name);
+  });
+
+envCmd
+  .command("apply <app-id>")
+  .description("Restart app machines so staged env changes take effect")
+  .action(async (appId: string) => {
+    await envApply(appId);
   });
 
 program.parseAsync(process.argv).catch((err) => {

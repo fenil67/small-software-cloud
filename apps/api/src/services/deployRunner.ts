@@ -616,7 +616,17 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     // Step 3b: generate Dockerfile + fly.toml (lockfile-aware for Node)
     log(deploymentId, "Generating deploy files…");
     try {
-      const { nodeVersionLog } = await generateDeployFiles(workDir, appName, appType, appId);
+      // Fetch env var names so they are injected into the app container secrets list.
+      // Values never leave Fly; we only need the names for the machine_config.
+      const envRows = appId
+        ? await pool.query<{ name: string }>(
+            `SELECT name FROM app_env_vars WHERE app_id = $1 ORDER BY name`,
+            [appId],
+          )
+        : { rows: [] as { name: string }[] };
+      const appSecretNames = envRows.rows.map((r) => r.name);
+
+      const { nodeVersionLog } = await generateDeployFiles(workDir, appName, appType, appId, undefined, appSecretNames);
       if (nodeVersionLog) log(deploymentId, nodeVersionLog);
     } catch (err) {
       throw new DeployError(

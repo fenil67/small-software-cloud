@@ -64,6 +64,9 @@ export const ActivityEventType = {
   MEMBER_ROLE_CHANGED:      "member.role_changed",
   MEMBER_REMOVED:           "member.removed",
   MEMBER_LEFT:              "member.left",
+
+  ENV_SET:                  "env.set",
+  ENV_UNSET:                "env.unset",
 } as const;
 
 export type ActivityEventTypeValue = (typeof ActivityEventType)[keyof typeof ActivityEventType];
