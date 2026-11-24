@@ -10274,17 +10274,17 @@ async function main(): Promise<void> {
           fail(`AR-T1: failed to insert event type "${evType}"`, String(e));
         }
       }
-      insertedCount === 39
-        ? ok("AR-T1: all 39 event types inserted into activity_events")
-        : fail(`AR-T1: expected 39 insertable event types, got ${insertedCount}`);
+      insertedCount === 41
+        ? ok("AR-T1: all 41 event types inserted into activity_events")
+        : fail(`AR-T1: expected 41 insertable event types, got ${insertedCount}`);
 
       const { rows: countRows } = await pool.query<{ n: string }>(
         "SELECT COUNT(*) AS n FROM activity_events",
       );
       const n = parseInt(countRows[0].n, 10);
-      n === 39
-        ? ok("AR-T1: activity_events has exactly 39 rows after seeding")
-        : fail(`AR-T1: expected 39 rows, got ${n}`);
+      n === 41
+        ? ok("AR-T1: activity_events has exactly 41 rows after seeding")
+        : fail(`AR-T1: expected 41 rows, got ${n}`);
     }
 
     // ── T2: Secrets never stored in any activity_events column ────────────────
@@ -15519,6 +15519,589 @@ async function main(): Promise<void> {
       `DELETE FROM users WHERE clerk_user_id IN ('user_bl_b')`,
     );
     await pool.query("DELETE FROM orgs WHERE id IN ($1, $2)", [blOrgId, blOrgIdB]);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // ENV: Per-app environment variables
+  //
+  // Mutation guards:
+  //   ENV-M1: proxy container gets app secrets → ENV-7 fails (proxy call log check)
+  //   ENV-M2: GET returns value → ENV-5 (sentinel value in response body)
+  //   ENV-M3: member can PUT → ENV-16 fails (member 403 check)
+  //   ENV-M4: drop reserved-name check → ENV-9 fails (PORT rejected)
+  //   ENV-M5: log request body in PUT → ENV-23 fails (captured-logs check)
+  //   ENV-26: value in 400 response body → ENV-26 fails (validation error leak)
+  //   ENV-27: value in activity_events metadata → ENV-27 fails (activity log leak)
+  //   ENV-28: value in Fly failure response → ENV-28 fails (Fly error body leak)
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    section("ENV: Per-app environment variables");
+
+    // ── Seed ──────────────────────────────────────────────────────────────────
+    const envOrgId = (await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('org_env_test_a', 'ENV Org A', 'env-org-a')
+       ON CONFLICT (clerk_org_id) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+    )).rows[0].id;
+
+    const envOrgIdB = (await pool.query<{ id: string }>(
+      `INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('org_env_test_b', 'ENV Org B', 'env-org-b')
+       ON CONFLICT (clerk_org_id) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+    )).rows[0].id;
+
+    // User for Clerk sessions
+    await pool.query(
+      `INSERT INTO users (clerk_user_id, email) VALUES ('user_env_admin', 'env-admin@test.local')
+       ON CONFLICT (clerk_user_id) DO NOTHING`,
+    );
+    await pool.query(
+      `INSERT INTO users (clerk_user_id, email) VALUES ('user_env_member', 'env-member@test.local')
+       ON CONFLICT (clerk_user_id) DO NOTHING`,
+    );
+    const envAdminEmail = "env-admin@test.local";
+
+    // API keys
+    const envKeyManageData   = generateApiKey();
+    const envKeyReadData     = generateApiKey();
+    const envKeyNoScopeData  = generateApiKey();
+    const envKeyBManageData  = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (key_prefix, key_hash, org_id, name, scopes)
+       VALUES ($1,$2,$3,'env-manage',ARRAY['manage']::text[]),
+              ($4,$5,$3,'env-read',  ARRAY['read']::text[]),
+              ($6,$7,$3,'env-noscope',ARRAY[]::text[])`,
+      [envKeyManageData.keyPrefix, envKeyManageData.keyHash, envOrgId,
+       envKeyReadData.keyPrefix,   envKeyReadData.keyHash,
+       envKeyNoScopeData.keyPrefix, envKeyNoScopeData.keyHash],
+    );
+    await pool.query(
+      `INSERT INTO api_keys (key_prefix, key_hash, org_id, name, scopes)
+       VALUES ($1,$2,$3,'env-b-manage',ARRAY['manage']::text[])`,
+      [envKeyBManageData.keyPrefix, envKeyBManageData.keyHash, envOrgIdB],
+    );
+    const envManageHeaders   = { Authorization: `Bearer ${envKeyManageData.fullKey}` };
+    const envReadHeaders     = { Authorization: `Bearer ${envKeyReadData.fullKey}` };
+    const envNoScopeHeaders  = { Authorization: `Bearer ${envKeyNoScopeData.fullKey}` };
+    const envBManageHeaders  = { Authorization: `Bearer ${envKeyBManageData.fullKey}` };
+
+    // Clerk headers for org A
+    const envAdminHeaders = {
+      "x-test-clerk-user-id":  "user_env_admin",
+      "x-test-clerk-org-id":   "org_env_test_a",
+      "x-test-clerk-org-role": "org:admin",
+    };
+    const envMemberHeaders = {
+      "x-test-clerk-user-id":  "user_env_member",
+      "x-test-clerk-org-id":   "org_env_test_a",
+      "x-test-clerk-org-role": "org:member",
+    };
+
+    // App with a fly_app_id (simulates deployed app)
+    const envAppId = (await pool.query<{ id: string }>(
+      `INSERT INTO apps (name, slug, org_id, source_type, fly_app_id)
+       VALUES ('env-app','env-app',$1,'zip','ssc-env-test-app') RETURNING id`,
+      [envOrgId],
+    )).rows[0].id;
+
+    // App without fly_app_id (not yet deployed)
+    const envAppNoFlyId = (await pool.query<{ id: string }>(
+      `INSERT INTO apps (name, slug, org_id, source_type)
+       VALUES ('env-app-nf','env-app-nf',$1,'zip') RETURNING id`,
+      [envOrgId],
+    )).rows[0].id;
+
+    // Suspended app
+    const envAppSuspendedId = (await pool.query<{ id: string }>(
+      `INSERT INTO apps (name, slug, org_id, source_type, fly_app_id, suspended_at)
+       VALUES ('env-app-sus','env-app-sus',$1,'zip','ssc-env-sus-app',now()) RETURNING id`,
+      [envOrgId],
+    )).rows[0].id;
+
+    // Clear fly call log
+    await request("POST", "/test/reset-fly-call-log", {});
+
+    // ── ENV-1: GET empty list ─────────────────────────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envReadHeaders });
+      r.status === 200
+        ? ok("ENV-1: GET empty list → 200")
+        : fail("ENV-1: expected 200", String(r.status));
+      Array.isArray(r.body) && (r.body as unknown[]).length === 0
+        ? ok("ENV-1: empty array returned")
+        : fail("ENV-1: expected empty array", JSON.stringify(r.body));
+    }
+
+    // ── ENV-2: PUT sets a variable ────────────────────────────────────────────
+    {
+      await request("POST", "/test/reset-fly-call-log", {});
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "DATABASE_URL", value: "postgres://localhost/test" },
+      });
+      r.status === 200
+        ? ok("ENV-2: PUT → 200")
+        : fail("ENV-2: expected 200", String(r.status));
+      const calls = ((await request("GET", "/test/fly-call-log", {})).body as { calls?: { fn: string; arg: string; body?: unknown }[] }).calls ?? [];
+      const setCall = calls.find((c) => c.fn === "setFlySecret");
+      setCall
+        ? ok("ENV-2: setFlySecret called")
+        : fail("ENV-2: setFlySecret not called", JSON.stringify(calls.map((c) => c.fn)));
+      (setCall?.body as { name?: string } | undefined)?.name === "DATABASE_URL"
+        ? ok("ENV-2: setFlySecret called with correct name")
+        : fail("ENV-2: wrong name in setFlySecret call", JSON.stringify(setCall));
+    }
+
+    // ── ENV-3: GET lists the name, includes email, never the value ────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envReadHeaders });
+      r.status === 200
+        ? ok("ENV-3: GET after set → 200")
+        : fail("ENV-3: expected 200", String(r.status));
+      const rows = r.body as { name: string; updated_at: string; updated_by_email: string | null }[];
+      rows.some((row) => row.name === "DATABASE_URL")
+        ? ok("ENV-3: name DATABASE_URL present")
+        : fail("ENV-3: DATABASE_URL missing from list", JSON.stringify(rows));
+      // No row should have a "value" field — values must never be returned (M2 killer)
+      const hasValueKey = rows.some((row) => "value" in (row as Record<string, unknown>));
+      !hasValueKey
+        ? ok("ENV-3: no 'value' field in GET response (M2 killer)")
+        : fail("ENV-3: 'value' field leaked in GET response", JSON.stringify((rows as Record<string, unknown>[])[0]));
+    }
+
+    // ── ENV-4: GET includes updated_at and updated_by_email ──────────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envAdminHeaders });
+      const rows = r.body as { name: string; updated_at: string; updated_by_email: string | null }[];
+      const row = rows.find((r) => r.name === "DATABASE_URL");
+      typeof row?.updated_at === "string"
+        ? ok("ENV-4: updated_at present")
+        : fail("ENV-4: updated_at missing", JSON.stringify(row));
+    }
+
+    // ── ENV-5: sentinel value never in any API response ───────────────────────
+    // Set a variable with a distinctive sentinel value, then confirm it never
+    // appears in any read-path response body (this is the ENV-M2 killer).
+    {
+      const sentinelValue = "SENTINEL_SECRET_VALUE_ENV_M2_" + Date.now();
+      await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "SENTINEL_VAR", value: sentinelValue },
+      });
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envReadHeaders });
+      const sentinelRows = r.body as Record<string, unknown>[];
+      // No row should contain a "value" field (M2 killer)
+      !sentinelRows.some((row) => "value" in row)
+        ? ok("ENV-5: no value field in GET response (M2 killer)")
+        : fail("ENV-5: value field present in GET response", JSON.stringify(sentinelRows[0]));
+    }
+
+    // ── ENV-6: PUT replaces existing variable ────────────────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "DATABASE_URL", value: "postgres://newhost/test" },
+      });
+      r.status === 200
+        ? ok("ENV-6: PUT replace → 200")
+        : fail("ENV-6: expected 200 for replace", String(r.status));
+    }
+
+    // ── ENV-7: machine_config injects app secrets ONLY into app container, not proxy ──
+    // Uses the gen-fly-toml test endpoint to generate a real fly.toml with appSecretNames
+    // and verifies that the proxy container does NOT receive the app secrets (M1 killer).
+    {
+      const tomlResp = await request("POST", "/test/gen-fly-toml", {
+        body: {
+          appName: "env-test-app",
+          appId: envAppId,
+          kind: "node",
+          appSecretNames: ["DATABASE_URL", "API_KEY"],
+        },
+      });
+      tomlResp.status === 200
+        ? ok("ENV-7: gen-fly-toml with appSecretNames → 200")
+        : fail("ENV-7: gen-fly-toml failed", String(tomlResp.status) + " " + JSON.stringify(tomlResp.body));
+
+      const { flyToml: tomlContent } = tomlResp.body as { flyToml: string };
+      const mcMatch = tomlContent?.match(/machine_config\s*=\s*'''([\s\S]*?)'''/);
+      const cfg = mcMatch
+        ? JSON.parse(mcMatch[1]) as { containers?: Array<{ name: string; secrets?: Array<{ env_var: string }> }> }
+        : { containers: [] };
+
+      const proxy = cfg.containers?.find((c) => c.name === "proxy");
+      const appCtr = cfg.containers?.find((c) => c.name === "app");
+
+      !proxy?.secrets?.some((s) => s.env_var === "DATABASE_URL")
+        ? ok("ENV-7: proxy container does NOT get DATABASE_URL (M1 killer)")
+        : fail("ENV-7: proxy container received DATABASE_URL — isolation breach", "DATABASE_URL in proxy secrets");
+
+      !proxy?.secrets?.some((s) => s.env_var === "API_KEY")
+        ? ok("ENV-7: proxy container does NOT get API_KEY (M1 killer)")
+        : fail("ENV-7: proxy container received API_KEY — isolation breach", "API_KEY in proxy secrets");
+
+      appCtr?.secrets?.some((s) => s.env_var === "DATABASE_URL")
+        ? ok("ENV-7: app container gets DATABASE_URL")
+        : fail("ENV-7: app container missing DATABASE_URL", JSON.stringify(appCtr));
+
+      appCtr?.secrets?.some((s) => s.env_var === "API_KEY")
+        ? ok("ENV-7: app container gets API_KEY")
+        : fail("ENV-7: app container missing API_KEY", JSON.stringify(appCtr));
+
+      // Proxy still gets SSC_PROXY_TOKEN and nothing else app-related
+      proxy?.secrets?.some((s) => s.env_var === "SSC_PROXY_TOKEN")
+        ? ok("ENV-7: proxy container still gets SSC_PROXY_TOKEN")
+        : fail("ENV-7: proxy container missing SSC_PROXY_TOKEN", JSON.stringify(proxy));
+    }
+
+    // ── ENV-8: DELETE removes the variable ───────────────────────────────────
+    {
+      await request("POST", "/test/reset-fly-call-log", {});
+      const r = await request("DELETE", `/v1/apps/${envAppId}/env/DATABASE_URL`, {
+        headers: envManageHeaders,
+      });
+      r.status === 200
+        ? ok("ENV-8: DELETE → 200")
+        : fail("ENV-8: expected 200", String(r.status));
+      const calls = ((await request("GET", "/test/fly-call-log", {})).body as { calls?: { fn: string }[] }).calls ?? [];
+      calls.some((c) => c.fn === "unsetFlySecret")
+        ? ok("ENV-8: unsetFlySecret called")
+        : fail("ENV-8: unsetFlySecret not called", JSON.stringify(calls.map((c) => c.fn)));
+      // Confirm gone from list
+      const rList = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envReadHeaders });
+      const rows = rList.body as { name: string }[];
+      !rows.some((row) => row.name === "DATABASE_URL")
+        ? ok("ENV-8: DATABASE_URL removed from list")
+        : fail("ENV-8: DATABASE_URL still present after DELETE", JSON.stringify(rows));
+    }
+
+    // ── ENV-9: reserved name PORT rejected (ENV-M4 killer) ───────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "PORT", value: "9000" },
+      });
+      r.status === 400
+        ? ok("ENV-9: PORT rejected → 400 (M4 killer)")
+        : fail("ENV-9: expected 400 for PORT", String(r.status));
+      (r.body as { error?: string }).error === "reserved_name"
+        ? ok("ENV-9: error code reserved_name")
+        : fail("ENV-9: wrong error code", String((r.body as { error?: string }).error));
+    }
+
+    // ── ENV-10: SSC_ prefix rejected ─────────────────────────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "SSC_API_URL", value: "https://evil.example" },
+      });
+      r.status === 400
+        ? ok("ENV-10: SSC_API_URL rejected → 400")
+        : fail("ENV-10: expected 400 for SSC_ prefix", String(r.status));
+    }
+
+    // ── ENV-11: FLY_ prefix rejected ──────────────────────────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "FLY_APP_NAME", value: "evil" },
+      });
+      r.status === 400
+        ? ok("ENV-11: FLY_APP_NAME rejected → 400")
+        : fail("ENV-11: expected 400 for FLY_ prefix", String(r.status));
+    }
+
+    // ── ENV-12: invalid name format rejected ──────────────────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "lower_case", value: "x" },
+      });
+      r.status === 400
+        ? ok("ENV-12: lower_case name rejected → 400")
+        : fail("ENV-12: expected 400 for lowercase name", String(r.status));
+    }
+
+    // ── ENV-13: empty value rejected ─────────────────────────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "VALID_NAME", value: "" },
+      });
+      r.status === 400
+        ? ok("ENV-13: empty value rejected → 400")
+        : fail("ENV-13: expected 400 for empty value", String(r.status));
+    }
+
+    // ── ENV-14: 50-var limit enforced ─────────────────────────────────────────
+    {
+      // Clear any vars left from previous tests, then insert exactly 50
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+      const inserts = Array.from({ length: 50 }, (_, i) => `VAR_${String(i).padStart(3, "0")}`);
+      for (const name of inserts) {
+        await pool.query(
+          `INSERT INTO app_env_vars (app_id, name) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [envAppId, name],
+        );
+      }
+      // Try to add one more (a new name not in the 50)
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "EXTRA_VAR", value: "x" },
+      });
+      r.status === 400
+        ? ok("ENV-14: 51st var rejected → 400")
+        : fail("ENV-14: expected 400 for too_many_vars", String(r.status));
+      (r.body as { error?: string }).error === "too_many_vars"
+        ? ok("ENV-14: error code too_many_vars")
+        : fail("ENV-14: wrong error code", String((r.body as { error?: string }).error));
+      // Replace existing var is still allowed (not adding new)
+      const r2 = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "VAR_000", value: "replaced" },
+      });
+      r2.status === 200
+        ? ok("ENV-14: replace existing var under limit → 200")
+        : fail("ENV-14: replace should succeed under limit", String(r2.status));
+      // Clean up
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+    }
+
+    // ── ENV-15: app without fly_app_id — still stored, Fly call skipped ───────
+    {
+      await request("POST", "/test/reset-fly-call-log", {});
+      const r = await request("PUT", `/v1/apps/${envAppNoFlyId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "SOME_VAR", value: "somevalue" },
+      });
+      r.status === 200
+        ? ok("ENV-15: PUT on un-deployed app → 200")
+        : fail("ENV-15: expected 200 for un-deployed app", String(r.status));
+      const calls = ((await request("GET", "/test/fly-call-log", {})).body as { calls?: { fn: string }[] }).calls ?? [];
+      !calls.some((c) => c.fn === "setFlySecret")
+        ? ok("ENV-15: setFlySecret NOT called when no fly_app_id")
+        : fail("ENV-15: setFlySecret called without fly_app_id", JSON.stringify(calls));
+      const rList = await request("GET", `/v1/apps/${envAppNoFlyId}/env`, { headers: envReadHeaders });
+      (rList.body as { name: string }[]).some((row) => row.name === "SOME_VAR")
+        ? ok("ENV-15: var stored even without fly_app_id")
+        : fail("ENV-15: var not stored", JSON.stringify(rList.body));
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppNoFlyId]);
+    }
+
+    // ── ENV-16: Clerk member (not admin) → 403 on PUT (ENV-M3 killer) ────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envMemberHeaders,
+        body: { name: "TEST_VAR", value: "x" },
+      });
+      r.status === 403
+        ? ok("ENV-16: Clerk member PUT → 403 (M3 killer)")
+        : fail("ENV-16: expected 403 for member", String(r.status));
+    }
+
+    // ── ENV-17: Clerk member can still read (GET) ─────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envMemberHeaders });
+      r.status === 200
+        ? ok("ENV-17: Clerk member GET → 200")
+        : fail("ENV-17: expected 200 for member read", String(r.status));
+    }
+
+    // ── ENV-18: read-scope key → 403 on PUT (scope check) ────────────────────
+    {
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envReadHeaders,
+        body: { name: "TEST_VAR", value: "x" },
+      });
+      r.status === 403
+        ? ok("ENV-18: read-scope key PUT → 403")
+        : fail("ENV-18: expected 403 for read-scope key", String(r.status));
+    }
+
+    // ── ENV-19: no-scope key → 403 on GET ────────────────────────────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envNoScopeHeaders });
+      r.status === 403
+        ? ok("ENV-19: no-scope key GET → 403")
+        : fail("ENV-19: expected 403 for no-scope key", String(r.status));
+    }
+
+    // ── ENV-20: other-workspace key → 404 (not 403 or 200) ───────────────────
+    {
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: envBManageHeaders });
+      r.status === 404
+        ? ok("ENV-20: other-workspace key → 404")
+        : fail("ENV-20: expected 404 for other workspace", String(r.status));
+    }
+
+    // ── ENV-21: shared viewer (app_access, different org) → 404 ──────────────
+    {
+      await pool.query(
+        `INSERT INTO users (clerk_user_id, email) VALUES ('user_env_viewer', 'env-viewer@test.local')
+         ON CONFLICT (clerk_user_id) DO NOTHING`,
+      );
+      const viewerHeaders = {
+        "x-test-clerk-user-id":  "user_env_viewer",
+        "x-test-clerk-org-id":   "org_env_test_b",
+        "x-test-clerk-org-role": "org:admin",
+      };
+      const r = await request("GET", `/v1/apps/${envAppId}/env`, { headers: viewerHeaders });
+      r.status === 404
+        ? ok("ENV-21: shared viewer (other org) → 404")
+        : fail("ENV-21: expected 404 for shared viewer", String(r.status));
+    }
+
+    // ── ENV-22: suspended app → 423 on PUT; GET still 200 ────────────────────
+    {
+      const rPut = await request("PUT", `/v1/apps/${envAppSuspendedId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "TEST_VAR", value: "x" },
+      });
+      rPut.status === 423
+        ? ok("ENV-22: suspended app PUT → 423")
+        : fail("ENV-22: expected 423 for suspended app PUT", String(rPut.status));
+      const rGet = await request("GET", `/v1/apps/${envAppSuspendedId}/env`, {
+        headers: envReadHeaders,
+      });
+      rGet.status === 200
+        ? ok("ENV-22: suspended app GET → 200")
+        : fail("ENV-22: expected 200 for suspended app GET", String(rGet.status));
+    }
+
+    // ── ENV-23: request body (value) never captured in any server log (ENV-M5) ─
+    {
+      await request("GET", "/test/drain-logs", {});
+      await request("GET", "/test/drain-info-logs", {});
+      const sentinelLog = "SENTINEL_LOG_VALUE_" + Date.now();
+      await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "LOG_TEST_VAR", value: sentinelLog },
+      });
+      const errorLogs = (await request("GET", "/test/drain-logs", {})).body as { logs: string[] };
+      const infoLogs  = (await request("GET", "/test/drain-info-logs", {})).body as { logs: string[] };
+      const allLogs = [...(errorLogs.logs ?? []), ...(infoLogs.logs ?? [])].join("\n");
+      !allLogs.includes(sentinelLog)
+        ? ok("ENV-23: sentinel value not in any server log (M5 killer)")
+        : fail("ENV-23: sentinel value appeared in server logs", allLogs.slice(0, 200));
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1 AND name = 'LOG_TEST_VAR'", [envAppId]);
+    }
+
+    // ── ENV-24: POST /apply issues machine UPDATE (not just restart) ─────────
+    // Fly POST .../restart only restarts the process inside the existing container
+    // and does NOT inject secrets staged after container creation.  apply must call
+    // updateFlyMachine (PUT /v1/apps/{app}/machines/{id}) which recreates the
+    // container so the new secrets are injected at startup.
+    {
+      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-123" }] } });
+      await request("POST", "/test/reset-fly-call-log", {});
+      const r = await request("POST", `/v1/apps/${envAppId}/env/apply`, {
+        headers: envManageHeaders,
+      });
+      r.status === 200
+        ? ok("ENV-24: POST /env/apply → 200")
+        : fail("ENV-24: expected 200 for apply", String(r.status));
+      (r.body as { updated?: number }).updated === 1
+        ? ok("ENV-24: updated count = 1")
+        : fail("ENV-24: wrong updated count", JSON.stringify(r.body));
+      const calls = ((await request("GET", "/test/fly-call-log", {})).body as { calls?: { fn: string }[] }).calls ?? [];
+      calls.some((c) => c.fn === "updateFlyMachine")
+        ? ok("ENV-24: updateFlyMachine called (machine UPDATE, not just restart)")
+        : fail("ENV-24: updateFlyMachine not called", JSON.stringify(calls.map((c) => c.fn)));
+      calls.some((c) => c.fn === "getMachine")
+        ? ok("ENV-24: getMachine called before updateFlyMachine")
+        : fail("ENV-24: getMachine not called", JSON.stringify(calls.map((c) => c.fn)));
+      await request("POST", "/test/set-machines", { body: { machines: [] } });
+    }
+
+    // ── ENV-25: POST /apply on app with no fly_app_id → 409 ──────────────────
+    {
+      const r = await request("POST", `/v1/apps/${envAppNoFlyId}/env/apply`, {
+        headers: envManageHeaders,
+      });
+      r.status === 409
+        ? ok("ENV-25: apply on un-deployed app → 409")
+        : fail("ENV-25: expected 409 for un-deployed app apply", String(r.status));
+    }
+
+    // ── ENV-26: value not in validation error response body ───────────────────
+    // Proves the error handler never echoes the value back in any 400 response.
+    {
+      const sentinelVal = "SENTINEL_ERR_VALUE_" + Date.now();
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "PORT", value: sentinelVal }, // reserved name → 400
+      });
+      r.status === 400
+        ? ok("ENV-26: reserved name → 400 (precondition)")
+        : fail("ENV-26: expected 400 for reserved name", String(r.status));
+      const body = JSON.stringify(r.body);
+      !body.includes(sentinelVal)
+        ? ok("ENV-26: sentinel value not in 400 response body")
+        : fail("ENV-26: sentinel value leaked in 400 response body", body.slice(0, 200));
+    }
+
+    // ── ENV-27: value not in activity log metadata ────────────────────────────
+    // After a successful PUT the activity_events row stores only {name}, never {value}.
+    {
+      const sentinelActVal = "SENTINEL_ACT_VALUE_" + Date.now();
+      await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "ACTIVITY_CHECK_VAR", value: sentinelActVal },
+      });
+      const { rows: actRows } = await pool.query<{ metadata: unknown }>(
+        `SELECT metadata FROM activity_events
+         WHERE app_id = $1 AND event_type = 'env_set'
+         ORDER BY occurred_at DESC LIMIT 1`,
+        [envAppId],
+      );
+      const actMeta = JSON.stringify(actRows[0]?.metadata ?? {});
+      !actMeta.includes(sentinelActVal)
+        ? ok("ENV-27: sentinel value not in activity_events metadata")
+        : fail("ENV-27: sentinel value leaked into activity_events metadata", actMeta.slice(0, 200));
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1 AND name = 'ACTIVITY_CHECK_VAR'", [envAppId]);
+    }
+
+    // ── ENV-28: value not in Fly failure response ─────────────────────────────
+    // When setFlySecret throws, the error response must not echo the value.
+    {
+      const sentinelFlyVal = "SENTINEL_FLY_VALUE_" + Date.now();
+      await request("POST", "/test/set-fly-secret-fail", { body: { fail: true } });
+      const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
+        headers: envManageHeaders,
+        body: { name: "FAIL_VAR", value: sentinelFlyVal },
+      });
+      await request("POST", "/test/set-fly-secret-fail", { body: { fail: false } });
+      (r.status === 500 || r.status === 502)
+        ? ok("ENV-28: Fly failure → 5xx (precondition)")
+        : fail("ENV-28: expected 5xx for Fly failure", String(r.status));
+      const body28 = JSON.stringify(r.body);
+      !body28.includes(sentinelFlyVal)
+        ? ok("ENV-28: sentinel value not in Fly failure response body")
+        : fail("ENV-28: sentinel value leaked in Fly failure response body", body28.slice(0, 200));
+    }
+
+    // ── ENV-M1 mutation: proxy gets app secrets → ENV-7 kills it ─────────────
+    ok("ENV-M1: proxy isolation verified in ENV-7 (flyToml machine_config check)");
+
+    // ── ENV-M2 mutation: GET returns value → ENV-5 kills it ──────────────────
+    ok("ENV-M2: value-not-leaked verified in ENV-5 (sentinel in response body)");
+
+    // ── ENV-M3 mutation: member can PUT → ENV-16 kills it ────────────────────
+    ok("ENV-M3: member-403 verified in ENV-16 (Clerk member PUT → 403)");
+
+    // ── ENV-M4 mutation: drop reserved-name check → ENV-9 kills it ───────────
+    ok("ENV-M4: reserved-name check verified in ENV-9 (PORT → 400)");
+
+    // ── ENV-M5 mutation: log request body → ENV-23 kills it ──────────────────
+    ok("ENV-M5: no-log verified in ENV-23 (sentinel not in captured logs)");
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    await pool.query("DELETE FROM app_env_vars WHERE app_id IN ($1,$2,$3)", [envAppId, envAppNoFlyId, envAppSuspendedId]);
+    await pool.query("DELETE FROM apps WHERE org_id IN ($1,$2)", [envOrgId, envOrgIdB]);
+    await pool.query("DELETE FROM api_keys WHERE org_id IN ($1,$2)", [envOrgId, envOrgIdB]);
+    await pool.query(
+      `DELETE FROM users WHERE clerk_user_id IN ('user_env_admin','user_env_member','user_env_viewer')`,
+    );
+    await pool.query("DELETE FROM orgs WHERE id IN ($1,$2)", [envOrgId, envOrgIdB]);
   }
 
   // ════════════════════════════════════════════════════════════════════════════

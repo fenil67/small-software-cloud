@@ -15,7 +15,7 @@ const PROXY_PORT = 8787;
 
 // ─── fly.toml v2 ─────────────────────────────────────────────────────────────
 
-function flyToml(appName: string, appId: string, appPort: number): string {
+function flyToml(appName: string, appId: string, appPort: number, appSecretNames: string[] = []): string {
   const proxyImage = process.env.PROXY_IMAGE!;
   const apiUrl = process.env.API_PUBLIC_URL!;
   const loginUrl = (process.env.WEB_URL ?? "") + "/access";
@@ -49,6 +49,9 @@ function flyToml(appName: string, appId: string, appPort: number): string {
         name: "app",
         image: "placeholder",
         env: { PORT: String(appPort) },
+        ...(appSecretNames.length > 0
+          ? { secrets: appSecretNames.map((n) => ({ env_var: n, name: n })) }
+          : {}),
         depends_on: [{ name: "proxy", condition: "healthy" }],
       },
     ],
@@ -273,6 +276,7 @@ export async function generateDeployFiles(
   appType: AppType,
   appId?: string,
   appPort?: number,
+  appSecretNames: string[] = [],
 ): Promise<{ internalPort: number; nodeVersionLog?: string }> {
   let dockerfile: string;
   let nodeVersionLog: string | undefined;
@@ -282,7 +286,7 @@ export async function generateDeployFiles(
       // User-supplied Dockerfile: don't overwrite it, just write fly.toml.
       // Sniff the EXPOSE port when the caller hasn't provided one explicitly.
       const effectiveAppPort = appPort ?? (await sniffExposePort(dir)) ?? APP_PORT;
-      await fs.writeFile(path.join(dir, "fly.toml"), flyToml(appName, appId ?? "", effectiveAppPort));
+      await fs.writeFile(path.join(dir, "fly.toml"), flyToml(appName, appId ?? "", effectiveAppPort, appSecretNames));
       return { internalPort: effectiveAppPort };
     }
 
@@ -310,7 +314,7 @@ export async function generateDeployFiles(
   }
 
   await fs.writeFile(path.join(dir, "Dockerfile"), dockerfile!);
-  await fs.writeFile(path.join(dir, "fly.toml"), flyToml(appName, appId ?? "", APP_PORT));
+  await fs.writeFile(path.join(dir, "fly.toml"), flyToml(appName, appId ?? "", APP_PORT, appSecretNames));
 
   return { internalPort: APP_PORT, nodeVersionLog };
 }

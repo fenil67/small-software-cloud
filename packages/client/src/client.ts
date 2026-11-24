@@ -22,6 +22,8 @@ import type {
   DeployOptions,
   DeployEvent,
   AccessList,
+  AppEnvVar,
+  EnvApplyResult,
 } from "./types";
 
 /** Read the "name" field from package.json in dirPath, or return null. */
@@ -213,6 +215,50 @@ export class SscClient {
       return data;
     } catch (err) {
       throw new Error(extractSharingError(err));
+    }
+  }
+
+  // ─── Env vars ──────────────────────────────────────────────────────────────
+
+  /** List env variable names for an app (names only, never values). */
+  async listEnv(appId: string): Promise<AppEnvVar[]> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.get<AppEnvVar[]>(`/v1/apps/${appId}/env`);
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  /** Set or replace an env variable. Value is sent to Fly and never stored in DB. */
+  async setEnv(appId: string, name: string, value: string): Promise<void> {
+    const ax = makeAxios(this.config);
+    try {
+      await ax.put(`/v1/apps/${appId}/env`, { name, value });
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  /** Remove an env variable. */
+  async unsetEnv(appId: string, name: string): Promise<void> {
+    const ax = makeAxios(this.config);
+    try {
+      await ax.delete(`/v1/apps/${appId}/env/${encodeURIComponent(name)}`);
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
+    }
+  }
+
+  /** Restart app machines so staged env changes take effect. */
+  async applyEnv(appId: string): Promise<EnvApplyResult> {
+    const ax = makeAxios(this.config);
+    try {
+      const { data } = await ax.post<EnvApplyResult>(`/v1/apps/${appId}/env/apply`);
+      return data;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err));
     }
   }
 

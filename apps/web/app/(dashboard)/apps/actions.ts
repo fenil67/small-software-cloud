@@ -82,3 +82,69 @@ export async function fetchAccessList(
 ): Promise<AppAccess[]> {
   return apiFetch<AppAccess[]>(`/v1/apps/${appId}/access`, { token });
 }
+
+// ── Env var actions ───────────────────────────────────────────────────────────
+
+export async function setEnvVar(
+  appId: string,
+  name: string,
+  value: string,
+): Promise<{ error?: string }> {
+  const { getToken } = await auth();
+  const token = await getToken();
+  if (!token) return { error: "not_authenticated" };
+
+  try {
+    await apiFetch(`/v1/apps/${appId}/env`, {
+      method: "PUT",
+      body: { name, value },
+      token,
+    });
+    return {};
+  } catch (e: unknown) {
+    const code = (e as { code?: string }).code;
+    const status = (e as { status?: number }).status;
+    if (status === 423) return { error: "app_suspended" };
+    if (status === 400) return { error: code ?? "invalid_input" };
+    return { error: code ?? "set_failed" };
+  }
+}
+
+export async function unsetEnvVar(
+  appId: string,
+  name: string,
+): Promise<{ error?: string }> {
+  const { getToken } = await auth();
+  const token = await getToken();
+  if (!token) return { error: "not_authenticated" };
+
+  try {
+    await apiFetch(`/v1/apps/${appId}/env/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      token,
+    });
+    return {};
+  } catch (e: unknown) {
+    const code = (e as { code?: string }).code;
+    return { error: code ?? "unset_failed" };
+  }
+}
+
+export async function applyEnvVars(
+  appId: string,
+): Promise<{ error?: string; updated?: number }> {
+  const { getToken } = await auth();
+  const token = await getToken();
+  if (!token) return { error: "not_authenticated" };
+
+  try {
+    const result = await apiFetch<{ updated: number }>(`/v1/apps/${appId}/env/apply`, {
+      method: "POST",
+      token,
+    });
+    return { updated: result.updated };
+  } catch (e: unknown) {
+    const code = (e as { code?: string }).code;
+    return { error: code ?? "apply_failed" };
+  }
+}

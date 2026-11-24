@@ -123,10 +123,17 @@ vi.mock("../../../lib/api", () => ({
   isAppAccessResponse: vi.fn(() => true),
 }));
 
+const mockSetEnvVar    = vi.fn();
+const mockUnsetEnvVar  = vi.fn();
+const mockApplyEnvVars = vi.fn();
+
 vi.mock("../../../app/(dashboard)/apps/actions", () => ({
-  deleteApp: (...a: unknown[]) => mockDeleteApp(...a),
-  grantAccess: (...a: unknown[]) => mockGrantAccess(...a),
-  revokeAccess: (...a: unknown[]) => mockRevokeAccess(...a),
+  deleteApp:     (...a: unknown[]) => mockDeleteApp(...a),
+  grantAccess:   (...a: unknown[]) => mockGrantAccess(...a),
+  revokeAccess:  (...a: unknown[]) => mockRevokeAccess(...a),
+  setEnvVar:     (...a: unknown[]) => mockSetEnvVar(...a),
+  unsetEnvVar:   (...a: unknown[]) => mockUnsetEnvVar(...a),
+  applyEnvVars:  (...a: unknown[]) => mockApplyEnvVars(...a),
 }));
 
 vi.mock("../../../app/(dashboard)/keys/actions", () => ({
@@ -1554,5 +1561,196 @@ describe("DashboardLayout – sidebar fixed, main scrolls (Bug #5)", () => {
     const main = document.querySelector("main") as HTMLElement | null;
     expect(main).not.toBeNull();
     expect(main!.className).toContain("dashboard-main");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EnvSection – per-app environment variables UI
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { EnvSection } from "../../../app/(dashboard)/apps/[id]/EnvSection";
+import type { AppEnvVar } from "../../../lib/api-types";
+
+describe("EnvSection", () => {
+  const appId = "app-env-test";
+
+  const makeVar = (name: string): AppEnvVar => ({
+    name,
+    updated_at: new Date().toISOString(),
+    updated_by_email: "owner@test.local",
+  });
+
+  beforeEach(() => {
+    mockSetEnvVar.mockReset();
+    mockUnsetEnvVar.mockReset();
+    mockApplyEnvVars.mockReset();
+  });
+
+  it("renders 'No variables set' when list is empty", () => {
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    expect(screen.getByText(/no variables set/i)).toBeDefined();
+  });
+
+  it("renders var names (not values)", () => {
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("DATABASE_URL"), makeVar("API_KEY")]}
+        isAdmin
+        isSuspended={false}
+      />,
+    );
+    expect(screen.getByText("DATABASE_URL")).toBeDefined();
+    expect(screen.getByText("API_KEY")).toBeDefined();
+  });
+
+  it("ENV-M2: value field is never rendered in the list", () => {
+    const sentinelValue = "SECRET_SHOULD_NOT_APPEAR_12345";
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("DATABASE_URL")]}
+        isAdmin
+        isSuspended={false}
+      />,
+    );
+    // The value is never in the DOM
+    expect(document.body.textContent).not.toContain(sentinelValue);
+  });
+
+  it("admin sees Add variable button", () => {
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    expect(screen.getByRole("button", { name: /add variable/i })).toBeDefined();
+  });
+
+  it("non-admin does not see Add variable button", () => {
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin={false} isSuspended={false} />);
+    expect(screen.queryByRole("button", { name: /add variable/i })).toBeNull();
+  });
+
+  it("non-admin does not see Replace/Remove buttons", () => {
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("MY_VAR")]}
+        isAdmin={false}
+        isSuspended={false}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /replace/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /remove/i })).toBeNull();
+  });
+
+  it("Add variable shows form with password input", async () => {
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    const passwordInput = document.querySelector("input[type='password']");
+    expect(passwordInput).not.toBeNull();
+  });
+
+  it("Show/Hide toggles value visibility", async () => {
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    const showBtn = screen.getByRole("button", { name: /show value/i });
+    fireEvent.click(showBtn);
+    const textInput = document.querySelector("input[type='text'][placeholder='Value']");
+    expect(textInput).not.toBeNull();
+  });
+
+  it("calls setEnvVar on save and updates list", async () => {
+    mockSetEnvVar.mockResolvedValueOnce({});
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    const nameInput = document.querySelector("input[placeholder='VARIABLE_NAME']") as HTMLInputElement;
+    const valInput  = document.querySelector("input[type='password']") as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: "NEW_VAR" } });
+    fireEvent.change(valInput,  { target: { value: "secret123" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(mockSetEnvVar).toHaveBeenCalledWith(appId, "NEW_VAR", "secret123"));
+    // Form is closed after success
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull());
+  });
+
+  it("shows error message when setEnvVar returns error", async () => {
+    mockSetEnvVar.mockResolvedValueOnce({ error: "reserved_name" });
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    const nameInput = document.querySelector("input[placeholder='VARIABLE_NAME']") as HTMLInputElement;
+    const valInput  = document.querySelector("input[type='password']") as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: "PORT" } });
+    fireEvent.change(valInput,  { target: { value: "3000" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(screen.getByText(/reserved/i)).toBeDefined());
+  });
+
+  it("Remove button asks for confirmation before calling unsetEnvVar", async () => {
+    mockUnsetEnvVar.mockResolvedValueOnce({});
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("OLD_VAR")]}
+        isAdmin
+        isSuspended={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /remove/i }));
+    // Confirmation buttons appear
+    expect(screen.getByRole("button", { name: /delete/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /cancel/i })).toBeDefined();
+    // unsetEnvVar not yet called
+    expect(mockUnsetEnvVar).not.toHaveBeenCalled();
+  });
+
+  it("confirms delete removes var from list", async () => {
+    mockUnsetEnvVar.mockResolvedValueOnce({});
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("OLD_VAR")]}
+        isAdmin
+        isSuspended={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /remove/i }));
+    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+    await waitFor(() => expect(mockUnsetEnvVar).toHaveBeenCalledWith(appId, "OLD_VAR"));
+    await waitFor(() => expect(screen.queryByText("OLD_VAR")).toBeNull());
+  });
+
+  it("shows pending apply banner after set/delete", async () => {
+    mockSetEnvVar.mockResolvedValueOnce({});
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    fireEvent.change(document.querySelector("input[placeholder='VARIABLE_NAME']") as HTMLInputElement, { target: { value: "X_VAR" } });
+    fireEvent.change(document.querySelector("input[type='password']") as HTMLInputElement, { target: { value: "v" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(screen.getByText(/changes apply on next deploy/i)).toBeDefined());
+  });
+
+  it("Restart now calls applyEnvVars", async () => {
+    mockSetEnvVar.mockResolvedValueOnce({});
+    mockApplyEnvVars.mockResolvedValueOnce({ restarted: 1 });
+    render(<EnvSection appId={appId} initialVars={[]} isAdmin isSuspended={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /add variable/i }));
+    fireEvent.change(document.querySelector("input[placeholder='VARIABLE_NAME']") as HTMLInputElement, { target: { value: "Y_VAR" } });
+    fireEvent.change(document.querySelector("input[type='password']") as HTMLInputElement, { target: { value: "v" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => screen.getByText(/restart now/i));
+    fireEvent.click(screen.getByRole("button", { name: /restart now/i }));
+    await waitFor(() => expect(mockApplyEnvVars).toHaveBeenCalledWith(appId));
+  });
+
+  it("suspended app shows read-only notice for admin", () => {
+    render(
+      <EnvSection
+        appId={appId}
+        initialVars={[makeVar("MY_VAR")]}
+        isAdmin
+        isSuspended
+      />,
+    );
+    expect(screen.getByText(/suspended/i)).toBeDefined();
+    // No Add variable button
+    expect(screen.queryByRole("button", { name: /add variable/i })).toBeNull();
   });
 });

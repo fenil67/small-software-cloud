@@ -14,4 +14,6 @@ export type {
   AccessUser,
   PendingGrant,
   AccessList,
+  AppEnvVar,
+  EnvApplyResult,
 } from "./types";

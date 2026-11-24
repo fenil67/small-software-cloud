@@ -167,3 +167,72 @@ export async function destroyMachine(appName: string, machineId: string): Promis
   const client = makeClient();
   await client.delete(`/apps/${appName}/machines/${machineId}?force=true`);
 }
+
+/**
+ * Stages a Fly secret (no machine restart).
+ * POST /v1/apps/{app_name}/secrets body: {"values": {"NAME": "value"}}
+ * Returns {version: N, secrets: [{name, digest}]}.
+ */
+export async function setFlySecret(appName: string, name: string, value: string): Promise<void> {
+  const client = makeClient();
+  await client.post(`/apps/${appName}/secrets`, { values: { [name]: value } });
+}
+
+/**
+ * Removes a Fly secret by name.
+ * DELETE /v1/apps/{app_name}/secrets/{secret_name}
+ */
+export async function unsetFlySecret(appName: string, name: string): Promise<void> {
+  const client = makeClient();
+  try {
+    await client.delete(`/apps/${appName}/secrets/${encodeURIComponent(name)}`);
+  } catch (err) {
+    // 404 means secret never existed — treat as success
+    if (err instanceof FlyApiError && err.status === 404) return;
+    throw err;
+  }
+}
+
+/**
+ * Fetches the full config for a single Fly machine.
+ * GET /v1/apps/{app}/machines/{id}
+ */
+export async function getMachine(appName: string, machineId: string): Promise<unknown> {
+  const client = makeClient();
+  const { data } = await client.get(`/apps/${appName}/machines/${machineId}`);
+  return data;
+}
+
+/**
+ * Updates a Fly machine with its existing config, triggering a container
+ * recreation so staged secrets (set via POST /apps/{app}/secrets) are injected.
+ * PUT /v1/apps/{app}/machines/{id}
+ *
+ * POST .../restart only restarts the process inside the existing container and
+ * does NOT pick up secrets staged after the container was created.  A machine
+ * UPDATE causes Fly to create a new container from the latest config, which
+ * reads the current secret values at startup.  This is what `flyctl secrets
+ * deploy` does internally (lm.Update → PUT with MinSecretsVersion).
+ */
+export async function updateFlyMachine(appName: string, machineId: string, config: unknown): Promise<void> {
+  const client = makeClient();
+  await client.put(`/apps/${appName}/machines/${machineId}`, config);
+}
+
+/**
+ * Applies staged secrets to all running machines by fetching each machine's
+ * current config and issuing a PUT (machine UPDATE), which recreates the
+ * container so the new secrets are injected at startup.
+ * Returns the number of machines updated.
+ */
+export async function updateFlyMachines(appName: string): Promise<{ updated: number }> {
+  const machines = await listMachines(appName);
+  if (machines.length === 0) return { updated: 0 };
+  await Promise.all(
+    machines.map(async (m) => {
+      const config = await getMachine(appName, m.id);
+      await updateFlyMachine(appName, m.id, config);
+    }),
+  );
+  return { updated: machines.length };
+}

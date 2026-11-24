@@ -214,3 +214,9 @@ export interface BuildLog {
   truncated: boolean;
   created_at: string;
 }
+
+export interface AppEnvVar {
+  name: string;
+  updated_at: string;
+  updated_by_email: string | null;
+}

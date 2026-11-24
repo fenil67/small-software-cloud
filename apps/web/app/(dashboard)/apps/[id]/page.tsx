@@ -2,10 +2,11 @@ import { auth } from "@clerk/nextjs/server";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ErrorCard } from "../../../../components/dashboard/ErrorCard";
-import { apiFetch, isAppAccessResponse, isDeploymentArray } from "../../../../lib/api";
+import { apiFetch, isAppAccessResponse, isDeploymentArray, isAppEnvVarArray } from "../../../../lib/api";
 import { appUrl as normalizeAppUrl } from "../../../../lib/app-url";
-import type { App, AppAccess, AppAccessResponse } from "../../../../lib/api-types";
+import type { App, AppAccess, AppAccessResponse, AppEnvVar } from "../../../../lib/api-types";
 import type { Deployment } from "../../../../lib/api-types";
+import { EnvSection } from "./EnvSection";
 import { resolveAppStatus } from "../../../../lib/status";
 import { AppStatusBadge } from "../../../../components/dashboard/AppStatusBadge";
 import { AppDetailClient } from "./AppDetailClient";
@@ -45,11 +46,12 @@ export default async function AppDetailPage({ params }: PageProps) {
     );
   }
 
-  const [rawDeployments, rawAccess] = await Promise.all([
+  const [rawDeployments, rawAccess, rawEnv] = await Promise.all([
     apiFetch<unknown>(`/v1/apps/${id}/deployments`, { token }).catch((): unknown => []),
     isAdmin
       ? apiFetch<unknown>(`/v1/apps/${id}/access`, { token }).catch((): unknown => null)
       : Promise.resolve(null),
+    apiFetch<unknown>(`/v1/apps/${id}/env`, { token }).catch((): unknown => []),
   ]);
 
   let deployments: Deployment[] = [];
@@ -71,6 +73,8 @@ export default async function AppDetailPage({ params }: PageProps) {
       console.error(`[apps/${id}] GET /v1/apps/${id}/access shape mismatch: expected {users, pending}, got ${JSON.stringify(Object.keys(rawAccess as Record<string, unknown>))}`);
     }
   }
+
+  const envVars: AppEnvVar[] = isAppEnvVarArray(rawEnv) ? rawEnv : [];
 
   const resolved = resolveAppStatus(app.suspended, app.status, app.latest_deployment_status);
   const appUrl = normalizeAppUrl(app.subdomain);
@@ -176,6 +180,14 @@ export default async function AppDetailPage({ params }: PageProps) {
               </p>
             </div>
           )}
+
+          {/* Environment variables */}
+          <EnvSection
+            appId={app.id}
+            initialVars={envVars}
+            isAdmin={isAdmin}
+            isSuspended={app.suspended}
+          />
 
           {/* Delete app — admin only */}
           {isAdmin && (
