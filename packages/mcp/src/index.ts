@@ -24,7 +24,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
-import { SscClient } from "@ssc/client";
+import { SscClient, PlatformUpdatingError } from "@ssc/client";
 import type { DeployEvent } from "@ssc/client";
 
 // ─── Per-process deploy rate limit ────────────────────────────────────────────
@@ -173,6 +173,12 @@ FILES NEVER UPLOADED: .env, .env.*, *.key, *.pem, node_modules/, .git/ — alway
             await client.deployZip(local_path!, opts));
         }
       } catch (err) {
+        if (err instanceof PlatformUpdatingError) {
+          return {
+            content: [{ type: "text" as const, text: "Utir is updating, try again in a minute." }],
+            isError: true,
+          };
+        }
         return {
           content: [
             {

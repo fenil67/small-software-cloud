@@ -9,8 +9,8 @@
     "suspended": 8
   },
   "deploys_today": {
-    "total": 3,
-    "failed": 2
+    "total": 14,
+    "failed": 7
   },
   "visits_today": 3,
   "refused_today": 0,
@@ -85,8 +85,8 @@
     },
     {
       "date": "2026-11-27",
-      "succeeded": 1,
-      "failed": 2
+      "succeeded": 7,
+      "failed": 7
     }
   ],
   "open_alerts": [

@@ -10,6 +10,7 @@
 import fs from "fs";
 import path from "path";
 import FormData from "form-data";
+import axios from "axios";
 import { makeAxios, extractErrorMessage, extractSharingError, extractAppError } from "./http";
 import { resolveConfig, SscConfig } from "./config";
 import { zipDirectory } from "./zip";
@@ -25,6 +26,28 @@ import type {
   AppEnvVar,
   EnvApplyResult,
 } from "./types";
+
+/**
+ * Thrown by deployZip / deployGithub when the platform returns 503
+ * {"error":"platform_updating"}.  The CLI catches this and retries once after
+ * retryAfterSeconds.
+ */
+export class PlatformUpdatingError extends Error {
+  constructor(public readonly retryAfterSeconds: number) {
+    super("Utir is updating, try again in a minute");
+    this.name = "PlatformUpdatingError";
+  }
+}
+
+function throwIfPlatformUpdating(err: unknown): void {
+  if (axios.isAxiosError(err) && err.response?.status === 503) {
+    const body = err.response?.data as Record<string, unknown> | undefined;
+    if (body?.error === "platform_updating") {
+      const retryAfter = typeof body?.retry_after === "number" ? body.retry_after : 30;
+      throw new PlatformUpdatingError(retryAfter);
+    }
+  }
+}
 
 /** Read the "name" field from package.json in dirPath, or return null. */
 function readPackageJsonName(dirPath: string): string | null {
@@ -109,6 +132,7 @@ export class SscClient {
       );
       return data;
     } catch (err) {
+      throwIfPlatformUpdating(err);
       throw new Error(extractErrorMessage(err));
     }
   }
@@ -141,6 +165,7 @@ export class SscClient {
       );
       return data;
     } catch (err) {
+      throwIfPlatformUpdating(err);
       throw new Error(extractErrorMessage(err));
     }
   }

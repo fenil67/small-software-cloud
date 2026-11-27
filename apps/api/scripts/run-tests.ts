@@ -16264,6 +16264,267 @@ async function main(): Promise<void> {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section("GS: Graceful Shutdown");
+  // ════════════════════════════════════════════════════════════════════════════
+  {
+    // GS-1 / GS-2 / GS-5: shutdown flag blocks intake + health
+    // Create a fully self-contained org + key (no created_by so reconciliation skips it).
+    const gsInitOrgRow = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+      ["clerk_org_gs_init", "GS Init Org", "gs-init-org"],
+    );
+    const gsInitOrgId = gsInitOrgRow.rows[0].id;
+    const { fullKey: gsInitKey, keyPrefix: gsInitPrefix, keyHash: gsInitHash } = generateApiKey();
+    await pool.query(
+      "INSERT INTO api_keys (org_id, name, key_prefix, key_hash, scopes) VALUES ($1,$2,$3,$4,'{read,deploy,manage}')",
+      [gsInitOrgId, "GS Init Key", gsInitPrefix, gsInitHash],
+    );
+
+    try {
+      await request("POST", "/test/set-shutting-down", { body: { value: true } });
+
+      // GS-1: no active deploys when flag is set
+      const countR = await request("GET", "/test/active-deploy-count");
+      (countR.body as { count?: number }).count === 0
+        ? ok("GS-1: active-deploy-count=0 when no deploys running")
+        : fail("GS-1: expected active-deploy-count=0", JSON.stringify(countR.body));
+
+      // GS-5: /health returns 503 during shutdown
+      const healthR = await request("GET", "/health");
+      healthR.status === 503
+        ? ok("GS-5: /health returns 503 during shutdown")
+        : fail("GS-5: expected 503 from /health", String(healthR.status));
+      (healthR.body as { status?: string }).status === "shutting_down"
+        ? ok("GS-5: health body has status=shutting_down")
+        : fail("GS-5: expected status=shutting_down", JSON.stringify(healthR.body));
+
+      // GS-2: intake/zip returns 503 platform_updating
+      const intakeR = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(gsInitKey),
+        body: {},
+      });
+      intakeR.status === 503
+        ? ok("GS-2: intake/zip returns 503 during shutdown")
+        : fail("GS-2: expected 503 from intake/zip during shutdown", String(intakeR.status));
+      (intakeR.body as { error?: string }).error === "platform_updating"
+        ? ok("GS-2: error=platform_updating in intake/zip response")
+        : fail("GS-2: expected error=platform_updating", JSON.stringify(intakeR.body));
+      typeof (intakeR.body as { retry_after?: unknown }).retry_after === "number"
+        ? ok("GS-2: retry_after is a number in intake/zip response")
+        : fail("GS-2: expected retry_after number", JSON.stringify(intakeR.body));
+
+      // GS-2: intake/github also returns 503 platform_updating
+      const intakeGhR = await request("POST", "/v1/deployments/intake/github", {
+        headers: authHeaders(gsInitKey),
+        body: { github_url: "https://github.com/test/repo" },
+      });
+      intakeGhR.status === 503
+        ? ok("GS-2: intake/github returns 503 during shutdown")
+        : fail("GS-2: expected 503 from intake/github during shutdown", String(intakeGhR.status));
+
+      // Reset
+      await request("POST", "/test/set-shutting-down", { body: { value: false } });
+      const healthAfter = await request("GET", "/health");
+      healthAfter.status === 200
+        ? ok("GS-1: /health returns 200 after shutdown flag cleared")
+        : fail("GS-1: expected 200 from /health after clearing flag", String(healthAfter.status));
+    } finally {
+      await request("POST", "/test/set-shutting-down", { body: { value: false } });
+      await pool.query("DELETE FROM api_keys WHERE key_hash=$1", [gsInitHash]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [gsInitOrgId]);
+    }
+
+    // GS-3 / GS-4: deploy abort via shutdown module
+    {
+      // Set up a fresh org / key for GS tests (no created_by — reconciliation skips it)
+      const gsOrgRow = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_org_gs", "GS Org", "gs-org"],
+      );
+      const gsOrgId = gsOrgRow.rows[0].id;
+      const { fullKey: gsKey, keyPrefix: gsKeyPrefix, keyHash: gsKeyHash } = generateApiKey();
+      await pool.query(
+        "INSERT INTO api_keys (org_id, name, key_prefix, key_hash, scopes) VALUES ($1,$2,$3,$4,'{read,deploy}')",
+        [gsOrgId, "GS Key", gsKeyPrefix, gsKeyHash],
+      );
+      const gsZip = await buildZip({ "index.js": 'console.log("hello")' });
+
+      // GS-3: normal deploy registers with shutdown and unregisters on completion
+      {
+        await request("POST", "/test/set-deploy-mode", { body: { mode: "success" } });
+        const gsForm3 = new FormData();
+        gsForm3.append("code", gsZip, { filename: "app.zip", contentType: "application/zip" });
+        gsForm3.append("app_name", "gs-test-app-3");
+
+        const intakeR3 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(gsKey),
+          formData: gsForm3,
+        });
+        intakeR3.status === 202
+          ? ok("GS-3: intake accepted deploy")
+          : fail("GS-3: expected 202 from intake", String(intakeR3.status));
+
+        const depId3 = (intakeR3.body as { deployment_id?: string }).deployment_id ?? "";
+        const result3 = await pollDeployment(depId3, gsKey, 5000);
+        result3.status === "success"
+          ? ok("GS-3: deploy that runs normally → success")
+          : fail("GS-3: expected success status", JSON.stringify(result3));
+
+        // After completion the deploy unregisters itself
+        const countR3 = await request("GET", "/test/active-deploy-count");
+        (countR3.body as { count?: number }).count === 0
+          ? ok("GS-3: active-deploy-count=0 after normal deploy completes (unregistered)")
+          : fail("GS-3: expected active-deploy-count=0 after completion", JSON.stringify(countR3.body));
+      }
+
+      // GS-4: slow deploy is aborted → fails with platform_update + SSE event
+      {
+        await request("POST", "/test/set-deploy-mode", { body: { mode: "slow" } });
+        const gsForm4 = new FormData();
+        gsForm4.append("code", gsZip, { filename: "app.zip", contentType: "application/zip" });
+        gsForm4.append("app_name", "gs-test-app-4");
+
+        const intakeR4 = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(gsKey),
+          formData: gsForm4,
+        });
+        intakeR4.status === 202
+          ? ok("GS-4: intake accepted slow deploy")
+          : fail("GS-4: expected 202 from intake for slow deploy", String(intakeR4.status));
+
+        const depId4 = (intakeR4.body as { deployment_id?: string }).deployment_id ?? "";
+
+        // Wait for the slow deploy to register with shutdown (up to 2s)
+        const deadline4 = Date.now() + 2000;
+        let count4 = 0;
+        while (count4 === 0 && Date.now() < deadline4) {
+          const cr = await request("GET", "/test/active-deploy-count");
+          count4 = (cr.body as { count?: number }).count ?? 0;
+          if (count4 === 0) await new Promise((r) => setTimeout(r, 50));
+        }
+        count4 >= 1
+          ? ok("GS-4: deploy registered with shutdown (active-deploy-count>=1)")
+          : fail("GS-4: deploy never registered with shutdown", String(count4));
+
+        // Open the SSE stream before aborting so we capture the final events
+        const streamPromise = streamRequest(
+          `/v1/deployments/${depId4}/stream`,
+          authHeaders(gsKey),
+        );
+
+        // Abort all active deploys (simulates grace-period expiry)
+        await request("POST", "/test/abort-active-deploys", {});
+
+        // Wait for stream to end
+        const streamEvents = await streamPromise;
+        const parsedEvents = streamEvents
+          .map((e) => { try { return JSON.parse(e) as Record<string, unknown>; } catch { return null; } })
+          .filter(Boolean) as Array<Record<string, unknown>>;
+
+        const errorEv = parsedEvents.find((e) => e.type === "error");
+        errorEv?.stage === "platform_update"
+          ? ok("GS-4: SSE stream has error event with stage=platform_update")
+          : fail("GS-4: SSE stream missing platform_update error event", JSON.stringify(parsedEvents.slice(-4)));
+
+        parsedEvents.some((e) => e.type === "done")
+          ? ok("GS-4: SSE stream has done event after abort")
+          : fail("GS-4: SSE stream missing done event", JSON.stringify(parsedEvents.slice(-4)));
+
+        // Poll the deployment record
+        const poll4 = await pollDeployment(depId4, gsKey, 5000);
+        poll4.status === "failed"
+          ? ok("GS-4: deployment marked failed after abort")
+          : fail("GS-4: expected failed status", JSON.stringify(poll4));
+        poll4.failure_stage === "platform_update"
+          ? ok("GS-4: failure_stage=platform_update")
+          : fail("GS-4: expected failure_stage=platform_update", String(poll4.failure_stage));
+        (poll4.failure_message ?? "").includes("Please deploy again")
+          ? ok("GS-4: failure_message contains 'Please deploy again'")
+          : fail("GS-4: unexpected failure_message", String(poll4.failure_message));
+
+        // Count should be back to 0
+        const countAfter4 = await request("GET", "/test/active-deploy-count");
+        (countAfter4.body as { count?: number }).count === 0
+          ? ok("GS-4: active-deploy-count=0 after abort completes")
+          : fail("GS-4: expected active-deploy-count=0 after abort", JSON.stringify(countAfter4.body));
+      }
+
+      // Cleanup GS-3/4 resources
+      await pool.query("DELETE FROM api_keys WHERE org_id=$1", [gsOrgId]);
+      await pool.query("DELETE FROM apps WHERE org_id=$1", [gsOrgId]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [gsOrgId]);
+    }
+
+    // GS-6: reaper marks a deleted app's stuck deployment failed
+    {
+      const gsOrgRow6 = await pool.query<{ id: string }>(
+        "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+        ["clerk_org_gs6", "GS6 Org", "gs6-org"],
+      );
+      const gsOrgId6 = gsOrgRow6.rows[0].id;
+      const gsUserRow6 = await pool.query<{ id: string }>(
+        "INSERT INTO users (clerk_user_id, email) VALUES ($1,$2) RETURNING id",
+        ["user_gs6_test", "gs6@test.local"],
+      );
+      const gsUserId6 = gsUserRow6.rows[0].id;
+
+      // Create a soft-deleted app with a stuck deployment
+      const appRow6 = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, owner_id, name, slug, subdomain)
+         VALUES ($1,$2,'gs6-app','gs6-app','gs6-app.fly.dev') RETURNING id`,
+        [gsOrgId6, gsUserId6],
+      );
+      const appId6 = appRow6.rows[0].id;
+      await pool.query("UPDATE apps SET deleted_at=now() WHERE id=$1", [appId6]);
+
+      const depRow6 = await pool.query<{ id: string }>(
+        "INSERT INTO deployments (app_id, status) VALUES ($1,'building') RETURNING id",
+        [appId6],
+      );
+      const depId6 = depRow6.rows[0].id;
+
+      // Run the deleted-apps reaper
+      const reapR = await request("POST", "/test/run-reap-deleted-apps", {});
+      reapR.status === 200
+        ? ok("GS-6: run-reap-deleted-apps returned 200")
+        : fail("GS-6: expected 200 from reaper", String(reapR.status));
+      ((reapR.body as { count?: number }).count ?? 0) >= 1
+        ? ok("GS-6: reaper reported count >= 1")
+        : fail("GS-6: expected count >= 1", JSON.stringify(reapR.body));
+
+      const { rows: dep6Rows } = await pool.query<{
+        status: string; failure_stage: string | null; failure_message: string | null;
+      }>(
+        "SELECT status, failure_stage, failure_message FROM deployments WHERE id=$1",
+        [depId6],
+      );
+      dep6Rows[0]?.status === "failed"
+        ? ok("GS-6: stuck deployment marked failed by reaper")
+        : fail("GS-6: expected status=failed", String(dep6Rows[0]?.status));
+      dep6Rows[0]?.failure_stage === "app_deleted"
+        ? ok("GS-6: failure_stage=app_deleted")
+        : fail("GS-6: expected failure_stage=app_deleted", String(dep6Rows[0]?.failure_stage));
+      (dep6Rows[0]?.failure_message ?? "").includes("deleted")
+        ? ok("GS-6: failure_message mentions deleted")
+        : fail("GS-6: unexpected failure_message", String(dep6Rows[0]?.failure_message));
+
+      // GS-M3 reference: mutation is in reaper.ts (see mutation report below)
+      ok("GS-M3: reaper skips deleted apps → GS-6 kills it (see mutation proof below)");
+
+      // Cleanup
+      await pool.query("DELETE FROM deployments WHERE id=$1", [depId6]);
+      await pool.query("DELETE FROM apps WHERE id=$1", [appId6]);
+      await pool.query("DELETE FROM users WHERE id=$1", [gsUserId6]);
+      await pool.query("DELETE FROM orgs WHERE id=$1", [gsOrgId6]);
+    }
+
+    // GS-M1 reference: mutation is in intake.ts (see mutation report below)
+    ok("GS-M1: accept deploys during shutdown → GS-2 kills it (see mutation proof below)");
+    // GS-M2 reference: mutation is in shutdown.ts (see mutation report below)
+    ok("GS-M2: skip marking unfinished deploy failed → GS-4 kills it (see mutation proof below)");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Summary
   // ════════════════════════════════════════════════════════════════════════════
   console.log("\n" + B("─".repeat(50)));

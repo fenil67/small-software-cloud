@@ -110,6 +110,8 @@ import { webhookRouter } from "./routes/webhooks";
 import { startReaper } from "./lib/reaper";
 import { validateWatchdogConfig } from "./lib/watchdog";
 import { ResendSender, setEmailSender } from "./lib/email/sender";
+import { runGracefulShutdown } from "./lib/shutdown";
+import { pool } from "./db";
 
 // PLATFORM_ADMIN_CLERK_IDS — optional; each entry must match ^user_[A-Za-z0-9]+$
 // Called here, directly after the ./routes/admin import, so the compiled require()
@@ -194,8 +196,15 @@ if (_resendKey) {
 // ─── Background jobs ─────────────────────────────────────────────────────────
 startReaper();
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[api] listening on http://localhost:${PORT}`);
+});
+
+// Railway sends SIGTERM before stopping the old container during redeployment.
+// runGracefulShutdown blocks new deploys, waits for in-flight ones to finish,
+// aborts any that exceed the grace window, then closes the pool and exits.
+process.on("SIGTERM", () => {
+  void runGracefulShutdown(server, pool);
 });
 
 export default app;

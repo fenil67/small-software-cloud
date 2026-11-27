@@ -88,7 +88,8 @@ import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
 // apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
-import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs, reapDeploymentsOfDeletedApps } from "../src/lib/reaper";
+import { setShuttingDownForTest, activeDeployCount, abortAllActiveDeploysForTest, registerDeploy, unregisterDeploy } from "../src/lib/shutdown";
 import { runReconcile, ClerkOrgCheck } from "../src/lib/reconcile";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
@@ -145,9 +146,9 @@ type DeployArgs = {
 const _realRunDeploy = deployRunnerModule.runDeploy as (args: DeployArgs) => Promise<void>;
 let _realDeployEnabled = false;
 
-let nextDeployMode: "success" | "failure" | "timeout" = "success";
+let nextDeployMode: "success" | "failure" | "timeout" | "slow" = "success";
 
-export function setNextDeployMode(mode: "success" | "failure" | "timeout"): void {
+export function setNextDeployMode(mode: "success" | "failure" | "timeout" | "slow"): void {
   nextDeployMode = mode;
 }
 
@@ -169,6 +170,48 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
        WHERE id=$1`,
       [deploymentId],
     );
+    return;
+  }
+
+  // "slow" mode: registers with shutdown module, waits for abort or 30s timeout.
+  // Used by GS-4 to test platform_update failure when grace period expires.
+  if (mode === "slow") {
+    let _aborted = false;
+    let _abortStage = "platform_update";
+    let _abortMsg = "Utir was updating during your deploy. Please deploy again.";
+
+    await pool.query(
+      `UPDATE deployments SET status='building', started_at=now() WHERE id=$1`,
+      [deploymentId],
+    );
+
+    registerDeploy(deploymentId, (stage: string, message: string) => {
+      _aborted = true;
+      _abortStage = stage;
+      _abortMsg = message;
+    });
+
+    try {
+      const deadline = Date.now() + 30_000;
+      while (!_aborted && Date.now() < deadline) {
+        await new Promise<void>((r) => setTimeout(r, 50));
+      }
+
+      if (_aborted) {
+        await pool.query(
+          `UPDATE deployments
+           SET status='failed', failure_stage=$1, failure_message=$2, finished_at=now()
+           WHERE id=$3`,
+          [_abortStage, _abortMsg, deploymentId],
+        );
+        eventBus.emit(deploymentId, { type: "error", stage: _abortStage, message: _abortMsg });
+        eventBus.emit(deploymentId, { type: "status", status: "failed" });
+        eventBus.emit(deploymentId, { type: "done" });
+      }
+      // If timed out without abort: leave as 'building' (reaper handles it).
+    } finally {
+      unregisterDeploy(deploymentId);
+    }
     return;
   }
 
@@ -212,46 +255,54 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
   // Set fly_app_id on the app so subdomain works
   await pool.query("UPDATE apps SET fly_app_id=$1 WHERE id=$2", [flyAppName, appId]);
 
-  // Short delay to simulate async work
-  await new Promise((r) => setTimeout(r, 80));
+  // Register with shutdown module so GS tests can verify active-deploy-count.
+  // Abort callback is a no-op for fast modes (deploy completes before grace expires).
+  registerDeploy(deploymentId, () => {});
 
-  if (mode === "failure") {
-    // Clear fly_app_id for new apps (mirrors real deployRunner fail() behaviour)
-    if (!hadFlyAppId) {
-      await pool.query("UPDATE apps SET fly_app_id=NULL WHERE id=$1", [appId]);
+  try {
+    // Short delay to simulate async work
+    await new Promise((r) => setTimeout(r, 80));
+
+    if (mode === "failure") {
+      // Clear fly_app_id for new apps (mirrors real deployRunner fail() behaviour)
+      if (!hadFlyAppId) {
+        await pool.query("UPDATE apps SET fly_app_id=NULL WHERE id=$1", [appId]);
+      }
+      await pool.query(
+        `UPDATE deployments SET status='failed',
+           failure_stage='build',
+           failure_message='Dockerfile build failed: unknown instruction RRUN',
+           finished_at=now()
+         WHERE id=$1`,
+        [deploymentId],
+      );
+      eventBus.emit(deploymentId, {
+        type: "error",
+        stage: "build",
+        message: "Dockerfile build failed: unknown instruction RRUN",
+      });
+      eventBus.emit(deploymentId, { type: "status", status: "failed" });
+      eventBus.emit(deploymentId, { type: "done" });
+    } else {
+      const appHost = `${flyAppName}.fly.dev`;
+      const appUrl = `https://${appHost}`;
+      await pool.query(
+        `UPDATE apps SET subdomain=$1 WHERE id=$2`,
+        [appHost, appId],
+      );
+      await pool.query(
+        `UPDATE deployments SET status='success', fly_machine_id='test-machine-1', finished_at=now()
+         WHERE id=$1`,
+        [deploymentId],
+      );
+      eventBus.emit(deploymentId, { type: "log", message: "Building image…" });
+      eventBus.emit(deploymentId, { type: "log", message: "Deploy complete." });
+      eventBus.emit(deploymentId, { type: "url", url: appUrl });
+      eventBus.emit(deploymentId, { type: "status", status: "success" });
+      eventBus.emit(deploymentId, { type: "done" });
     }
-    await pool.query(
-      `UPDATE deployments SET status='failed',
-         failure_stage='build',
-         failure_message='Dockerfile build failed: unknown instruction RRUN',
-         finished_at=now()
-       WHERE id=$1`,
-      [deploymentId],
-    );
-    eventBus.emit(deploymentId, {
-      type: "error",
-      stage: "build",
-      message: "Dockerfile build failed: unknown instruction RRUN",
-    });
-    eventBus.emit(deploymentId, { type: "status", status: "failed" });
-    eventBus.emit(deploymentId, { type: "done" });
-  } else {
-    const appHost = `${flyAppName}.fly.dev`;
-    const appUrl = `https://${appHost}`;
-    await pool.query(
-      `UPDATE apps SET subdomain=$1 WHERE id=$2`,
-      [appHost, appId],
-    );
-    await pool.query(
-      `UPDATE deployments SET status='success', fly_machine_id='test-machine-1', finished_at=now()
-       WHERE id=$1`,
-      [deploymentId],
-    );
-    eventBus.emit(deploymentId, { type: "log", message: "Building image…" });
-    eventBus.emit(deploymentId, { type: "log", message: "Deploy complete." });
-    eventBus.emit(deploymentId, { type: "url", url: appUrl });
-    eventBus.emit(deploymentId, { type: "status", status: "success" });
-    eventBus.emit(deploymentId, { type: "done" });
+  } finally {
+    unregisterDeploy(deploymentId);
   }
 };
 
@@ -502,10 +553,10 @@ app.use(requestIdMiddleware);
 
 // ── Test-control endpoints ────────────────────────────────────────────────────
 
-// POST /test/set-deploy-mode { mode: "success"|"failure"|"timeout" }
+// POST /test/set-deploy-mode { mode: "success"|"failure"|"timeout"|"slow" }
 app.post("/test/set-deploy-mode", (req, res) => {
   const { mode } = req.body as { mode?: string };
-  if (mode === "success" || mode === "failure" || mode === "timeout") {
+  if (mode === "success" || mode === "failure" || mode === "timeout" || mode === "slow") {
     nextDeployMode = mode;
     res.json({ ok: true, mode });
   } else {
@@ -1067,6 +1118,38 @@ app.post("/test/set-build-log", async (req, res) => {
       [deployment_id, content, truncated],
     );
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /test/set-shutting-down { value: bool }
+// Simulates SIGTERM effects without calling process.exit — for GS tests only.
+app.post("/test/set-shutting-down", (req, res) => {
+  const { value } = req.body as { value?: boolean };
+  setShuttingDownForTest(value === true);
+  res.json({ ok: true, shuttingDown: value === true });
+});
+
+// GET /test/active-deploy-count
+// Returns the number of deploys currently registered with the shutdown module.
+app.get("/test/active-deploy-count", (_req, res) => {
+  res.json({ count: activeDeployCount() });
+});
+
+// POST /test/abort-active-deploys
+// Calls abortAllActiveDeploysForTest() — simulates grace-period expiry.
+app.post("/test/abort-active-deploys", (_req, res) => {
+  abortAllActiveDeploysForTest();
+  res.json({ ok: true });
+});
+
+// POST /test/run-reap-deleted-apps
+// Runs reapDeploymentsOfDeletedApps() directly in this process.
+app.post("/test/run-reap-deleted-apps", async (_req, res) => {
+  try {
+    const count = await reapDeploymentsOfDeletedApps();
+    res.json({ ok: true, count });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

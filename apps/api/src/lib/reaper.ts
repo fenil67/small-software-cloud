@@ -21,6 +21,9 @@ const TIMEOUT_MINUTES = 15;
 const INTERVAL_MS = 5 * 60 * 1000;
 
 export async function reapStalledDeployments(): Promise<number> {
+  // COALESCE(started_at, created_at): deployments inserted before the
+  // started_at-on-building fix have started_at = NULL; fall back to created_at
+  // so they are still reaped after the timeout window.
   const { rowCount } = await pool.query(
     `UPDATE deployments
      SET status         = 'failed',
@@ -28,7 +31,7 @@ export async function reapStalledDeployments(): Promise<number> {
          failure_message = 'Deployment was interrupted or timed out',
          finished_at    = now()
      WHERE status IN ('queued', 'building', 'deploying')
-       AND started_at < now() - INTERVAL '${TIMEOUT_MINUTES} minutes'`,
+       AND COALESCE(started_at, created_at) < now() - INTERVAL '${TIMEOUT_MINUTES} minutes'`,
   );
   const count = rowCount ?? 0;
   if (count > 0) {
@@ -72,6 +75,70 @@ export async function reapOrphanedFlyApps(): Promise<number> {
     }
   }
   return destroyed;
+}
+
+/**
+ * Marks in-progress deployments of soft-deleted apps as failed and cleans up
+ * their Fly apps if any remain.
+ *
+ * When a user deletes an app while a deploy is running, the deploy runner
+ * eventually fails but the deployment record may stay stuck in an in-progress
+ * state.  This function sweeps those up so they don't linger in the dashboard.
+ */
+export async function reapDeploymentsOfDeletedApps(): Promise<number> {
+  const { rows } = await pool.query<{
+    id: string;
+    fly_app_id: string | null;
+    org_id: string;
+  }>(
+    `SELECT d.id, a.fly_app_id, a.org_id
+     FROM deployments d
+     JOIN apps a ON a.id = d.app_id
+     WHERE d.status IN ('queued', 'building', 'deploying')
+       AND a.deleted_at IS NOT NULL`,
+  );
+  if (rows.length === 0) return 0;
+
+  let count = 0;
+  for (const { id, fly_app_id, org_id } of rows) {
+    const { rowCount } = await pool.query(
+      `UPDATE deployments
+       SET status          = 'failed',
+           failure_stage   = 'app_deleted',
+           failure_message = 'The app was deleted.',
+           finished_at     = now()
+       WHERE id = $1
+         AND status IN ('queued', 'building', 'deploying')`,
+      [id],
+    );
+    if ((rowCount ?? 0) === 0) continue; // already updated by concurrent reaper
+    count++;
+
+    // Best-effort: destroy the Fly app if it still exists.
+    if (fly_app_id) {
+      try {
+        await destroyFlyApp(fly_app_id);
+        console.log(`[reaper] destroyed Fly app for deleted app: ${fly_app_id}`);
+      } catch (err) {
+        console.error(
+          `[reaper] failed to destroy Fly app ${fly_app_id} for deleted app:`,
+          safeErr(err),
+        );
+        await pool.query(
+          `INSERT INTO orphaned_fly_apps (fly_app_name, org_id, last_error)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (fly_app_name) DO UPDATE
+             SET org_id     = COALESCE(EXCLUDED.org_id, orphaned_fly_apps.org_id),
+                 last_error = EXCLUDED.last_error`,
+          [fly_app_id, org_id, String(safeErr(err))],
+        ).catch(() => {});
+      }
+    }
+  }
+  if (count > 0) {
+    console.log(`[reaper] marked ${count} deployment(s) for deleted apps as failed`);
+  }
+  return count;
 }
 
 /** Delete build logs older than 30 days. */
@@ -178,6 +245,9 @@ export function startReaper(): void {
   reapOldBuildLogs().catch((err) =>
     console.error("[reaper] build-logs boot run failed:", safeErr(err)),
   );
+  reapDeploymentsOfDeletedApps().catch((err) =>
+    console.error("[reaper] deleted-apps boot run failed:", safeErr(err)),
+  );
   setInterval(() => {
     reapStalledDeployments().catch((err) =>
       console.error("[reaper] interval run failed:", safeErr(err)),
@@ -190,6 +260,9 @@ export function startReaper(): void {
     );
     reapOldBuildLogs().catch((err) =>
       console.error("[reaper] build-logs interval run failed:", safeErr(err)),
+    );
+    reapDeploymentsOfDeletedApps().catch((err) =>
+      console.error("[reaper] deleted-apps interval run failed:", safeErr(err)),
     );
   }, INTERVAL_MS);
 

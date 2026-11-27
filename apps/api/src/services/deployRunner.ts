@@ -18,6 +18,7 @@ import { generateDeployFiles, sniffExposePort } from "./dockerfileGen";
 import { issueProxyToken } from "../lib/proxyCredentials";
 import { ActivityEventType, recordActivity } from "../lib/activityLog";
 import { saveBuildLog } from "../lib/buildLogs";
+import { registerDeploy, unregisterDeploy } from "../lib/shutdown";
 
 const execFileP = promisify(execFile);
 
@@ -54,6 +55,9 @@ async function updateDeploymentStatus(
   const sets: string[] = ["status = $2"];
   const vals: unknown[] = [deploymentId, status];
   let i = 3;
+  // Record when the deployment runner actually started work (not just queued).
+  // The reaper uses started_at to find stuck deployments.
+  if (status === "building") { sets.push("started_at = now()"); }
   if (extra.fly_machine_id) { sets.push(`fly_machine_id = $${i++}`); vals.push(extra.fly_machine_id); }
   if (extra.failure_stage) { sets.push(`failure_stage = $${i++}`); vals.push(extra.failure_stage); }
   if (extra.failure_message) { sets.push(`failure_message = $${i++}`); vals.push(extra.failure_message); }
@@ -387,6 +391,12 @@ export async function runFlyctlDeploy(
 export async function runDeploy(args: RunDeployArgs): Promise<void> {
   const { deploymentId, appId, zipBuffer, githubUrl, actorUserId, actorKeyId } = args;
 
+  // Guard against double-completion (natural fail vs. shutdown abort racing).
+  // Node.js is single-threaded so the check+set below is race-free across
+  // synchronous sections; it also prevents double-cleanup if abort fires
+  // concurrently with a natural completion.
+  let _done = false;
+
   let flyAppName: string | null = null;
   let flyAppCreatedThisRun = false;
   let workDir: string | null = null;
@@ -421,6 +431,8 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
   });
 
   const fail = async (err: DeployError): Promise<void> => {
+    if (_done) return; // already completed via another path
+    _done = true;
     console.error(`[deploy] ${deploymentId} failed at ${err.stage}: ${err.message}`);
     await updateDeploymentStatus(deploymentId, "failed", {
       failure_stage: err.stage,
@@ -459,6 +471,15 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       fs.rm(workDir, { recursive: true, force: true }, () => {});
     }
   };
+
+  // Register with the shutdown module so SIGTERM can abort this deploy if the
+  // grace period expires before it finishes.  The abort callback calls fail()
+  // which marks the DB, emits the final SSE events, and cleans up Fly resources.
+  // flyAppName and flyAppCreatedThisRun are closed over by reference so the
+  // callback reflects current state at abort time.
+  registerDeploy(deploymentId, (stage: string, message: string) => {
+    void fail(new DeployError(stage, message));
+  });
 
   try {
     await updateDeploymentStatus(deploymentId, "building");
@@ -657,6 +678,11 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     }
 
     // Step 5: success
+    // Guard: if abort fired during an earlier await (e.g. runFlyctlDeploy),
+    // fail() already set _done = true.  Skip the success path so we don't
+    // overwrite the failed status in the DB.
+    if (_done) return;
+    _done = true;
     // The live URL follows Fly's deterministic pattern; no JSON parsing needed.
     // fly_machine_id is left NULL — it is purely informational and would require
     // a separate listMachines() API call that isn't worth the extra latency here.
@@ -693,6 +719,8 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       console.error("[deploy] unexpected:", safeErr(err));
     }
   } finally {
+    // Always unregister — whether the deploy succeeded, failed, or was aborted.
+    unregisterDeploy(deploymentId);
     _logEmitter.off("event", _collectLog);
     // Best-effort: persist the build log (already scrubbed line-by-line in runFlyctlDeploy).
     await saveBuildLog(deploymentId, _buildLogLines).catch((e) =>
