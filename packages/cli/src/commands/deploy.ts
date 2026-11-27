@@ -1,4 +1,4 @@
-import { SscClient } from "@ssc/client";
+import { SscClient, PlatformUpdatingError } from "@ssc/client";
 import type { DeployEvent } from "@ssc/client";
 
 interface DeployFlags {
@@ -26,19 +26,37 @@ export async function deploy(
     ...(flags.name ? { appName: flags.name } : {}),
   };
 
+  /** Submit the deploy intake request, retrying once if platform is updating. */
+  async function submitDeploy(): Promise<{ deployment_id: string; app_id: string }> {
+    const submit = async () => {
+      if (flags.github) {
+        console.error(`Submitting GitHub URL: ${flags.github}`);
+        return client.deployGithub(flags.github, opts);
+      } else {
+        console.error(`Zipping ${localPath} …`);
+        return client.deployZip(localPath!, opts);
+      }
+    };
+
+    try {
+      return await submit();
+    } catch (err) {
+      if (err instanceof PlatformUpdatingError) {
+        console.error(`Utir is updating, try again in a minute`);
+        console.error(`Retrying in ${err.retryAfterSeconds}s…`);
+        await new Promise<void>((r) => setTimeout(r, err.retryAfterSeconds * 1000));
+        // Retry once — if it fails again, let the error propagate.
+        return await submit();
+      }
+      throw err;
+    }
+  }
+
   let deploymentId: string;
   let appId: string;
 
   try {
-    if (flags.github) {
-      console.error(`Submitting GitHub URL: ${flags.github}`);
-      ({ deployment_id: deploymentId, app_id: appId } =
-        await client.deployGithub(flags.github, opts));
-    } else {
-      console.error(`Zipping ${localPath} …`);
-      ({ deployment_id: deploymentId, app_id: appId } =
-        await client.deployZip(localPath!, opts));
-    }
+    ({ deployment_id: deploymentId, app_id: appId } = await submitDeploy());
   } catch (err) {
     console.error(
       `Error: ${err instanceof Error ? err.message : String(err)}`,

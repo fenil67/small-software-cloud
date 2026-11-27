@@ -1,4 +1,4 @@
-export { SscClient } from "./client";
+export { SscClient, PlatformUpdatingError } from "./client";
 export { resolveConfig, writeConfigFile } from "./config";
 export { zipDirectory } from "./zip";
 export type { SscConfig } from "./config";

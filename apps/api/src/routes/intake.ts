@@ -20,6 +20,7 @@ import { runDeploy } from "../services/deployRunner";
 import { asyncHandler } from "../lib/asyncHandler";
 import { safeErr } from "../lib/safeErr";
 import { ActivityEventType, recordActivity } from "../lib/activityLog";
+import { isShuttingDown } from "../lib/shutdown";
 
 export const intakeRouter = Router();
 intakeRouter.use(requireAuth);
@@ -209,6 +210,13 @@ intakeRouter.post(
   requireScope("deploy"),
   limitedUpload,
   asyncHandler(async (req: Request, res: Response) => {
+    // Refuse new deploys while the platform is restarting.
+    // The CLI retries once after retry_after seconds.
+    if (isShuttingDown()) {
+      res.status(503).json({ error: "platform_updating", retry_after: 30 });
+      return;
+    }
+
     if (!req.file) {
       res.status(400).json({ error: "validation_error", message: "Field 'code' (zip file) is required." });
       return;
@@ -341,6 +349,12 @@ intakeRouter.post(
 // ─── POST /github ─────────────────────────────────────────────────────────────
 
 intakeRouter.post("/github", requireScope("deploy"), asyncHandler(async (req: Request, res: Response) => {
+  // Refuse new deploys while the platform is restarting.
+  if (isShuttingDown()) {
+    res.status(503).json({ error: "platform_updating", retry_after: 30 });
+    return;
+  }
+
   const { github_url, app_id: existingAppId, app_name } = req.body as {
     github_url?: string;
     app_id?: string;
