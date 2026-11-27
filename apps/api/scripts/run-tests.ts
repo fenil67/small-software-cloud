@@ -840,7 +840,7 @@ async function main(): Promise<void> {
     console.log(`  After reap: status=${d.status}  stage=${d.failure_stage}  msg="${d.failure_message}"`);
     d.status === "failed" ? ok("reaper → status=failed") : fail("reaper should set failed", `got ${d.status}`);
     d.failure_stage === "timeout" ? ok("reaper → failure_stage=timeout") : fail("failure_stage should be timeout");
-    d.failure_message?.includes("interrupted or timed out") ? ok("reaper → correct failure_message") : fail("wrong failure_message");
+    d.failure_message?.includes("Please deploy again") ? ok("reaper → correct failure_message") : fail("wrong failure_message", d.failure_message ?? "");
 
     // Verify late-join stream shows error+failed+done
     const events = await streamRequest(`/v1/deployments/${stuckId}/stream`, authHeaders(keyA));
@@ -16578,6 +16578,676 @@ async function main(): Promise<void> {
     ok("GS-M1: accept deploys during shutdown → GS-2 kills it (see mutation proof below)");
     // GS-M2 reference: mutation is in shutdown.ts (see mutation report below)
     ok("GS-M2: skip marking unfinished deploy failed → GS-4 kills it (see mutation proof below)");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Section DT — Deploy timeouts, step logging, and reaper Fly cleanup
+  //
+  // Uses real deployRunner with the hang-mode fake flyctl and short timeouts
+  // set at runtime via /test/set-deploy-timeouts.
+  //
+  // DT-1: build timeout fires on first deploy → PID killed, SSE done event,
+  //        DB=failed/timeout, destroyFlyApp called (first deploy).
+  // DT-2: build timeout fires on a redeploy → Fly app NOT destroyed (existing
+  //        machines keep running), DB=failed/timeout.
+  // DT-3: reaper marks a stale first-deploy deployment failed AND calls
+  //        destroyFlyApp for the app's fly_app_id.
+  // DT-4: step log lines (egress_policy, generate_files, flyctl_deploy,
+  //        proxy_verify, done) emitted to console.log on a successful deploy;
+  //        no secrets appear in those lines.
+  // ════════════════════════════════════════════════════════════════════════════
+  section("DT: Deploy timeouts, step logging, and reaper Fly cleanup");
+  {
+    // Shared fly-log helpers (same shape as Section S / T)
+    type DtFlyCall = { fn: string; arg: string; body?: Record<string, unknown> };
+    const getDtFlyLog = async (): Promise<DtFlyCall[]> =>
+      ((await request("GET", "/test/fly-call-log")).body as { calls?: DtFlyCall[] }).calls ?? [];
+    const resetDtFlyLog = () => request("POST", "/test/reset-fly-call-log");
+
+    // Fresh org + API key for all DT sub-tests
+    const { rows: dtOrgRows } = await pool.query<{ id: string }>(
+      "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_dt','DT Org','dt-org') RETURNING id",
+    );
+    const dtOrgId = dtOrgRows[0].id;
+    const { fullKey: dtKey, keyPrefix: dtKP, keyHash: dtKH } = generateApiKey();
+    await pool.query(
+      `INSERT INTO api_keys (org_id, name, key_prefix, key_hash, scopes)
+       VALUES ($1,'dt-key',$2,$3,'{read,deploy,manage}')`,
+      [dtOrgId, dtKP, dtKH],
+    );
+
+    // Minimal valid zip for all DT deploys
+    const dtZip = await buildZip({
+      "package.json": JSON.stringify({
+        name: "dt-test-app",
+        version: "1.0.0",
+        scripts: { start: "node index.js" },
+      }),
+      "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+    });
+
+    // ── DT-1: build timeout, first deploy → PID killed + Fly app destroyed ──
+    {
+      console.log(DIM("\n  DT-1: build timeout, first deploy → PID killed, SSE done, Fly app destroyed"));
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      // 2s build timeout, 20s hard cap (won't fire in this test)
+      await request("POST", "/test/set-deploy-timeouts", { body: { buildMs: 2000, hardCapMs: 20000 } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "hang" } });
+      await resetDtFlyLog();
+
+      const dt1Form = new FormData();
+      dt1Form.append("code", dtZip, { filename: "app.zip", contentType: "application/zip" });
+      dt1Form.append("app_name", "dt1-app");
+      const dt1Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(dtKey), formData: dt1Form,
+      });
+      dt1Intake.status === 202
+        ? ok("DT-1: intake accepted (202)")
+        : fail("DT-1: intake should 202", `got ${dt1Intake.status} ${JSON.stringify(dt1Intake.body)}`);
+
+      const { deployment_id: dt1DepId, app_id: dt1AppId } =
+        dt1Intake.body as Record<string, string>;
+
+      // Open SSE stream immediately — must be before 2s timeout fires
+      const dt1StreamPromise = streamRequest(
+        `/v1/deployments/${dt1DepId}/stream`,
+        authHeaders(dtKey),
+      );
+
+      // Poll for PID written by the hang script (up to 3s)
+      let dt1Pid: number | null = null;
+      const dt1PidDeadline = Date.now() + 3000;
+      while (dt1Pid === null && Date.now() < dt1PidDeadline) {
+        const pr = await request("GET", "/test/flyctl-hang-pid");
+        dt1Pid = (pr.body as { pid?: number | null }).pid ?? null;
+        if (dt1Pid === null) await new Promise<void>((r) => setTimeout(r, 100));
+      }
+      dt1Pid !== null
+        ? ok("DT-1: hang-mode flyctl wrote PID file")
+        : fail("DT-1: hang-mode flyctl never wrote PID file — hang script may not have been reached");
+
+      // Wait for stream to close (build timeout fires at ~2s)
+      const dt1Events = await dt1StreamPromise;
+      const dt1Parsed = dt1Events
+        .map((e) => { try { return JSON.parse(e) as Record<string, unknown>; } catch { return null; } })
+        .filter(Boolean) as Array<Record<string, unknown>>;
+
+      dt1Parsed.some((e) => e.type === "error" && e.stage === "timeout")
+        ? ok("DT-1: SSE stream has error event with stage=timeout")
+        : fail("DT-1: SSE stream missing timeout error event", JSON.stringify(dt1Parsed.slice(-4)));
+
+      dt1Parsed.some((e) => e.type === "done")
+        ? ok("DT-1: SSE stream has done event after timeout")
+        : fail("DT-1: SSE stream missing done event", JSON.stringify(dt1Parsed.slice(-4)));
+
+      // Check PID killed (poll up to 500ms for SIGKILL to take effect)
+      if (dt1Pid !== null) {
+        let pidAlive = true;
+        const pidDeathDeadline = Date.now() + 500;
+        while (pidAlive && Date.now() < pidDeathDeadline) {
+          const ar = await request("GET", `/test/is-pid-alive/${dt1Pid}`);
+          pidAlive = (ar.body as { alive?: boolean }).alive ?? true;
+          if (pidAlive) await new Promise<void>((r) => setTimeout(r, 50));
+        }
+        !pidAlive
+          ? ok("DT-1: flyctl process group killed after build timeout (PID dead)")
+          : fail("DT-1: flyctl process still alive — SIGKILL may not have reached process group");
+      }
+
+      // Check DB
+      const dt1Poll = await pollDeployment(dt1DepId, dtKey, 5000);
+      dt1Poll.status === "failed"
+        ? ok("DT-1: deployment=failed after build timeout")
+        : fail("DT-1: expected status=failed", dt1Poll.status);
+      dt1Poll.failure_stage === "timeout"
+        ? ok("DT-1: failure_stage=timeout")
+        : fail("DT-1: expected failure_stage=timeout", String(dt1Poll.failure_stage));
+      (dt1Poll.failure_message ?? "").includes("Please deploy again")
+        ? ok("DT-1: failure_message contains 'Please deploy again'")
+        : fail("DT-1: unexpected failure_message", String(dt1Poll.failure_message));
+
+      // Wait for destroyWithRetry to settle
+      await new Promise<void>((r) => setTimeout(r, 600));
+
+      const dt1Log = await getDtFlyLog();
+      dt1Log.some((c) => c.fn === "destroyFlyApp")
+        ? ok("DT-1: destroyFlyApp called — first-deploy Fly app cleaned up after timeout")
+        : fail("DT-1: destroyFlyApp not called — first-deploy Fly app not cleaned up");
+
+      // fly_app_id cleared in DB (fail() clears before destroy)
+      const { rows: dt1AppRows } = await pool.query<{ fly_app_id: string | null }>(
+        "SELECT fly_app_id FROM apps WHERE id=$1", [dt1AppId],
+      );
+      dt1AppRows[0]?.fly_app_id === null
+        ? ok("DT-1: fly_app_id=NULL after failed first deploy")
+        : fail("DT-1: fly_app_id should be NULL", dt1AppRows[0]?.fly_app_id ?? "");
+    }
+
+    // ── DT-2: build timeout, redeploy → Fly app NOT destroyed ───────────────
+    {
+      console.log(DIM("\n  DT-2: build timeout, redeploy → Fly app NOT destroyed"));
+
+      // First: a successful deploy to establish the app (use mode=success)
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      await resetDtFlyLog();
+
+      const dt2Form1 = new FormData();
+      dt2Form1.append("code", dtZip, { filename: "app.zip", contentType: "application/zip" });
+      dt2Form1.append("app_name", "dt2-app");
+      const dt2Intake1 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(dtKey), formData: dt2Form1,
+      });
+      const { deployment_id: dt2DepId1, app_id: dt2AppId } =
+        dt2Intake1.body as Record<string, string>;
+      const dt2Poll1 = await pollDeployment(dt2DepId1, dtKey, 15000);
+      dt2Poll1.status === "success"
+        ? ok("DT-2: first deploy succeeded (setup for redeploy test)")
+        : fail("DT-2: first deploy should succeed before redeploy test",
+            `${dt2Poll1.status} stage=${dt2Poll1.failure_stage}`);
+
+      // Second: hang-mode redeploy of same app
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "hang" } });
+      await resetDtFlyLog();
+
+      const dt2Form2 = new FormData();
+      dt2Form2.append("code", dtZip, { filename: "app.zip", contentType: "application/zip" });
+      dt2Form2.append("app_id", dt2AppId);
+      const dt2Intake2 = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(dtKey), formData: dt2Form2,
+      });
+      const { deployment_id: dt2DepId2 } = dt2Intake2.body as Record<string, string>;
+
+      // Wait for timeout to fire and cleanup to settle
+      const dt2Poll2 = await pollDeployment(dt2DepId2, dtKey, 10000);
+      await new Promise<void>((r) => setTimeout(r, 600));
+
+      dt2Poll2.status === "failed"
+        ? ok("DT-2: redeploy marked failed after build timeout")
+        : fail("DT-2: expected failed status", dt2Poll2.status);
+      dt2Poll2.failure_stage === "timeout"
+        ? ok("DT-2: failure_stage=timeout on redeploy")
+        : fail("DT-2: expected failure_stage=timeout on redeploy", String(dt2Poll2.failure_stage));
+
+      const dt2Log = await getDtFlyLog();
+      !dt2Log.some((c) => c.fn === "destroyFlyApp")
+        ? ok("DT-2: destroyFlyApp NOT called — existing machines kept running on redeploy")
+        : fail("DT-2: destroyFlyApp should NOT be called on a redeploy timeout");
+    }
+
+    // ── DT-3: reaper marks stale first-deploy deployment failed + destroyFlyApp ──
+    {
+      console.log(DIM("\n  DT-3: reaper cleans stale first-deploy deployment"));
+
+      // Disable real deploy (not needed for this sub-test; avoids mode interference)
+      await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+      await resetDtFlyLog();
+
+      // Fresh app with fly_app_id set (simulates a first deploy in progress)
+      const { rows: dt3AppRows } = await pool.query<{ id: string }>(
+        `INSERT INTO apps (org_id, name, slug, subdomain, fly_app_id)
+         VALUES ($1,'dt3-app','dt3-app','dt3-fake.fly.dev','dt3-fake-fly-app') RETURNING id`,
+        [dtOrgId],
+      );
+      const dt3AppId = dt3AppRows[0].id;
+
+      // Stale deployment: status=deploying, created_at far in the past, no prior success
+      const { rows: dt3DepRows } = await pool.query<{ id: string }>(
+        `INSERT INTO deployments (app_id, status, created_at)
+         VALUES ($1,'deploying',now() - INTERVAL '20 minutes') RETURNING id`,
+        [dt3AppId],
+      );
+      const dt3DepId = dt3DepRows[0].id;
+
+      const dt3ReapR = await request("POST", "/test/run-reap-stalled", {});
+      dt3ReapR.status === 200
+        ? ok("DT-3: run-reap-stalled returned 200")
+        : fail("DT-3: expected 200 from reap-stalled", String(dt3ReapR.status));
+      ((dt3ReapR.body as { count?: number }).count ?? 0) >= 1
+        ? ok("DT-3: reaper reported count>=1")
+        : fail("DT-3: expected count>=1", JSON.stringify(dt3ReapR.body));
+
+      const { rows: dt3DepResult } = await pool.query<{
+        status: string; failure_stage: string | null; failure_message: string | null;
+      }>(
+        "SELECT status, failure_stage, failure_message FROM deployments WHERE id=$1", [dt3DepId],
+      );
+      dt3DepResult[0]?.status === "failed"
+        ? ok("DT-3: reaper marked deployment=failed")
+        : fail("DT-3: expected status=failed from reaper", String(dt3DepResult[0]?.status));
+      dt3DepResult[0]?.failure_stage === "timeout"
+        ? ok("DT-3: failure_stage=timeout from reaper")
+        : fail("DT-3: expected failure_stage=timeout from reaper", String(dt3DepResult[0]?.failure_stage));
+      (dt3DepResult[0]?.failure_message ?? "").includes("Please deploy again")
+        ? ok("DT-3: failure_message contains 'Please deploy again'")
+        : fail("DT-3: unexpected failure_message from reaper", String(dt3DepResult[0]?.failure_message));
+
+      await new Promise<void>((r) => setTimeout(r, 300)); // let destroyFlyApp settle
+      const dt3Log = await getDtFlyLog();
+      dt3Log.some((c) => c.fn === "destroyFlyApp" && c.arg === "dt3-fake-fly-app")
+        ? ok("DT-3: reaper called destroyFlyApp for first-deploy app")
+        : fail("DT-3: reaper did not call destroyFlyApp — first-deploy Fly app not cleaned up");
+
+      // Cleanup
+      await pool.query("DELETE FROM deployments WHERE id=$1", [dt3DepId]);
+      await pool.query("DELETE FROM apps WHERE id=$1", [dt3AppId]);
+    }
+
+    // ── DT-4: step log lines emitted on successful deploy, no secrets ────────
+    {
+      console.log(DIM("\n  DT-4: step log lines on successful deploy, no secrets"));
+
+      await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+      await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+      // restore sensible timeouts for a success deploy
+      await request("POST", "/test/set-deploy-timeouts", { body: { buildMs: 60000, hardCapMs: 120000 } });
+
+      // Drain any stale info logs before the deploy
+      await request("GET", "/test/drain-info-logs");
+
+      const dt4Form = new FormData();
+      dt4Form.append("code", dtZip, { filename: "app.zip", contentType: "application/zip" });
+      dt4Form.append("app_name", "dt4-app");
+      const dt4Intake = await request("POST", "/v1/deployments/intake/zip", {
+        headers: authHeaders(dtKey), formData: dt4Form,
+      });
+      const { deployment_id: dt4DepId } = dt4Intake.body as Record<string, string>;
+
+      // Wait for deploy to complete
+      await pollDeployment(dt4DepId, dtKey, 15000);
+      await new Promise<void>((r) => setTimeout(r, 300));
+
+      const dt4InfoLogsR = await request("GET", "/test/drain-info-logs");
+      const dt4InfoLogs = (dt4InfoLogsR.body as { logs?: string[] }).logs ?? [];
+      const dt4Steps = dt4InfoLogs.filter((l) => l.includes("[deploy]") && l.includes("step="));
+
+      const hasEgress = dt4Steps.some((l) => l.includes("step=egress_policy"));
+      hasEgress
+        ? ok("DT-4: step=egress_policy logged")
+        : fail("DT-4: step=egress_policy not found in info logs", JSON.stringify(dt4Steps.slice(0, 5)));
+
+      const hasGenerate = dt4Steps.some((l) => l.includes("step=generate_files"));
+      hasGenerate
+        ? ok("DT-4: step=generate_files logged")
+        : fail("DT-4: step=generate_files not found in info logs");
+
+      const hasFlyctl = dt4Steps.some((l) => l.includes("step=flyctl_deploy"));
+      hasFlyctl
+        ? ok("DT-4: step=flyctl_deploy logged")
+        : fail("DT-4: step=flyctl_deploy not found in info logs");
+
+      const hasVerify = dt4Steps.some((l) => l.includes("step=proxy_verify"));
+      hasVerify
+        ? ok("DT-4: step=proxy_verify logged")
+        : fail("DT-4: step=proxy_verify not found in info logs");
+
+      const hasDone = dt4Steps.some((l) => l.includes("step=done"));
+      hasDone
+        ? ok("DT-4: step=done logged")
+        : fail("DT-4: step=done not found in info logs");
+
+      // No secrets in step log lines (no key= or token= patterns in the structured lines)
+      const secretPattern = /(secret|token|password|key=\w{8,})/i;
+      const leakedLine = dt4Steps.find((l) => secretPattern.test(l));
+      leakedLine === undefined
+        ? ok("DT-4: no secrets in step log lines")
+        : fail("DT-4: potential secret in step log line", leakedLine);
+    }
+
+    // Cleanup DT org resources
+    await request("POST", "/test/set-real-deploy", { body: { enabled: false } });
+    await request("POST", "/test/set-flyctl-mode", { body: { mode: "success" } });
+    await request("POST", "/test/set-deploy-timeouts", { body: { buildMs: 600000, hardCapMs: 900000 } });
+    await pool.query("DELETE FROM api_keys WHERE org_id=$1", [dtOrgId]);
+    await pool.query("DELETE FROM apps WHERE org_id=$1", [dtOrgId]);
+    await pool.query("DELETE FROM orgs WHERE id=$1", [dtOrgId]);
+  }
+
+  // ── DT-M1 (.bak mutation): remove build timeout → DT-1 "done" check fails ──
+  // Mutate deployRunner.ts to use a 999 999 999 ms timeout (effectively no timeout),
+  // restart server, run DT-1-equivalent with 2s forced env timeout.
+  // The stream will never get the "done" event within 8s → assertion fails.
+  {
+    const deployRunnerPath = path.resolve(__dirname, "../src/services/deployRunner.ts");
+    const bakPath = deployRunnerPath + ".bak";
+    const originalSrc = fs.readFileSync(deployRunnerPath, "utf8");
+
+    // Replace the buildTimeoutMs variable reference in setTimeout with a large literal
+    // so the env-var-driven short timeout has no effect.
+    const ORIGINAL_TIMEOUT = "    }, buildTimeoutMs);";
+    const MUTATED_TIMEOUT  = "    }, 999999999); // MUTATED — build timeout effectively removed";
+    const mutatedSrc = originalSrc.replace(ORIGINAL_TIMEOUT, MUTATED_TIMEOUT);
+
+    if (mutatedSrc === originalSrc) {
+      fail("DT-M1 (.bak): mutation target not found in deployRunner.ts — cannot apply");
+    } else {
+      const { execSync, spawn } = require("child_process") as typeof import("child_process");
+
+      const killPort4099 = () => {
+        try {
+          execSync(
+            `for p in $(lsof -nP -tiTCP:4099 -sTCP:LISTEN 2>/dev/null); do` +
+            ` ps -p "$p" -o command= 2>/dev/null | grep -q test-server && kill "$p" 2>/dev/null || true; done`,
+            { shell: "/bin/bash" },
+          );
+        } catch {}
+      };
+
+      const startServer = () => {
+        const child = spawn(
+          "npx",
+          ["ts-node", "--project", "tsconfig.json", "scripts/test-server.ts"],
+          {
+            cwd: path.resolve(__dirname, ".."),
+            env: { ...process.env, TEST_PORT: "4099", DATABASE_URL: process.env.DATABASE_URL! },
+            stdio: "ignore",
+            detached: true,
+          },
+        );
+        child.unref();
+      };
+
+      try {
+        fs.writeFileSync(bakPath, originalSrc);
+        fs.writeFileSync(deployRunnerPath, mutatedSrc);
+
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        startServer();
+        await waitForServer(60);
+
+        // Fresh org + key for mutation test
+        const { rows: dtm1OrgRows } = await pool.query<{ id: string }>(
+          "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_dtm1','DTM1 Org','dtm1-org') RETURNING id",
+        );
+        const dtm1OrgId = dtm1OrgRows[0].id;
+        const { fullKey: dtm1Key, keyPrefix: dtm1KP, keyHash: dtm1KH } = generateApiKey();
+        await pool.query(
+          `INSERT INTO api_keys (org_id, name, key_prefix, key_hash, scopes)
+           VALUES ($1,'dtm1-key',$2,$3,'{read,deploy,manage}')`,
+          [dtm1OrgId, dtm1KP, dtm1KH],
+        );
+
+        await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+        // Set a 2s env timeout — the mutation makes the actual timer use 999999999ms
+        await request("POST", "/test/set-deploy-timeouts", { body: { buildMs: 2000, hardCapMs: 20000 } });
+        await request("POST", "/test/set-flyctl-mode", { body: { mode: "hang" } });
+
+        const dtm1Zip = await buildZip({
+          "package.json": JSON.stringify({ name: "dtm1-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+          "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+        });
+        const dtm1Form = new FormData();
+        dtm1Form.append("code", dtm1Zip, { filename: "app.zip", contentType: "application/zip" });
+        dtm1Form.append("app_name", "dtm1-app");
+        const dtm1Intake = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(dtm1Key), formData: dtm1Form,
+        });
+        const { deployment_id: dtm1DepId } = dtm1Intake.body as Record<string, string>;
+
+        // Stream: with the mutation, the timeout never fires, so the stream will
+        // hit the 8s timeout with no "done" event.
+        const dtm1Events = await streamRequest(
+          `/v1/deployments/${dtm1DepId}/stream`,
+          authHeaders(dtm1Key),
+        );
+        const dtm1Parsed = dtm1Events
+          .map((e) => { try { return JSON.parse(e) as Record<string, unknown>; } catch { return null; } })
+          .filter(Boolean) as Array<Record<string, unknown>>;
+
+        const dtm1HasDone = dtm1Parsed.some((e) => e.type === "done");
+        !dtm1HasDone
+          ? ok('DT-M1 (.bak): no "done" event within 8s → "DT-1: SSE stream has done event" FAILS — mutation killed')
+          : fail("DT-M1 (.bak): expected no done event but got one — mutation not effective");
+
+        // Cleanup mutant org
+        await pool.query("DELETE FROM api_keys WHERE org_id=$1", [dtm1OrgId]);
+        await pool.query("DELETE FROM apps WHERE org_id=$1", [dtm1OrgId]);
+        await pool.query("DELETE FROM orgs WHERE id=$1", [dtm1OrgId]);
+      } finally {
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        fs.writeFileSync(deployRunnerPath, originalSrc);
+        fs.unlinkSync(bakPath);
+        startServer();
+        await waitForServer(60);
+      }
+    }
+  }
+
+  // ── DT-M2 (.bak mutation): timeout fires but process not killed ─────────────
+  // Mutate deployRunner.ts to comment out the killProcessGroup call in the build
+  // timeout callback.  The stream will still get a done event (fail() fires), but
+  // the PID check shows the process is still alive.
+  {
+    const deployRunnerPath = path.resolve(__dirname, "../src/services/deployRunner.ts");
+    const bakPath = deployRunnerPath + ".bak";
+    const originalSrc = fs.readFileSync(deployRunnerPath, "utf8");
+
+    const ORIGINAL_KILL = "      if (proc.pid !== undefined) killProcessGroup(proc.pid);";
+    const MUTATED_KILL  = "      // if (proc.pid !== undefined) killProcessGroup(proc.pid); // MUTATED";
+    const mutatedSrc = originalSrc.replace(ORIGINAL_KILL, MUTATED_KILL);
+
+    if (mutatedSrc === originalSrc) {
+      fail("DT-M2 (.bak): mutation target not found in deployRunner.ts — cannot apply");
+    } else {
+      const { execSync, spawn } = require("child_process") as typeof import("child_process");
+
+      const killPort4099 = () => {
+        try {
+          execSync(
+            `for p in $(lsof -nP -tiTCP:4099 -sTCP:LISTEN 2>/dev/null); do` +
+            ` ps -p "$p" -o command= 2>/dev/null | grep -q test-server && kill "$p" 2>/dev/null || true; done`,
+            { shell: "/bin/bash" },
+          );
+        } catch {}
+      };
+
+      const startServer = () => {
+        const child = spawn(
+          "npx",
+          ["ts-node", "--project", "tsconfig.json", "scripts/test-server.ts"],
+          {
+            cwd: path.resolve(__dirname, ".."),
+            env: { ...process.env, TEST_PORT: "4099", DATABASE_URL: process.env.DATABASE_URL! },
+            stdio: "ignore",
+            detached: true,
+          },
+        );
+        child.unref();
+      };
+
+      try {
+        fs.writeFileSync(bakPath, originalSrc);
+        fs.writeFileSync(deployRunnerPath, mutatedSrc);
+
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        startServer();
+        await waitForServer(60);
+
+        const { rows: dtm2OrgRows } = await pool.query<{ id: string }>(
+          "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_dtm2','DTM2 Org','dtm2-org') RETURNING id",
+        );
+        const dtm2OrgId = dtm2OrgRows[0].id;
+        const { fullKey: dtm2Key, keyPrefix: dtm2KP, keyHash: dtm2KH } = generateApiKey();
+        await pool.query(
+          `INSERT INTO api_keys (org_id, name, key_prefix, key_hash, scopes)
+           VALUES ($1,'dtm2-key',$2,$3,'{read,deploy,manage}')`,
+          [dtm2OrgId, dtm2KP, dtm2KH],
+        );
+
+        await request("POST", "/test/set-real-deploy", { body: { enabled: true } });
+        await request("POST", "/test/set-deploy-timeouts", { body: { buildMs: 2000, hardCapMs: 20000 } });
+        await request("POST", "/test/set-flyctl-mode", { body: { mode: "hang" } });
+
+        const dtm2Zip = await buildZip({
+          "package.json": JSON.stringify({ name: "dtm2-app", version: "1.0.0", scripts: { start: "node index.js" } }),
+          "index.js": "require('http').createServer((_,r)=>r.end('ok')).listen(8080)",
+        });
+        const dtm2Form = new FormData();
+        dtm2Form.append("code", dtm2Zip, { filename: "app.zip", contentType: "application/zip" });
+        dtm2Form.append("app_name", "dtm2-app");
+        const dtm2Intake = await request("POST", "/v1/deployments/intake/zip", {
+          headers: authHeaders(dtm2Key), formData: dtm2Form,
+        });
+        const { deployment_id: dtm2DepId } = dtm2Intake.body as Record<string, string>;
+
+        // Open stream — will end when fail() fires (timeout fires, doesn't kill,
+        // but still calls reject → fail() path → SSE done emitted)
+        const dtm2StreamPromise = streamRequest(
+          `/v1/deployments/${dtm2DepId}/stream`,
+          authHeaders(dtm2Key),
+        );
+
+        // Poll for PID
+        let dtm2Pid: number | null = null;
+        const dtm2PidDeadline = Date.now() + 3000;
+        while (dtm2Pid === null && Date.now() < dtm2PidDeadline) {
+          const pr = await request("GET", "/test/flyctl-hang-pid");
+          dtm2Pid = (pr.body as { pid?: number | null }).pid ?? null;
+          if (dtm2Pid === null) await new Promise<void>((r) => setTimeout(r, 100));
+        }
+
+        // Wait for stream to close (timeout fires at 2s, done event emitted)
+        await dtm2StreamPromise;
+
+        // After the done event, PID should STILL be alive (kill was removed)
+        if (dtm2Pid !== null) {
+          // Brief wait to let any remaining async happen
+          await new Promise<void>((r) => setTimeout(r, 300));
+          const ar = await request("GET", `/test/is-pid-alive/${dtm2Pid}`);
+          const dtm2PidAlive = (ar.body as { alive?: boolean }).alive ?? false;
+          dtm2PidAlive
+            ? ok('DT-M2 (.bak): PID still alive after timeout → "DT-1: flyctl process group killed" FAILS — mutation killed')
+            : fail("DT-M2 (.bak): expected PID still alive but it died — mutation not effective or PID reused");
+
+          // Clean up the orphaned process
+          try { process.kill(dtm2Pid, "SIGKILL"); } catch { /* already gone */ }
+        } else {
+          fail("DT-M2 (.bak): hang-mode flyctl never wrote PID file — cannot verify mutation");
+        }
+
+        // Cleanup
+        await pool.query("DELETE FROM api_keys WHERE org_id=$1", [dtm2OrgId]);
+        await pool.query("DELETE FROM apps WHERE org_id=$1", [dtm2OrgId]);
+        await pool.query("DELETE FROM orgs WHERE id=$1", [dtm2OrgId]);
+      } finally {
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        fs.writeFileSync(deployRunnerPath, originalSrc);
+        fs.unlinkSync(bakPath);
+        startServer();
+        await waitForServer(60);
+      }
+    }
+  }
+
+  // ── DT-M3 (.bak mutation): reaper marks failed but doesn't destroy Fly app ──
+  // Mutate reaper.ts to comment out the destroyFlyApp call in reapStalledDeployments.
+  // DT-3's fly-call-log check for destroyFlyApp will find no such call.
+  {
+    const reaperPath = path.resolve(__dirname, "../src/lib/reaper.ts");
+    const bakPath = reaperPath + ".bak";
+    const originalSrc = fs.readFileSync(reaperPath, "utf8");
+
+    // Target the destroyFlyApp call unique to reapStalledDeployments (timed-out deploy log)
+    const ORIGINAL_DESTROY =
+      `          await destroyFlyApp(fly_app_id);\n` +
+      `          console.log(\`[reaper] destroyed Fly app for timed-out first deploy: \${fly_app_id}\`);`;
+    const MUTATED_DESTROY  =
+      `          // await destroyFlyApp(fly_app_id); // MUTATED — reaper skips destroy\n` +
+      `          console.log(\`[reaper] destroyed Fly app for timed-out first deploy: \${fly_app_id}\`);`;
+    const mutatedSrc = originalSrc.replace(ORIGINAL_DESTROY, MUTATED_DESTROY);
+
+    if (mutatedSrc === originalSrc) {
+      fail("DT-M3 (.bak): mutation target not found in reaper.ts — cannot apply");
+    } else {
+      const { execSync, spawn } = require("child_process") as typeof import("child_process");
+
+      const killPort4099 = () => {
+        try {
+          execSync(
+            `for p in $(lsof -nP -tiTCP:4099 -sTCP:LISTEN 2>/dev/null); do` +
+            ` ps -p "$p" -o command= 2>/dev/null | grep -q test-server && kill "$p" 2>/dev/null || true; done`,
+            { shell: "/bin/bash" },
+          );
+        } catch {}
+      };
+
+      const startServer = () => {
+        const child = spawn(
+          "npx",
+          ["ts-node", "--project", "tsconfig.json", "scripts/test-server.ts"],
+          {
+            cwd: path.resolve(__dirname, ".."),
+            env: { ...process.env, TEST_PORT: "4099", DATABASE_URL: process.env.DATABASE_URL! },
+            stdio: "ignore",
+            detached: true,
+          },
+        );
+        child.unref();
+      };
+
+      try {
+        fs.writeFileSync(bakPath, originalSrc);
+        fs.writeFileSync(reaperPath, mutatedSrc);
+
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        startServer();
+        await waitForServer(60);
+
+        // Fresh app + stale deployment for the mutation test
+        const { rows: dtm3OrgRows } = await pool.query<{ id: string }>(
+          "INSERT INTO orgs (clerk_org_id, name, slug) VALUES ('clerk_org_dtm3','DTM3 Org','dtm3-org') RETURNING id",
+        );
+        const dtm3OrgId = dtm3OrgRows[0].id;
+        const { rows: dtm3AppRows } = await pool.query<{ id: string }>(
+          `INSERT INTO apps (org_id, name, slug, subdomain, fly_app_id)
+           VALUES ($1,'dtm3-app','dtm3-app','dtm3-fake.fly.dev','dtm3-fake-fly-app') RETURNING id`,
+          [dtm3OrgId],
+        );
+        const dtm3AppId = dtm3AppRows[0].id;
+        const { rows: dtm3DepRows } = await pool.query<{ id: string }>(
+          `INSERT INTO deployments (app_id, status, created_at)
+           VALUES ($1,'deploying',now() - INTERVAL '20 minutes') RETURNING id`,
+          [dtm3AppId],
+        );
+        const dtm3DepId = dtm3DepRows[0].id;
+
+        // Reset fly log on the mutated server
+        await request("POST", "/test/reset-fly-call-log");
+
+        const dtm3ReapR = await request("POST", "/test/run-reap-stalled", {});
+
+        // The reaper marks the deployment failed but does NOT call destroyFlyApp
+        const dtm3LogR = await request("GET", "/test/fly-call-log");
+        const dtm3Log = (dtm3LogR.body as { calls?: DtFlyCall[] }).calls ?? [];
+        const hasDestroy = dtm3Log.some((c) => c.fn === "destroyFlyApp" && c.arg === "dtm3-fake-fly-app");
+
+        // Verify the reaper DID mark it failed (the mutation only removed destroy)
+        const { rows: dtm3DepResult } = await pool.query<{ status: string }>(
+          "SELECT status FROM deployments WHERE id=$1", [dtm3DepId],
+        );
+        dtm3DepResult[0]?.status === "failed" && !hasDestroy
+          ? ok('DT-M3 (.bak): reaper marks failed but destroyFlyApp not called → "DT-3: reaper called destroyFlyApp" FAILS — mutation killed')
+          : fail("DT-M3 (.bak): unexpected state — either not failed or destroy still called",
+              `status=${dtm3DepResult[0]?.status} hasDestroy=${hasDestroy} reapR=${JSON.stringify(dtm3ReapR.body)}`);
+
+        // Cleanup
+        await pool.query("DELETE FROM deployments WHERE id=$1", [dtm3DepId]);
+        await pool.query("DELETE FROM apps WHERE id=$1", [dtm3AppId]);
+        await pool.query("DELETE FROM orgs WHERE id=$1", [dtm3OrgId]);
+      } finally {
+        killPort4099();
+        await new Promise<void>((r) => setTimeout(r, 1500));
+        fs.writeFileSync(reaperPath, originalSrc);
+        fs.unlinkSync(bakPath);
+        startServer();
+        await waitForServer(60);
+      }
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════

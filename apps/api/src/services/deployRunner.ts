@@ -22,6 +22,56 @@ import { registerDeploy, unregisterDeploy } from "../lib/shutdown";
 
 const execFileP = promisify(execFile);
 
+// ─── Per-step timeout configuration ──────────────────────────────────────────
+// All limits are read from env at call time so tests can override them via
+// process.env without restarting the server.
+
+/** Timeout for the entire flyctl build + deploy command (image build, push, machine creation). */
+function getDeployBuildTimeoutMs(): number {
+  const v = parseInt(process.env.DEPLOY_BUILD_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 10 * 60 * 1000; // 10 minutes
+}
+
+/** Hard cap for the entire deploy (all steps combined). */
+function getDeployHardCapMs(): number {
+  const v = parseInt(process.env.DEPLOY_HARD_CAP_MS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 15 * 60 * 1000; // 15 minutes
+}
+
+// ─── Step logger ──────────────────────────────────────────────────────────────
+// Logs to console (Railway logs), never to the SSE stream.
+// No secrets — do not pass user tokens or env values as step names.
+
+function stepLog(deploymentId: string, step: string, startMs?: number): void {
+  const suffix = startMs !== undefined
+    ? ` done duration=${Date.now() - startMs}ms`
+    : " started";
+  console.log(`[deploy] ${deploymentId} step=${step}${suffix}`);
+}
+
+// ─── Child process registry ────────────────────────────────────────────────────
+// Maps deploymentId → function that kills the process group.
+// Used by fail() (for timeout/abort) and by the reaper (for stalled deploys).
+
+const _activeProcesses = new Map<string, () => void>();
+
+function killProcessGroup(pid: number): void {
+  try { process.kill(-pid, "SIGKILL"); } catch { /* already exited */ }
+}
+
+/**
+ * Kill the flyctl process group registered for this deployment.
+ * Returns true if a process was found; false if none was registered.
+ * Safe to call multiple times — no-op if already removed.
+ */
+export function killDeployProcess(deploymentId: string): boolean {
+  const kill = _activeProcesses.get(deploymentId);
+  if (!kill) return false;
+  _activeProcesses.delete(deploymentId);
+  kill();
+  return true;
+}
+
 interface RunDeployArgs {
   deploymentId: string;
   appId: string;
@@ -156,10 +206,16 @@ async function setProxySecret(appName: string, token: string): Promise<void> {
 // Polls the app until the access proxy is confirmed running, or the deadline
 // expires.  Uses raw http/https to avoid automatic redirect-following.
 
-const VERIFY_TIMEOUT_MS =
-  process.env.SSC_TEST === "1" && process.env.SSC_VERIFY_TIMEOUT_MS
-    ? parseInt(process.env.SSC_VERIFY_TIMEOUT_MS, 10)
-    : 90_000;
+const VERIFY_TIMEOUT_MS = (() => {
+  // Test-mode override via SSC_VERIFY_TIMEOUT_MS (set in test-server.ts before import).
+  if (process.env.SSC_TEST === "1" && process.env.SSC_VERIFY_TIMEOUT_MS) {
+    const v = parseInt(process.env.SSC_VERIFY_TIMEOUT_MS, 10);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  // Production limit via DEPLOY_VERIFY_TIMEOUT_MS, defaulting to 2 minutes.
+  const v = parseInt(process.env.DEPLOY_VERIFY_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 2 * 60 * 1000;
+})();
 const VERIFY_POLL_MS = process.env.SSC_TEST === "1" ? 100 : 3_000;
 
 function fetchNoFollow(
@@ -332,6 +388,7 @@ export async function runFlyctlDeploy(
 ): Promise<void> {
   log(deploymentId, `Deploying to Fly app: ${appName}`);
 
+  const buildTimeoutMs = getDeployBuildTimeoutMs();
   const outputLines: string[] = [];
 
   return new Promise<void>((resolve, reject) => {
@@ -345,8 +402,25 @@ export async function runFlyctlDeploy(
       {
         cwd: dir,
         env: flyctlEnv(),
+        // detached=true gives flyctl its own process group so SIGKILL can reach
+        // all child processes (the remote builder, any background agents) at once.
+        detached: true,
       },
     );
+
+    // Register so fail() (timeout / shutdown abort) and the reaper can kill this.
+    if (proc.pid !== undefined) {
+      _activeProcesses.set(deploymentId, () => killProcessGroup(proc.pid!));
+    }
+
+    // Build timeout: kills the process group and rejects if flyctl goes silent.
+    // Covers both the image build/push phase and machine creation/start (both run
+    // inside this single flyctl command).
+    const buildTimer = setTimeout(() => {
+      _activeProcesses.delete(deploymentId);
+      if (proc.pid !== undefined) killProcessGroup(proc.pid);
+      reject(new DeployError("timeout", "Fly did not respond in time. Please deploy again."));
+    }, buildTimeoutMs);
 
     proc.stdout.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
@@ -370,9 +444,15 @@ export async function runFlyctlDeploy(
     // Without this handler, a missing flyctl binary raises ENOENT outside the
     // Promise and the catch block in runDeploy never fires, leaving the SSE
     // stream stuck on keep-alive pings.
-    proc.on("error", reject);
+    proc.on("error", (err: Error) => {
+      clearTimeout(buildTimer);
+      _activeProcesses.delete(deploymentId);
+      reject(err);
+    });
 
     proc.on("close", (code: number) => {
+      clearTimeout(buildTimer);
+      _activeProcesses.delete(deploymentId);
       if (code !== 0) {
         // When flyctl gets an unrecognised flag it prints ~20 lines of usage
         // text instead of a useful error.  Detect that case and surface only
@@ -433,6 +513,9 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
   const fail = async (err: DeployError): Promise<void> => {
     if (_done) return; // already completed via another path
     _done = true;
+    // Kill any flyctl child process still running for this deployment.
+    // This is a no-op if the process already exited or was never registered.
+    killDeployProcess(deploymentId);
     console.error(`[deploy] ${deploymentId} failed at ${err.stage}: ${err.message}`);
     await updateDeploymentStatus(deploymentId, "failed", {
       failure_stage: err.stage,
@@ -480,6 +563,14 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
   registerDeploy(deploymentId, (stage: string, message: string) => {
     void fail(new DeployError(stage, message));
   });
+
+  // Hard cap: if the whole deploy takes longer than getDeployHardCapMs(), mark it
+  // failed and kill any running flyctl child process.  This catches cases where a
+  // step hangs silently and no per-step timeout fires first.
+  let _hardCapTimer: NodeJS.Timeout | null = setTimeout(() => {
+    _hardCapTimer = null;
+    void fail(new DeployError("timeout", "Fly did not respond in time. Please deploy again."));
+  }, getDeployHardCapMs());
 
   try {
     await updateDeploymentStatus(deploymentId, "building");
@@ -563,22 +654,19 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
         await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
 
         // Egress policy (recreate path)
+        { const t0 = Date.now(); stepLog(deploymentId, "egress_policy");
+          try { await createEgressPolicy(appName); }
+          catch (err) { stepLog(deploymentId, "egress_policy", t0); throw new DeployError("provision", "Failed to configure network policy. Please try again."); }
+          stepLog(deploymentId, "egress_policy", t0); }
         log(deploymentId, "Setting egress network policy…");
-        try {
-          await createEgressPolicy(appName);
-        } catch (err) {
-          throw new DeployError("provision", "Failed to configure network policy. Please try again.");
-        }
 
         // Proxy token — always reissue on recreate
-        log(deploymentId, "Setting proxy credentials…");
-        const recreateToken = await issueProxyToken(appId);
-        try {
-          await setProxySecret(appName, recreateToken);
-        } catch (err) {
-          if (err instanceof DeployError) throw err;
-          throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
-        }
+        { const t0 = Date.now(); stepLog(deploymentId, "proxy_credentials");
+          log(deploymentId, "Setting proxy credentials…");
+          const recreateToken = await issueProxyToken(appId);
+          try { await setProxySecret(appName, recreateToken); }
+          catch (err) { stepLog(deploymentId, "proxy_credentials", t0); if (err instanceof DeployError) throw err; throw new DeployError("provision", "Failed to set proxy credentials. Please try again."); }
+          stepLog(deploymentId, "proxy_credentials", t0); }
       } else {
         // Existing redeploy — ensure proxy credentials exist (issue if missing)
         const { rows: credRows } = await pool.query<{ app_id: string }>(
@@ -586,14 +674,12 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
           [appId],
         );
         if (credRows.length === 0) {
+          const t0 = Date.now(); stepLog(deploymentId, "proxy_credentials");
           log(deploymentId, "Setting proxy credentials…");
           const redeployToken = await issueProxyToken(appId);
-          try {
-            await setProxySecret(appName, redeployToken);
-          } catch (err) {
-            if (err instanceof DeployError) throw err;
-            throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
-          }
+          try { await setProxySecret(appName, redeployToken); }
+          catch (err) { stepLog(deploymentId, "proxy_credentials", t0); if (err instanceof DeployError) throw err; throw new DeployError("provision", "Failed to set proxy credentials. Please try again."); }
+          stepLog(deploymentId, "proxy_credentials", t0);
         }
       }
     } else {
@@ -615,67 +701,73 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       await pool.query("UPDATE apps SET fly_app_id = $1 WHERE id = $2", [appName, appId]);
 
       // Egress policy (first deploy path)
-      log(deploymentId, "Setting egress network policy…");
-      try {
-        await createEgressPolicy(appName);
-      } catch (err) {
-        throw new DeployError("provision", "Failed to configure network policy. Please try again.");
-      }
+      { const t0 = Date.now(); stepLog(deploymentId, "egress_policy");
+        log(deploymentId, "Setting egress network policy…");
+        try { await createEgressPolicy(appName); }
+        catch (err) { stepLog(deploymentId, "egress_policy", t0); throw new DeployError("provision", "Failed to configure network policy. Please try again."); }
+        stepLog(deploymentId, "egress_policy", t0); }
 
       // Proxy token — always issue on first deploy
-      log(deploymentId, "Setting proxy credentials…");
-      const firstToken = await issueProxyToken(appId);
-      try {
-        await setProxySecret(appName, firstToken);
-      } catch (err) {
-        if (err instanceof DeployError) throw err;
-        throw new DeployError("provision", "Failed to set proxy credentials. Please try again.");
-      }
+      { const t0 = Date.now(); stepLog(deploymentId, "proxy_credentials");
+        log(deploymentId, "Setting proxy credentials…");
+        const firstToken = await issueProxyToken(appId);
+        try { await setProxySecret(appName, firstToken); }
+        catch (err) { stepLog(deploymentId, "proxy_credentials", t0); if (err instanceof DeployError) throw err; throw new DeployError("provision", "Failed to set proxy credentials. Please try again."); }
+        stepLog(deploymentId, "proxy_credentials", t0); }
     }
     flyAppName = appName;
 
     // Step 3b: generate Dockerfile + fly.toml (lockfile-aware for Node)
-    log(deploymentId, "Generating deploy files…");
-    try {
-      // Fetch env var names so they are injected into the app container secrets list.
-      // Values never leave Fly; we only need the names for the machine_config.
-      const envRows = appId
-        ? await pool.query<{ name: string }>(
-            `SELECT name FROM app_env_vars WHERE app_id = $1 ORDER BY name`,
-            [appId],
-          )
-        : { rows: [] as { name: string }[] };
-      const appSecretNames = envRows.rows.map((r) => r.name);
+    { const t0 = Date.now(); stepLog(deploymentId, "generate_files");
+      log(deploymentId, "Generating deploy files…");
+      try {
+        // Fetch env var names so they are injected into the app container secrets list.
+        // Values never leave Fly; we only need the names for the machine_config.
+        const envRows = appId
+          ? await pool.query<{ name: string }>(
+              `SELECT name FROM app_env_vars WHERE app_id = $1 ORDER BY name`,
+              [appId],
+            )
+          : { rows: [] as { name: string }[] };
+        const appSecretNames = envRows.rows.map((r) => r.name);
 
-      const { nodeVersionLog } = await generateDeployFiles(workDir, appName, appType, appId, undefined, appSecretNames);
-      if (nodeVersionLog) log(deploymentId, nodeVersionLog);
-    } catch (err) {
-      throw new DeployError(
-        "provision",
-        err instanceof Error ? err.message : "Failed to generate deploy files.",
-      );
-    }
+        const { nodeVersionLog } = await generateDeployFiles(workDir, appName, appType, appId, undefined, appSecretNames);
+        if (nodeVersionLog) log(deploymentId, nodeVersionLog);
+      } catch (err) {
+        stepLog(deploymentId, "generate_files", t0);
+        throw new DeployError(
+          "provision",
+          err instanceof Error ? err.message : "Failed to generate deploy files.",
+        );
+      }
+      stepLog(deploymentId, "generate_files", t0); }
 
     // Step 4: deploy
     await updateDeploymentStatus(deploymentId, "deploying");
     eventBus.emit(deploymentId, { type: "status", status: "deploying" });
 
-    await runFlyctlDeploy(workDir, appName, deploymentId);
+    { const t0 = Date.now(); stepLog(deploymentId, "flyctl_deploy");
+      try { await runFlyctlDeploy(workDir, appName, deploymentId); }
+      catch (err) { stepLog(deploymentId, "flyctl_deploy", t0); throw err; }
+      stepLog(deploymentId, "flyctl_deploy", t0); }
 
     // Step 4b: verify the access proxy is up
-    log(deploymentId, "Verifying access proxy…");
-    try {
-      await verifyProxy(appName, appId);
-    } catch {
-      // Proxy failed to come up — destroy every machine so auto_start_machines
-      // cannot bring the app back up in a half-deployed state.
-      const machines = await listMachines(appName);
-      await Promise.all(machines.map((m) => destroyMachine(appName, m.id).catch(() => {})));
-      throw new DeployError(
-        "verify",
-        "The app did not come up behind the access proxy, so it was taken offline. Please redeploy.",
-      );
-    }
+    { const t0 = Date.now(); stepLog(deploymentId, "proxy_verify");
+      log(deploymentId, "Verifying access proxy…");
+      try {
+        await verifyProxy(appName, appId);
+      } catch {
+        stepLog(deploymentId, "proxy_verify", t0);
+        // Proxy failed to come up — destroy every machine so auto_start_machines
+        // cannot bring the app back up in a half-deployed state.
+        const machines = await listMachines(appName);
+        await Promise.all(machines.map((m) => destroyMachine(appName, m.id).catch(() => {})));
+        throw new DeployError(
+          "verify",
+          "The app did not come up behind the access proxy, so it was taken offline. Please redeploy.",
+        );
+      }
+      stepLog(deploymentId, "proxy_verify", t0); }
 
     // Step 5: success
     // Guard: if abort fired during an earlier await (e.g. runFlyctlDeploy),
@@ -710,6 +802,7 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
     eventBus.emit(deploymentId, { type: "status", status: "success" });
     eventBus.emit(deploymentId, { type: "done" });
 
+    stepLog(deploymentId, "done");
     log(deploymentId, `Deploy complete: ${appUrl}`);
   } catch (err: unknown) {
     if (err instanceof DeployError) {
@@ -719,6 +812,8 @@ export async function runDeploy(args: RunDeployArgs): Promise<void> {
       console.error("[deploy] unexpected:", safeErr(err));
     }
   } finally {
+    // Cancel the hard cap timer if it hasn't fired yet.
+    if (_hardCapTimer) { clearTimeout(_hardCapTimer); _hardCapTimer = null; }
     // Always unregister — whether the deploy succeeded, failed, or was aborted.
     unregisterDeploy(deploymentId);
     _logEmitter.off("event", _collectLog);
