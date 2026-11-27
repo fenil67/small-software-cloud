@@ -89,7 +89,7 @@ import { intakeRouter } from "../src/routes/intake";
 // apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
 import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs, reapDeploymentsOfDeletedApps } from "../src/lib/reaper";
-import { setShuttingDownForTest, activeDeployCount, abortAllActiveDeploysForTest, registerDeploy, unregisterDeploy } from "../src/lib/shutdown";
+import { setShuttingDownForTest, activeDeployCount, runGracefulShutdown, pruneFinishedDeploys, registerDeploy, unregisterDeploy } from "../src/lib/shutdown";
 import { runReconcile, ClerkOrgCheck } from "../src/lib/reconcile";
 import { eventBus } from "../src/lib/eventBus";
 import { pool } from "../src/db";
@@ -1137,11 +1137,35 @@ app.get("/test/active-deploy-count", (_req, res) => {
   res.json({ count: activeDeployCount() });
 });
 
-// POST /test/abort-active-deploys
-// Calls abortAllActiveDeploysForTest() — simulates grace-period expiry.
-app.post("/test/abort-active-deploys", (_req, res) => {
-  abortAllActiveDeploysForTest();
-  res.json({ ok: true });
+// POST /test/trigger-shutdown { gracePeriodMs?: number }
+// Calls runGracefulShutdown with test-safe options (no exit, no server close, no pool end).
+// gracePeriodMs overrides the computed wait time — pass 0 or a small number for fast tests.
+app.post("/test/trigger-shutdown", (req, res) => {
+  const { gracePeriodMs } = req.body as { gracePeriodMs?: number };
+  void runGracefulShutdown(null, null, {
+    gracePeriodMs: typeof gracePeriodMs === "number" ? gracePeriodMs : 0,
+    skipClose: true,
+    skipPoolEnd: true,
+    skipExit: true,
+  }).then(() => {
+    // Reset the shutdown flag so subsequent tests can still use the server.
+    setShuttingDownForTest(false);
+    res.json({ ok: true });
+  }).catch((err) => {
+    setShuttingDownForTest(false);
+    res.status(500).json({ error: String(err) });
+  });
+});
+
+// POST /test/prune-stale-deploys
+// Calls pruneFinishedDeploys() synchronously and returns the count pruned.
+app.post("/test/prune-stale-deploys", async (_req, res) => {
+  try {
+    const pruned = await pruneFinishedDeploys(pool);
+    res.json({ ok: true, pruned });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // POST /test/run-reap-deleted-apps
