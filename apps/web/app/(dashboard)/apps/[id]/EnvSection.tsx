@@ -30,13 +30,17 @@ function relativeTime(isoDate: string): string {
 }
 
 const ERROR_MESSAGES: Record<string, string> = {
-  reserved_name:  "That name is reserved.",
-  invalid_name:   "Name must be uppercase letters, digits, or underscores and start with a letter or underscore.",
-  empty_value:    "Value cannot be empty.",
-  value_too_large:"Value exceeds the 32 KB limit.",
-  too_many_vars:  "Limit of 50 variables reached.",
-  app_suspended:  "Cannot modify variables while the app is suspended.",
-  not_authenticated: "Session expired. Please reload.",
+  reserved_name:    "That name is reserved.",
+  invalid_name:     "Name must be uppercase letters, digits, or underscores and start with a letter or underscore.",
+  empty_value:      "Value cannot be empty.",
+  value_too_large:  "Value exceeds the 32 KB limit.",
+  too_many_vars:    "Limit of 50 variables reached.",
+  app_suspended:    "Cannot modify variables while the app is suspended.",
+  not_authenticated:"Session expired. Please reload.",
+  // Apply-specific codes
+  fly_error:        "Could not update machines. Try again in a moment.",
+  app_not_deployed: "App has not been deployed yet.",
+  apply_failed:     "Failed to update machines.",
 };
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -86,7 +90,7 @@ export function EnvSection({ appId, initialVars, isAdmin, isSuspended }: Props) 
     setApplyMsg(null);
     const result = await applyEnvVars(appId);
     if (result.error) {
-      setError("Failed to restart app.");
+      setError(ERROR_MESSAGES[result.error] ?? "Failed to update machines.");
       return;
     }
     setPendingApply(false);

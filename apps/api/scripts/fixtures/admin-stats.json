@@ -19,21 +19,6 @@
   "email_sending_configured": true,
   "deploy_series": [
     {
-      "date": "2026-11-11",
-      "succeeded": 0,
-      "failed": 0
-    },
-    {
-      "date": "2026-11-12",
-      "succeeded": 0,
-      "failed": 0
-    },
-    {
-      "date": "2026-11-13",
-      "succeeded": 0,
-      "failed": 0
-    },
-    {
       "date": "2026-11-14",
       "succeeded": 0,
       "failed": 0
@@ -85,6 +70,21 @@
     },
     {
       "date": "2026-11-24",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-25",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-26",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "2026-11-27",
       "succeeded": 1,
       "failed": 2
     }

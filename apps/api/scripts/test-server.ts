@@ -311,27 +311,48 @@ flyModule.unsetFlySecret = async (appName: string, name: string) => {
   _flyCallLog.push({ fn: "unsetFlySecret", arg: appName, body: { name } });
   if (_unsetFlySecretFailMode) throw new Error("unsetFlySecret failed (test mode)");
 };
+// _mockAppContainerSecrets: simulates secrets already baked into the app
+// container at deploy time (set by /test/set-app-container-secrets).
+// Default: empty — machine was deployed before any env vars were added.
+let _mockAppContainerSecrets: Array<{ env_var: string; name: string }> = [];
+
 flyModule.getMachine = async (appName: string, machineId: string) => {
   _flyCallLog.push({ fn: "getMachine", arg: appName, body: { machineId } });
-  // Return a minimal machine config (the real code passes this straight to updateFlyMachine)
-  return { id: machineId, config: { image: "placeholder" } };
+  // Return a full multi-container machine detail matching the fly.toml structure.
+  // The app container carries _mockAppContainerSecrets so tests can simulate a
+  // machine that was last deployed with a different set of env vars.
+  return {
+    id: machineId,
+    state: "started",
+    config: {
+      containers: [
+        {
+          name: "proxy",
+          image: `${process.env.PROXY_IMAGE}`,
+          env: { SSC_APP_ID: "test-app", SSC_API_URL: process.env.API_PUBLIC_URL },
+          secrets: [{ env_var: "SSC_PROXY_TOKEN", name: "SSC_PROXY_TOKEN" }],
+        },
+        {
+          name: "app",
+          image: "placeholder",
+          env: { PORT: "8080" },
+          secrets: [..._mockAppContainerSecrets],
+        },
+      ],
+    },
+  };
 };
-flyModule.updateFlyMachine = async (appName: string, machineId: string) => {
-  _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId } });
+flyModule.updateFlyMachine = async (appName: string, machineId: string, body: unknown) => {
+  // Record the full payload so tests can inspect the config structure and verify:
+  // - body is { config } not the raw machine response (no "id", "state", etc.)
+  // - app container secrets match current app_env_vars
+  // - proxy container secrets are unchanged
+  _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId, payload: body } });
   if (_updateFlyMachineFailMode) throw new Error("updateFlyMachine failed (test mode)");
 };
-// updateFlyMachines is stubbed to avoid real HTTP calls while still recording
-// each machine UPDATE call so ENV-24 can assert updateFlyMachine was invoked.
-flyModule.updateFlyMachines = async (appName: string) => {
-  _flyCallLog.push({ fn: "updateFlyMachines", arg: appName });
-  if (_updateFlyMachineFailMode) throw new Error("updateFlyMachine failed (test mode)");
-  for (const m of _listMachinesResult) {
-    // Record individual machine UPDATE calls so tests can verify the pattern.
-    _flyCallLog.push({ fn: "getMachine", arg: appName, body: { machineId: m.id } });
-    _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId: m.id } });
-  }
-  return { updated: _listMachinesResult.length };
-};
+// NOTE: updateFlyMachines is NOT stubbed here — the real function runs via
+// self-require in flyClient.ts, which calls the stubbed getMachine /
+// updateFlyMachine above.  This exercises buildUpdatedConfig in production code.
 
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
@@ -829,6 +850,16 @@ app.post("/test/set-unset-fly-secret-fail", (req, res) => {
 // POST /test/set-update-fly-machine-fail { fail: bool }
 app.post("/test/set-update-fly-machine-fail", (req, res) => {
   _updateFlyMachineFailMode = !!(req.body as { fail?: boolean }).fail;
+  res.json({ ok: true });
+});
+
+// POST /test/set-app-container-secrets { secrets: [{env_var, name}] }
+// Sets the simulated "already-deployed" secrets on the app container that
+// getMachine stub returns.  Used by ENV-30 / ENV-M8 to simulate a machine
+// whose app container has stale/out-of-date secrets.
+app.post("/test/set-app-container-secrets", (req, res) => {
+  const { secrets } = req.body as { secrets?: Array<{ env_var: string; name: string }> };
+  _mockAppContainerSecrets = secrets ?? [];
   res.json({ ok: true });
 });
 
