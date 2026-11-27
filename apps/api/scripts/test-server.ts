@@ -88,7 +88,7 @@ import { deployStreamRouter } from "../src/routes/deployStream";
 import { intakeRouter } from "../src/routes/intake";
 // apiKeysRouter loaded via require() after requireAuth patch (see below)
 import { authRouter } from "../src/routes/auth";
-import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs, reapDeploymentsOfDeletedApps } from "../src/lib/reaper";
+import { startReaper, reapOrphanedFlyApps, reapExpiredProxyCodes, reapKeysByMembership, reapOldBuildLogs, reapDeploymentsOfDeletedApps, reapStalledDeployments } from "../src/lib/reaper";
 import { setShuttingDownForTest, activeDeployCount, runGracefulShutdown, pruneFinishedDeploys, registerDeploy, unregisterDeploy } from "../src/lib/shutdown";
 import { runReconcile, ClerkOrgCheck } from "../src/lib/reconcile";
 import { eventBus } from "../src/lib/eventBus";
@@ -107,11 +107,16 @@ const _flyctlStdinFile = path.join(_fakeFlyctlDir, "flyctl-stdin");
 // Full calls log — APPENDED on every invocation so argv from every call is visible,
 // not just the last one.  One line per invocation (space-joined args).
 const _flyctlArgvLog = path.join(_fakeFlyctlDir, "flyctl-argv-log");
+// Hang mode: fake flyctl writes its PID here then sleeps forever.
+const _flyctlPidFile = path.join(_fakeFlyctlDir, "flyctl-hang-pid");
 
-function writeFlyctlScript(exitCode: number, stdoutCmd?: string): void {
+function writeFlyctlScript(exitCode: number, stdoutCmd?: string, hangMode = false): void {
   // The "secrets" branch always exits 0 — failure modes only apply to other
   // subcommands (e.g. "deploy").  This matches real flyctl behaviour where
   // secrets import is a separate, independent call.
+  const hangSection = hangMode
+    ? `echo $$ > ${_flyctlPidFile}\nsleep 999\nexit 1\n`
+    : "";
   const script = `#!/bin/sh
 echo "$@" > ${_flyctlArgvFile}
 printf '%s\\n' "$*" >> ${_flyctlArgvLog}
@@ -119,7 +124,7 @@ if [ "$1" = "secrets" ]; then
   cat > ${_flyctlStdinFile}
   exit 0
 fi
-${stdoutCmd ? stdoutCmd + "\n" : ""}exit ${exitCode}
+${hangSection}${stdoutCmd ? stdoutCmd + "\n" : ""}exit ${exitCode}
 `;
   fs.writeFileSync(_fakeFlyctlBin, script, { mode: 0o755 });
 }
@@ -584,6 +589,11 @@ app.post("/test/set-flyctl-mode", (req, res) => {
   } else if (mode === "failure-with-token") {
     // flyctlEnv() passes FLY_API_TOKEN; fake flyctl echoes it then fails
     writeFlyctlScript(1, 'echo "unauthorized token=$FLY_API_TOKEN"');
+  } else if (mode === "hang") {
+    // Writes PID to _flyctlPidFile then sleeps indefinitely.
+    // Used by DT tests to verify that the build timeout kills the process.
+    try { fs.unlinkSync(_flyctlPidFile); } catch { /* not present yet */ }
+    writeFlyctlScript(0, undefined, true);
   } else {
     writeFlyctlScript(0);
   }
@@ -602,6 +612,52 @@ app.post("/test/set-flyctl-output", (req, res) => {
   fs.writeFileSync(outputFile, lines.join("\n") + (lines.length ? "\n" : ""), "utf8");
   writeFlyctlScript(code, `cat ${outputFile}`);
   res.json({ ok: true });
+});
+
+// GET /test/flyctl-hang-pid — returns the PID written by the hang-mode fake flyctl, or null.
+app.get("/test/flyctl-hang-pid", (_req, res) => {
+  try {
+    const pid = parseInt(fs.readFileSync(_flyctlPidFile, "utf8").trim(), 10);
+    res.json({ pid: Number.isFinite(pid) ? pid : null });
+  } catch {
+    res.json({ pid: null });
+  }
+});
+
+// GET /test/is-pid-alive/:pid — returns {alive: bool}.
+// Uses signal 0 to check existence without sending a real signal.
+app.get("/test/is-pid-alive/:pid", (req, res) => {
+  const pid = parseInt((req.params as { pid?: string }).pid ?? "", 10);
+  if (!Number.isFinite(pid)) { res.status(400).json({ error: "invalid pid" }); return; }
+  try {
+    process.kill(pid, 0);
+    res.json({ alive: true });
+  } catch {
+    res.json({ alive: false });
+  }
+});
+
+// POST /test/set-deploy-timeouts { buildMs?, hardCapMs?, verifyMs? }
+// Sets deploy timeout env vars at runtime so DT tests can use short values
+// without restarting the server.  Resets are the caller's responsibility.
+app.post("/test/set-deploy-timeouts", (req, res) => {
+  const { buildMs, hardCapMs, verifyMs } = req.body as {
+    buildMs?: number; hardCapMs?: number; verifyMs?: number;
+  };
+  if (typeof buildMs === "number") process.env.DEPLOY_BUILD_TIMEOUT_MS = String(buildMs);
+  if (typeof hardCapMs === "number") process.env.DEPLOY_HARD_CAP_MS = String(hardCapMs);
+  if (typeof verifyMs === "number") process.env.SSC_VERIFY_TIMEOUT_MS = String(verifyMs);
+  res.json({ ok: true });
+});
+
+// POST /test/run-reap-stalled — runs reapStalledDeployments() synchronously.
+app.post("/test/run-reap-stalled", async (_req, res) => {
+  try {
+    const count = await reapStalledDeployments();
+    res.json({ ok: true, count });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // GET /test/fly-call-log — returns all recorded Fly API calls

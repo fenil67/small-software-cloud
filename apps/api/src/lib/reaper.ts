@@ -13,6 +13,7 @@
 import { pool } from "../db";
 import { safeErr } from "./safeErr";
 import { destroyFlyApp } from "../services/flyClient";
+import { killDeployProcess } from "../services/deployRunner";
 import { runProbeRound, runMetricsRound } from "./watchdog";
 import { checkOrgMembership } from "./clerkSync";
 import { runEmailOutboxSender } from "./email/outbox";
@@ -24,16 +25,70 @@ export async function reapStalledDeployments(): Promise<number> {
   // COALESCE(started_at, created_at): deployments inserted before the
   // started_at-on-building fix have started_at = NULL; fall back to created_at
   // so they are still reaped after the timeout window.
-  const { rowCount } = await pool.query(
-    `UPDATE deployments
-     SET status         = 'failed',
-         failure_stage  = 'timeout',
-         failure_message = 'Deployment was interrupted or timed out',
-         finished_at    = now()
-     WHERE status IN ('queued', 'building', 'deploying')
-       AND COALESCE(started_at, created_at) < now() - INTERVAL '${TIMEOUT_MINUTES} minutes'`,
+  const { rows } = await pool.query<{
+    id: string;
+    app_id: string;
+    fly_app_id: string | null;
+    org_id: string;
+  }>(
+    `SELECT d.id, d.app_id, a.fly_app_id, a.org_id
+     FROM deployments d
+     JOIN apps a ON a.id = d.app_id
+     WHERE d.status IN ('queued', 'building', 'deploying')
+       AND COALESCE(d.started_at, d.created_at) < now() - INTERVAL '${TIMEOUT_MINUTES} minutes'`,
   );
-  const count = rowCount ?? 0;
+  if (rows.length === 0) return 0;
+
+  let count = 0;
+  for (const { id, app_id, fly_app_id, org_id } of rows) {
+    // Atomically claim this deployment so concurrent reapers don't double-process.
+    const { rowCount } = await pool.query(
+      `UPDATE deployments
+       SET status          = 'failed',
+           failure_stage   = 'timeout',
+           failure_message = 'Fly did not respond in time. Please deploy again.',
+           finished_at     = now()
+       WHERE id = $1
+         AND status IN ('queued', 'building', 'deploying')`,
+      [id],
+    );
+    if ((rowCount ?? 0) === 0) continue; // already updated by another reaper or the deploy runner
+    count++;
+
+    // Kill any flyctl child process still registered for this deployment.
+    killDeployProcess(id);
+
+    // For first deploys (no prior successful deployment), destroy the Fly app to
+    // avoid leaving a pending app running and potentially billing.
+    // For redeployments, existing machines keep running (previous version stays live).
+    if (fly_app_id) {
+      const { rows: successRows } = await pool.query<{ c: string }>(
+        `SELECT count(*)::text AS c FROM deployments
+         WHERE app_id = $1 AND status = 'success'`,
+        [app_id],
+      );
+      const hadPriorSuccess = parseInt(successRows[0]?.c ?? "0", 10) > 0;
+      if (!hadPriorSuccess) {
+        try {
+          await destroyFlyApp(fly_app_id);
+          console.log(`[reaper] destroyed Fly app for timed-out first deploy: ${fly_app_id}`);
+        } catch (err) {
+          console.error(
+            `[reaper] failed to destroy Fly app ${fly_app_id} for timed-out deploy:`,
+            safeErr(err),
+          );
+          await pool.query(
+            `INSERT INTO orphaned_fly_apps (fly_app_name, org_id, last_error)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (fly_app_name) DO UPDATE
+               SET org_id     = COALESCE(EXCLUDED.org_id, orphaned_fly_apps.org_id),
+                   last_error = EXCLUDED.last_error`,
+            [fly_app_id, org_id, String(safeErr(err))],
+          ).catch(() => {});
+        }
+      }
+    }
+  }
   if (count > 0) {
     console.log(`[reaper] marked ${count} stalled deployment(s) as failed`);
   }
@@ -113,6 +168,9 @@ export async function reapDeploymentsOfDeletedApps(): Promise<number> {
     );
     if ((rowCount ?? 0) === 0) continue; // already updated by concurrent reaper
     count++;
+
+    // Kill any flyctl child process still registered for this deployment.
+    killDeployProcess(id);
 
     // Best-effort: destroy the Fly app if it still exists.
     if (fly_app_id) {
