@@ -333,4 +333,89 @@ export class SscClient {
       response.data.on("error", (err: Error) => reject(err));
     });
   }
+
+  /**
+   * Watch a deployment to completion, with automatic reconnect and polling
+   * fallback if the SSE stream drops before a "done" event arrives.
+   *
+   * On stream drop:
+   *   1. Calls onReconnect() once (default: writes "Connection lost, checking
+   *      status…" to stderr).
+   *   2. Polls GET /v1/deployments/:id every 3 s for up to 10 minutes.
+   *   3. Synthesizes the appropriate events (status, error, done) from the
+   *      terminal poll result so the caller sees a consistent event sequence.
+   */
+  async watchDeployment(
+    deploymentId: string,
+    onEvent: (event: DeployEvent) => void,
+    options?: {
+      onReconnect?: () => void;
+      pollIntervalMs?: number;
+      pollTimeoutMs?: number;
+    },
+  ): Promise<void> {
+    const onReconnect = options?.onReconnect ?? (() => {
+      process.stderr.write("\nConnection lost, checking status…\n");
+    });
+    const pollInterval = options?.pollIntervalMs ?? 3_000;
+    const pollTimeout = options?.pollTimeoutMs ?? 10 * 60 * 1000;
+
+    let gotDone = false;
+
+    try {
+      await this.streamDeployment(deploymentId, (event) => {
+        if (event.type === "done") gotDone = true;
+        onEvent(event);
+      });
+      return; // stream ended cleanly
+    } catch {
+      // stream dropped — fall through to polling
+    }
+
+    if (gotDone) return; // done event arrived before the drop; nothing to do
+
+    onReconnect();
+
+    const deadline = Date.now() + pollTimeout;
+    while (Date.now() < deadline) {
+      await new Promise<void>((r) => setTimeout(r, pollInterval));
+
+      let deployment: Deployment;
+      try {
+        deployment = await this.getDeployment(deploymentId);
+      } catch {
+        // API unreachable — keep retrying until timeout
+        continue;
+      }
+
+      const { status, failure_stage, failure_message, url } = deployment;
+
+      if (status === "success") {
+        if (url) onEvent({ type: "url", url });
+        onEvent({ type: "status", status: "success" });
+        onEvent({ type: "done" });
+        return;
+      }
+
+      if (status === "failed") {
+        if (failure_stage && failure_message) {
+          onEvent({ type: "error", stage: failure_stage, message: failure_message });
+        }
+        onEvent({ type: "status", status: "failed" });
+        onEvent({ type: "done" });
+        return;
+      }
+
+      // still building/deploying/queued — keep polling
+    }
+
+    // Poll timed out — synthesize a failure so the caller doesn't hang
+    onEvent({
+      type: "error",
+      stage: "stream",
+      message: "Lost connection to deploy stream and timed out waiting for a result.",
+    });
+    onEvent({ type: "status", status: "failed" });
+    onEvent({ type: "done" });
+  }
 }

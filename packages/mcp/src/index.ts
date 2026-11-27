@@ -199,35 +199,28 @@ FILES NEVER UPLOADED: .env, .env.*, *.key, *.pem, node_modules/, .git/ — alway
       let failureStage: string | null = null;
       let failureMessage: string | null = null;
 
-      try {
-        await client.streamDeployment(deploymentId, (event: DeployEvent) => {
-          switch (event.type) {
-            case "log":
-              recentLogs.push(event.message);
-              if (recentLogs.length > MAX_LOG_LINES) recentLogs.shift();
-              break;
-            case "status":
-              finalStatus = event.status;
-              if (event.status === "failed") failed = true;
-              break;
-            case "url":
-              appUrl = event.url;
-              break;
-            case "error":
-              failureStage = event.stage;
-              failureMessage = event.message;
-              failed = true;
-              break;
-            case "done":
-              break;
-          }
-        });
-      } catch (err) {
-        failureMessage = `Stream error: ${err instanceof Error ? err.message : String(err)}`;
-        failureStage = failureStage ?? "stream";
-        if (finalStatus === "unknown") finalStatus = "failed";
-        failed = true;
-      }
+      await client.watchDeployment(deploymentId, (event: DeployEvent) => {
+        switch (event.type) {
+          case "log":
+            recentLogs.push(event.message);
+            if (recentLogs.length > MAX_LOG_LINES) recentLogs.shift();
+            break;
+          case "status":
+            finalStatus = event.status;
+            if (event.status === "failed") failed = true;
+            break;
+          case "url":
+            appUrl = event.url;
+            break;
+          case "error":
+            failureStage = event.stage;
+            failureMessage = event.message;
+            failed = true;
+            break;
+          case "done":
+            break;
+        }
+      });
 
       if (failed) {
         // Failure result: always include stage, message, and last log lines
