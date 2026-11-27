@@ -219,20 +219,22 @@ describe("click Accept → finalize fails + NOT member → shows error (M-not-me
   });
 });
 
-// ── 5. Revoked ticket → shows error code ─────────────────────────────────────
+// ── 5. Revoked ticket → shows "cancelled" message ────────────────────────────
+// Tests the real Clerk error code (organization_invitation_revoked_code) that
+// was shown as the generic fallback before this fix.
 
-describe("revoked ticket → shows error with code", () => {
-  it("shows revoked message and error code element", async () => {
+describe("revoked ticket → shows cancelled message (real Clerk error code)", () => {
+  it("shows 'cancelled' message for organization_invitation_revoked_code", async () => {
     mockNotSignedIn();
-    mockTicket.mockResolvedValue({ error: clerkError("invitation_revoked") });
+    mockTicket.mockResolvedValue({ error: clerkError("organization_invitation_revoked_code") });
 
     render(<AcceptInvitePage />);
     const btn = await screen.findByRole("button", { name: /accept invitation/i });
     fireEvent.click(btn);
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
-    expect(screen.getByRole("alert").textContent).toContain("revoked");
-    expect(screen.getByText(/invitation_revoked/)).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("cancelled");
+    expect(screen.getByText(/organization_invitation_revoked_code/)).toBeInTheDocument();
   });
 });
 
@@ -480,5 +482,109 @@ describe("sessionStorage error: reload shows error without calling Clerk", () =>
     expect(mockTicket).not.toHaveBeenCalled();
     expect(mockGetOrganizationInvitations).not.toHaveBeenCalled();
     expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 17. Expired ticket (ticket_expired_code) → shows "expired" message ────────
+
+describe("expired ticket → shows expired message (ticket_expired_code)", () => {
+  it("shows 'expired' message for ticket_expired_code", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("ticket_expired_code") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("expired");
+    expect(screen.getByText(/ticket_expired_code/)).toBeInTheDocument();
+  });
+});
+
+// ── 18. Already-used ticket → shows "already used" with sign-in link ──────────
+
+describe("already-used ticket → shows already-used message", () => {
+  it("shows 'already used' message for invitation_already_accepted", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("invitation_already_accepted") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("already used");
+    // Sign-in link present in error state
+    expect(screen.getByRole("link", { name: /sign-in/i })).toBeInTheDocument();
+  });
+
+  it("shows 'already used' message for already_a_member_in_organization", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("already_a_member_in_organization") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("already used");
+  });
+});
+
+// ── 19. Invalid ticket (ticket_invalid_code) → shows "not valid" message ──────
+
+describe("invalid ticket → shows not-valid message (ticket_invalid_code)", () => {
+  it("shows 'not valid' message for ticket_invalid_code", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("ticket_invalid_code") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("not valid");
+    expect(screen.getByText(/ticket_invalid_code/)).toBeInTheDocument();
+  });
+});
+
+// ── 20. Unknown error code → shows generic message ────────────────────────────
+
+describe("unknown error code → shows generic fallback message", () => {
+  it("shows generic 'Could not accept' message for unknown codes", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("some_unknown_clerk_code_xyz") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("Could not accept the invitation");
+  });
+});
+
+// ── 21. Mutation: map revoked to generic → test 5 fails ───────────────────────
+// .bak mutation proof: if organization_invitation_revoked_code maps to the generic
+// message instead of "cancelled", test 5 would fail (it checks for "cancelled").
+// This test documents the guard by verifying the fix is in place.
+// Run with the .bak method: copy page.tsx → page.tsx.bak, mutate line
+//   "organization_invitation_revoked_code" ... → return generic message,
+//   run suite (test 5 must fail), restore from .bak.
+
+describe("code-mapping guard: organization_invitation_revoked_code maps to 'cancelled', not generic", () => {
+  it("revoked code message contains 'cancelled' (would fail if mapped to generic)", async () => {
+    mockNotSignedIn();
+    mockTicket.mockResolvedValue({ error: clerkError("organization_invitation_revoked_code") });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    // This would fail if the mapping returned the generic message
+    expect(screen.getByRole("alert").textContent).not.toContain("Could not accept");
+    expect(screen.getByRole("alert").textContent).toContain("cancelled");
   });
 });

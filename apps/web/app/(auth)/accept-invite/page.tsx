@@ -11,9 +11,17 @@ type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "er
 const SS_PREFIX = "accept-invite-v1:";
 
 function ticketErrorMsg(code: string): string {
-  if (code === "invitation_expired") return "This invitation has expired. Ask a workspace admin to resend it.";
-  if (code === "invitation_revoked") return "This invitation was revoked. Contact your workspace admin.";
-  if (code === "invitation_already_accepted") return "This invitation was already accepted.";
+  // Codes verified in @clerk/shared localization types and user bug report.
+  if (code === "organization_invitation_revoked_code" || code === "invitation_revoked")
+    return "This invitation was cancelled. Ask the workspace admin to send a new one.";
+  if (code === "ticket_expired_code" || code === "invitation_expired")
+    return "This invitation has expired. Ask the workspace admin to send a new one.";
+  if (
+    code === "invitation_already_accepted" ||
+    code === "already_a_member_in_organization" ||
+    code === "already_a_member"
+  ) return "This invitation was already used. Sign in to continue.";
+  if (code === "ticket_invalid_code") return "This invitation link is not valid.";
   if (code === "not_allowed_access") return "This invitation is not valid for your account.";
   if (code === "missing_requirements") return "Additional information is required to complete sign-up.";
   if (code === "timeout") return "The request timed out. Please try again or contact your workspace admin.";
@@ -150,7 +158,7 @@ export default function AcceptInvitePage() {
           await matching.accept();
         } catch (err) {
           const code = extractCode(err);
-          if (code !== "invitation_already_accepted" && code !== "already_a_member") {
+          if (code !== "invitation_already_accepted" && code !== "already_a_member" && code !== "already_a_member_in_organization") {
             console.error("[accept-invite]", code);
             showError(ticketErrorMsg(code), code);
             return;
