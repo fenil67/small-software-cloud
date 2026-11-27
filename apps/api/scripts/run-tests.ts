@@ -15525,14 +15525,17 @@ async function main(): Promise<void> {
   // ENV: Per-app environment variables
   //
   // Mutation guards:
-  //   ENV-M1: proxy container gets app secrets → ENV-7 fails (proxy call log check)
+  //   ENV-M1: proxy container gets app secrets → ENV-7 (flyToml machine_config check)
   //   ENV-M2: GET returns value → ENV-5 (sentinel value in response body)
-  //   ENV-M3: member can PUT → ENV-16 fails (member 403 check)
-  //   ENV-M4: drop reserved-name check → ENV-9 fails (PORT rejected)
-  //   ENV-M5: log request body in PUT → ENV-23 fails (captured-logs check)
-  //   ENV-26: value in 400 response body → ENV-26 fails (validation error leak)
-  //   ENV-27: value in activity_events metadata → ENV-27 fails (activity log leak)
-  //   ENV-28: value in Fly failure response → ENV-28 fails (Fly error body leak)
+  //   ENV-M3: member can PUT → ENV-16 (member 403 check)
+  //   ENV-M4: drop reserved-name check → ENV-9 (PORT rejected)
+  //   ENV-M5: log request body in PUT → ENV-23 (captured-logs check)
+  //   ENV-M6: PUT raw machine instead of { config } → ENV-24 ('state' key present)
+  //   ENV-M7: apply secrets to proxy container → ENV-24 (proxy secrets mutated)
+  //   ENV-M8: append-only secrets (skip remove) → ENV-30 (STALE_SECRET still present)
+  //   ENV-26: value in 400 response body → ENV-26
+  //   ENV-27: value in activity_events metadata → ENV-27
+  //   ENV-28: value in Fly secret-set failure response → ENV-28
   // ════════════════════════════════════════════════════════════════════════════
   {
     section("ENV: Per-app environment variables");
@@ -15985,14 +15988,23 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM app_env_vars WHERE app_id = $1 AND name = 'LOG_TEST_VAR'", [envAppId]);
     }
 
-    // ── ENV-24: POST /apply issues machine UPDATE (not just restart) ─────────
-    // Fly POST .../restart only restarts the process inside the existing container
-    // and does NOT inject secrets staged after container creation.  apply must call
-    // updateFlyMachine (PUT /v1/apps/{app}/machines/{id}) which recreates the
-    // container so the new secrets are injected at startup.
+    // ── ENV-24: POST /apply — PUT body is { config }, not raw machine; app
+    //            container secrets = current DB names; proxy container unchanged ─
+    // Mutation guards:
+    //   ENV-M6: pass raw detail instead of { config } → body has 'state' key → killed here
+    //   ENV-M7: apply secrets to proxy container → proxy secrets mutated → killed here
     {
-      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-123" }] } });
+      // Set clean, known DB state for envAppId
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+      await pool.query(
+        "INSERT INTO app_env_vars (app_id, name, updated_at, updated_by) VALUES ($1, 'APPLY_VAR_A', now(), null), ($1, 'APPLY_VAR_B', now(), null)",
+        [envAppId],
+      );
+      // Reset app container secrets to empty (machine was deployed before vars were added)
+      await request("POST", "/test/set-app-container-secrets", { body: { secrets: [] } });
+      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-apply-1" }] } });
       await request("POST", "/test/reset-fly-call-log", {});
+
       const r = await request("POST", `/v1/apps/${envAppId}/env/apply`, {
         headers: envManageHeaders,
       });
@@ -16002,13 +16014,43 @@ async function main(): Promise<void> {
       (r.body as { updated?: number }).updated === 1
         ? ok("ENV-24: updated count = 1")
         : fail("ENV-24: wrong updated count", JSON.stringify(r.body));
-      const calls = ((await request("GET", "/test/fly-call-log", {})).body as { calls?: { fn: string }[] }).calls ?? [];
-      calls.some((c) => c.fn === "updateFlyMachine")
-        ? ok("ENV-24: updateFlyMachine called (machine UPDATE, not just restart)")
-        : fail("ENV-24: updateFlyMachine not called", JSON.stringify(calls.map((c) => c.fn)));
-      calls.some((c) => c.fn === "getMachine")
-        ? ok("ENV-24: getMachine called before updateFlyMachine")
-        : fail("ENV-24: getMachine not called", JSON.stringify(calls.map((c) => c.fn)));
+
+      // Verify PUT body shape and container mapping
+      const calls24 = ((await request("GET", "/test/fly-call-log", {})).body as {
+        calls?: Array<{ fn: string; body?: Record<string, unknown> }>;
+      }).calls ?? [];
+      const updateCall24 = calls24.find((c) => c.fn === "updateFlyMachine");
+      if (!updateCall24) {
+        fail("ENV-24: updateFlyMachine not called", JSON.stringify(calls24.map((c) => c.fn)));
+      } else {
+        ok("ENV-24: updateFlyMachine called");
+        const payload24 = updateCall24.body?.payload as Record<string, unknown> | undefined;
+
+        // Body must be { config }, not raw machine (no "id", "state", "events" etc.)
+        ("config" in (payload24 ?? {}))
+          ? ok("ENV-24: PUT body has 'config' key (M6 killer)")
+          : fail("ENV-24: PUT body missing 'config' key", JSON.stringify(Object.keys(payload24 ?? {})));
+        !("state" in (payload24 ?? {}))
+          ? ok("ENV-24: PUT body has no 'state' key — not raw machine (M6 killer)")
+          : fail("ENV-24: PUT body has 'state' — raw machine was sent instead of { config }", JSON.stringify(Object.keys(payload24 ?? {})));
+
+        const config24 = payload24?.config as { containers?: Array<{ name: string; secrets?: Array<{ env_var: string }> }> } | undefined;
+        const proxyContainer24 = config24?.containers?.find((c) => c.name === "proxy");
+        const appContainer24   = config24?.containers?.find((c) => c.name === "app");
+
+        // Proxy container secrets must be untouched (SSC_PROXY_TOKEN only)
+        const proxySec24 = proxyContainer24?.secrets ?? [];
+        (proxySec24.length === 1 && proxySec24[0].env_var === "SSC_PROXY_TOKEN")
+          ? ok("ENV-24: proxy container secrets unchanged — SSC_PROXY_TOKEN only (M7 killer)")
+          : fail("ENV-24: proxy container secrets mutated", JSON.stringify(proxySec24));
+
+        // App container secrets must equal the current DB names (APPLY_VAR_A, APPLY_VAR_B)
+        const appSec24 = (appContainer24?.secrets ?? []).map((s) => s.env_var).sort();
+        (appSec24.join(",") === "APPLY_VAR_A,APPLY_VAR_B")
+          ? ok("ENV-24: app container secrets = current DB names (APPLY_VAR_A, APPLY_VAR_B)")
+          : fail("ENV-24: app container secrets mismatch", JSON.stringify(appSec24));
+      }
+
       await request("POST", "/test/set-machines", { body: { machines: [] } });
     }
 
@@ -16023,7 +16065,6 @@ async function main(): Promise<void> {
     }
 
     // ── ENV-26: value not in validation error response body ───────────────────
-    // Proves the error handler never echoes the value back in any 400 response.
     {
       const sentinelVal = "SENTINEL_ERR_VALUE_" + Date.now();
       const r = await request("PUT", `/v1/apps/${envAppId}/env`, {
@@ -16040,7 +16081,6 @@ async function main(): Promise<void> {
     }
 
     // ── ENV-27: value not in activity log metadata ────────────────────────────
-    // After a successful PUT the activity_events row stores only {name}, never {value}.
     {
       const sentinelActVal = "SENTINEL_ACT_VALUE_" + Date.now();
       await request("PUT", `/v1/apps/${envAppId}/env`, {
@@ -16060,8 +16100,7 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM app_env_vars WHERE app_id = $1 AND name = 'ACTIVITY_CHECK_VAR'", [envAppId]);
     }
 
-    // ── ENV-28: value not in Fly failure response ─────────────────────────────
-    // When setFlySecret throws, the error response must not echo the value.
+    // ── ENV-28: value not in Fly secret-set failure response ─────────────────
     {
       const sentinelFlyVal = "SENTINEL_FLY_VALUE_" + Date.now();
       await request("POST", "/test/set-fly-secret-fail", { body: { fail: true } });
@@ -16071,12 +16110,108 @@ async function main(): Promise<void> {
       });
       await request("POST", "/test/set-fly-secret-fail", { body: { fail: false } });
       (r.status === 500 || r.status === 502)
-        ? ok("ENV-28: Fly failure → 5xx (precondition)")
+        ? ok("ENV-28: Fly secret-set failure → 5xx (precondition)")
         : fail("ENV-28: expected 5xx for Fly failure", String(r.status));
       const body28 = JSON.stringify(r.body);
       !body28.includes(sentinelFlyVal)
         ? ok("ENV-28: sentinel value not in Fly failure response body")
         : fail("ENV-28: sentinel value leaked in Fly failure response body", body28.slice(0, 200));
+    }
+
+    // ── ENV-29: var added after last deploy appears in apply payload ──────────
+    // The machine mock starts with an empty app container secrets list (simulating
+    // a machine deployed before env vars existed).  After adding a var and calling
+    // apply, that var must appear in the PUT body's app container secrets.
+    {
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+      await pool.query(
+        "INSERT INTO app_env_vars (app_id, name, updated_at, updated_by) VALUES ($1, 'NEW_AFTER_DEPLOY', now(), null)",
+        [envAppId],
+      );
+      await request("POST", "/test/set-app-container-secrets", { body: { secrets: [] } });
+      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-29" }] } });
+      await request("POST", "/test/reset-fly-call-log", {});
+
+      await request("POST", `/v1/apps/${envAppId}/env/apply`, { headers: envManageHeaders });
+
+      const calls29 = ((await request("GET", "/test/fly-call-log", {})).body as {
+        calls?: Array<{ fn: string; body?: Record<string, unknown> }>;
+      }).calls ?? [];
+      const payload29 = (calls29.find((c) => c.fn === "updateFlyMachine")?.body?.payload as {
+        config?: { containers?: Array<{ name: string; secrets?: Array<{ env_var: string }> }> };
+      } | undefined);
+      const appSec29 = (payload29?.config?.containers?.find((c) => c.name === "app")?.secrets ?? []).map((s) => s.env_var);
+      appSec29.includes("NEW_AFTER_DEPLOY")
+        ? ok("ENV-29: var added after deploy appears in apply payload")
+        : fail("ENV-29: var added after deploy missing from apply payload", JSON.stringify(appSec29));
+
+      await request("POST", "/test/set-machines", { body: { machines: [] } });
+    }
+
+    // ── ENV-30: var deleted after last deploy is REMOVED from apply payload ───
+    // Machine mock has app container secrets = [STALE_SECRET, KEEP_VAR].
+    // DB has only KEEP_VAR (STALE_SECRET was deleted after the last deploy).
+    // apply must set secrets to exactly [KEEP_VAR] — STALE_SECRET removed.
+    // Mutation guard: ENV-M8 — append-only logic → STALE_SECRET still present → killed here.
+    {
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+      await pool.query(
+        "INSERT INTO app_env_vars (app_id, name, updated_at, updated_by) VALUES ($1, 'KEEP_VAR', now(), null)",
+        [envAppId],
+      );
+      // Simulate machine that was deployed with both STALE_SECRET and KEEP_VAR
+      await request("POST", "/test/set-app-container-secrets", {
+        body: { secrets: [{ env_var: "STALE_SECRET", name: "STALE_SECRET" }, { env_var: "KEEP_VAR", name: "KEEP_VAR" }] },
+      });
+      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-30" }] } });
+      await request("POST", "/test/reset-fly-call-log", {});
+
+      await request("POST", `/v1/apps/${envAppId}/env/apply`, { headers: envManageHeaders });
+
+      const calls30 = ((await request("GET", "/test/fly-call-log", {})).body as {
+        calls?: Array<{ fn: string; body?: Record<string, unknown> }>;
+      }).calls ?? [];
+      const payload30 = (calls30.find((c) => c.fn === "updateFlyMachine")?.body?.payload as {
+        config?: { containers?: Array<{ name: string; secrets?: Array<{ env_var: string }> }> };
+      } | undefined);
+      const appSec30 = (payload30?.config?.containers?.find((c) => c.name === "app")?.secrets ?? []).map((s) => s.env_var);
+      !appSec30.includes("STALE_SECRET")
+        ? ok("ENV-30: stale secret removed from apply payload (M8 killer)")
+        : fail("ENV-30: stale secret still present in apply payload", JSON.stringify(appSec30));
+      appSec30.includes("KEEP_VAR")
+        ? ok("ENV-30: retained secret present in apply payload")
+        : fail("ENV-30: retained secret missing from apply payload", JSON.stringify(appSec30));
+
+      // Restore clean state
+      await request("POST", "/test/set-app-container-secrets", { body: { secrets: [] } });
+      await request("POST", "/test/set-machines", { body: { machines: [] } });
+    }
+
+    // ── ENV-31: Fly machine-update error → 502 fly_error, no value leak ───────
+    {
+      await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
+      await pool.query(
+        "INSERT INTO app_env_vars (app_id, name, updated_at, updated_by) VALUES ($1, 'FLY_ERR_VAR', now(), null)",
+        [envAppId],
+      );
+      await request("POST", "/test/set-machines", { body: { machines: [{ id: "machine-31" }] } });
+      await request("POST", "/test/set-update-fly-machine-fail", { body: { fail: true } });
+
+      const r31 = await request("POST", `/v1/apps/${envAppId}/env/apply`, { headers: envManageHeaders });
+
+      await request("POST", "/test/set-update-fly-machine-fail", { body: { fail: false } });
+      await request("POST", "/test/set-machines", { body: { machines: [] } });
+
+      r31.status === 502
+        ? ok("ENV-31: Fly machine-update error → 502")
+        : fail("ENV-31: expected 502 for Fly machine error", String(r31.status));
+      (r31.body as { error?: string }).error === "fly_error"
+        ? ok("ENV-31: response body is { error: 'fly_error' }")
+        : fail("ENV-31: wrong error code in response", JSON.stringify(r31.body));
+      const body31 = JSON.stringify(r31.body);
+      !body31.includes("FLY_ERR_VAR")
+        ? ok("ENV-31: var name not leaked in Fly error response")
+        : fail("ENV-31: var name leaked in Fly error response", body31.slice(0, 200));
     }
 
     // ── ENV-M1 mutation: proxy gets app secrets → ENV-7 kills it ─────────────
@@ -16093,6 +16228,15 @@ async function main(): Promise<void> {
 
     // ── ENV-M5 mutation: log request body → ENV-23 kills it ──────────────────
     ok("ENV-M5: no-log verified in ENV-23 (sentinel not in captured logs)");
+
+    // ── ENV-M6 mutation: PUT raw machine instead of { config } → ENV-24 kills it
+    ok("ENV-M6: { config } PUT body verified in ENV-24 (no 'state' key in payload)");
+
+    // ── ENV-M7 mutation: apply secrets to proxy container → ENV-24 kills it ──
+    ok("ENV-M7: proxy secrets isolation verified in ENV-24 (SSC_PROXY_TOKEN only)");
+
+    // ── ENV-M8 mutation: append-only secrets (don't remove deleted) → ENV-30 kills it
+    ok("ENV-M8: stale-secret removal verified in ENV-30 (STALE_SECRET absent after apply)");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     await pool.query("DELETE FROM app_env_vars WHERE app_id IN ($1,$2,$3)", [envAppId, envAppNoFlyId, envAppSuspendedId]);

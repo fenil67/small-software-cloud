@@ -22,6 +22,7 @@ import {
   setFlySecret,
   unsetFlySecret,
   updateFlyMachines,
+  FlyApiError,
 } from "../services/flyClient";
 
 export const appEnvRouter = Router({ mergeParams: true });
@@ -319,7 +320,23 @@ appEnvRouter.post(
       return;
     }
 
-    const result = await updateFlyMachines(ctx.flyAppId);
-    res.json({ updated: result.updated });
+    // Pass the current env var names so updateFlyMachines can sync the app
+    // container's secret mapping (add new, remove deleted).
+    const { rows: envRows } = await pool.query<{ name: string }>(
+      "SELECT name FROM app_env_vars WHERE app_id = $1 ORDER BY name",
+      [ctx.appId],
+    );
+    const envVarNames = envRows.map((r) => r.name);
+
+    try {
+      const result = await updateFlyMachines(ctx.flyAppId, envVarNames);
+      res.json({ updated: result.updated });
+    } catch (err) {
+      // Log only status + safe message — never values or config (config can
+      // contain secret names; names are acceptable, values are never logged).
+      const flyErr = err instanceof FlyApiError ? err : null;
+      console.error(`[env:apply] Fly ${flyErr?.status ?? 0}: ${flyErr?.message ?? "unexpected error"}`);
+      res.status(502).json({ error: "fly_error" });
+    }
   }),
 );

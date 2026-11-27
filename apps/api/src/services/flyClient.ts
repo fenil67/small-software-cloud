@@ -193,45 +193,109 @@ export async function unsetFlySecret(appName: string, name: string): Promise<voi
   }
 }
 
+// ── Multi-container machine types ─────────────────────────────────────────────
+
+export interface FlyContainerSecret {
+  env_var: string;
+  name: string;
+}
+
+export interface FlyContainer {
+  name: string;
+  image?: string;
+  env?: Record<string, string>;
+  secrets?: FlyContainerSecret[];
+  [key: string]: unknown;
+}
+
+export interface FlyMachineConfig {
+  containers?: FlyContainer[];
+  [key: string]: unknown;
+}
+
+export interface FlyMachineDetail {
+  id: string;
+  config: FlyMachineConfig;
+  [key: string]: unknown;
+}
+
 /**
- * Fetches the full config for a single Fly machine.
+ * Returns a copy of machineConfig with the "app" container's secrets set to
+ * exactly envVarNames (adds new, removes deleted).  Every other container
+ * (including "proxy") is returned byte-for-byte unchanged.
+ *
+ * When no "app" container is present the config is returned unchanged —
+ * the app was deployed before multi-container support was added.
+ */
+export function buildUpdatedConfig(
+  machineConfig: FlyMachineConfig,
+  envVarNames: string[],
+): FlyMachineConfig {
+  if (!machineConfig.containers || machineConfig.containers.length === 0) {
+    return machineConfig;
+  }
+  const updatedContainers = machineConfig.containers.map((c): FlyContainer => {
+    if (c.name !== "app") return c; // proxy and anything else: untouched
+    return {
+      ...c,
+      secrets: envVarNames.map((n): FlyContainerSecret => ({ env_var: n, name: n })),
+    };
+  });
+  return { ...machineConfig, containers: updatedContainers };
+}
+
+/**
+ * Fetches the full detail for a single Fly machine.
  * GET /v1/apps/{app}/machines/{id}
  */
-export async function getMachine(appName: string, machineId: string): Promise<unknown> {
+export async function getMachine(appName: string, machineId: string): Promise<FlyMachineDetail> {
   const client = makeClient();
-  const { data } = await client.get(`/apps/${appName}/machines/${machineId}`);
+  const { data } = await client.get<FlyMachineDetail>(`/apps/${appName}/machines/${machineId}`);
   return data;
 }
 
 /**
- * Updates a Fly machine with its existing config, triggering a container
- * recreation so staged secrets (set via POST /apps/{app}/secrets) are injected.
- * PUT /v1/apps/{app}/machines/{id}
+ * Issues a machine UPDATE (PUT /v1/apps/{app}/machines/{id}) with body
+ * { config }.  Container recreation injects the latest staged secrets at
+ * startup.  POST .../restart only restarts the process inside the existing
+ * container and does NOT pick up secrets staged after container creation.
  *
- * POST .../restart only restarts the process inside the existing container and
- * does NOT pick up secrets staged after the container was created.  A machine
- * UPDATE causes Fly to create a new container from the latest config, which
- * reads the current secret values at startup.  This is what `flyctl secrets
- * deploy` does internally (lm.Update → PUT with MinSecretsVersion).
+ * body must be { config: FlyMachineConfig } — never the full machine response.
  */
-export async function updateFlyMachine(appName: string, machineId: string, config: unknown): Promise<void> {
+export async function updateFlyMachine(
+  appName: string,
+  machineId: string,
+  body: { config: FlyMachineConfig },
+): Promise<void> {
   const client = makeClient();
-  await client.put(`/apps/${appName}/machines/${machineId}`, config);
+  await client.put(`/apps/${appName}/machines/${machineId}`, body);
 }
 
 /**
- * Applies staged secrets to all running machines by fetching each machine's
- * current config and issuing a PUT (machine UPDATE), which recreates the
- * container so the new secrets are injected at startup.
- * Returns the number of machines updated.
+ * Applies env-var secret mapping to every running machine:
+ * 1. GET each machine to obtain its current config.
+ * 2. Rebuild the "app" container's secrets to exactly envVarNames
+ *    (add new, remove deleted).  Proxy container is left untouched.
+ * 3. PUT { config } — only the config sub-object, never the full machine
+ *    response (which contains id, state, events, … that the update API
+ *    does not accept and would cause a 422).
+ *
+ * Uses require() to call getMachine / updateFlyMachine through the exports
+ * object so test stubs can intercept the calls.
  */
-export async function updateFlyMachines(appName: string): Promise<{ updated: number }> {
-  const machines = await listMachines(appName);
+export async function updateFlyMachines(
+  appName: string,
+  envVarNames: string[],
+): Promise<{ updated: number }> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const self = require("./flyClient") as typeof import("./flyClient");
+  const machines = await self.listMachines(appName);
   if (machines.length === 0) return { updated: 0 };
   await Promise.all(
     machines.map(async (m) => {
-      const config = await getMachine(appName, m.id);
-      await updateFlyMachine(appName, m.id, config);
+      const detail = await self.getMachine(appName, m.id);
+      const config = buildUpdatedConfig(detail.config, envVarNames);
+      await self.updateFlyMachine(appName, m.id, { config });
     }),
   );
   return { updated: machines.length };
