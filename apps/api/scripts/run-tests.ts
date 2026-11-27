@@ -15533,6 +15533,7 @@ async function main(): Promise<void> {
   //   ENV-M6: PUT raw machine instead of { config } → ENV-24 ('state' key present)
   //   ENV-M7: apply secrets to proxy container → ENV-24 (proxy secrets mutated)
   //   ENV-M8: append-only secrets (skip remove) → ENV-30 (STALE_SECRET still present)
+  //   ENV-M9: use PUT instead of POST for machine update → ENV-24 (stub returns 404 → 502)
   //   ENV-26: value in 400 response body → ENV-26
   //   ENV-27: value in activity_events metadata → ENV-27
   //   ENV-28: value in Fly secret-set failure response → ENV-28
@@ -15988,11 +15989,12 @@ async function main(): Promise<void> {
       await pool.query("DELETE FROM app_env_vars WHERE app_id = $1 AND name = 'LOG_TEST_VAR'", [envAppId]);
     }
 
-    // ── ENV-24: POST /apply — PUT body is { config }, not raw machine; app
-    //            container secrets = current DB names; proxy container unchanged ─
+    // ── ENV-24: POST /apply — POST to Fly machine update; body is { config }, not
+    //            raw machine; app container secrets = current DB names; proxy unchanged ─
     // Mutation guards:
     //   ENV-M6: pass raw detail instead of { config } → body has 'state' key → killed here
     //   ENV-M7: apply secrets to proxy container → proxy secrets mutated → killed here
+    //   ENV-M9: use PUT instead of POST → stub returns 404 → apply returns 502 → killed here
     {
       // Set clean, known DB state for envAppId
       await pool.query("DELETE FROM app_env_vars WHERE app_id = $1", [envAppId]);
@@ -16015,9 +16017,9 @@ async function main(): Promise<void> {
         ? ok("ENV-24: updated count = 1")
         : fail("ENV-24: wrong updated count", JSON.stringify(r.body));
 
-      // Verify PUT body shape and container mapping
+      // Verify POST method, path, body shape and container mapping
       const calls24 = ((await request("GET", "/test/fly-call-log", {})).body as {
-        calls?: Array<{ fn: string; body?: Record<string, unknown> }>;
+        calls?: Array<{ fn: string; body?: Record<string, unknown>; method?: string; path?: string }>;
       }).calls ?? [];
       const updateCall24 = calls24.find((c) => c.fn === "updateFlyMachine");
       if (!updateCall24) {
@@ -16049,6 +16051,16 @@ async function main(): Promise<void> {
         (appSec24.join(",") === "APPLY_VAR_A,APPLY_VAR_B")
           ? ok("ENV-24: app container secrets = current DB names (APPLY_VAR_A, APPLY_VAR_B)")
           : fail("ENV-24: app container secrets mismatch", JSON.stringify(appSec24));
+
+        // HTTP method must be POST (not PUT) — Fly's Update Machine API (M9 killer)
+        updateCall24.method === "POST"
+          ? ok("ENV-24: Fly machine update uses POST not PUT (M9 killer)")
+          : fail("ENV-24: expected POST, got " + String(updateCall24.method));
+        // Path must match Fly's Update Machine contract exactly (M9 killer)
+        const expectedMachinePath24 = "/apps/ssc-env-test-app/machines/machine-apply-1";
+        updateCall24.path === expectedMachinePath24
+          ? ok("ENV-24: Fly machine update path = " + expectedMachinePath24 + " (M9 killer)")
+          : fail("ENV-24: wrong machine update path", String(updateCall24.path));
       }
 
       await request("POST", "/test/set-machines", { body: { machines: [] } });
@@ -16237,6 +16249,9 @@ async function main(): Promise<void> {
 
     // ── ENV-M8 mutation: append-only secrets (don't remove deleted) → ENV-30 kills it
     ok("ENV-M8: stale-secret removal verified in ENV-30 (STALE_SECRET absent after apply)");
+
+    // ── ENV-M9 mutation: use PUT instead of POST for machine update → ENV-24 kills it
+    ok("ENV-M9: POST method verified in ENV-24 (PUT → stub returns 404 → apply returns 502)");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     await pool.query("DELETE FROM app_env_vars WHERE app_id IN ($1,$2,$3)", [envAppId, envAppNoFlyId, envAppSuspendedId]);

@@ -255,10 +255,13 @@ export async function getMachine(appName: string, machineId: string): Promise<Fl
 }
 
 /**
- * Issues a machine UPDATE (PUT /v1/apps/{app}/machines/{id}) with body
+ * Issues a machine UPDATE (POST /v1/apps/{app}/machines/{id}) with body
  * { config }.  Container recreation injects the latest staged secrets at
  * startup.  POST .../restart only restarts the process inside the existing
  * container and does NOT pick up secrets staged after container creation.
+ *
+ * Fly's Update Machine API is POST, not PUT — PUT returns 404.
+ * Docs: https://docs.machines.dev/machines/Machines_update.md
  *
  * body must be { config: FlyMachineConfig } — never the full machine response.
  */
@@ -268,7 +271,7 @@ export async function updateFlyMachine(
   body: { config: FlyMachineConfig },
 ): Promise<void> {
   const client = makeClient();
-  await client.put(`/apps/${appName}/machines/${machineId}`, body);
+  await client.post(`/apps/${appName}/machines/${machineId}`, body);
 }
 
 /**
@@ -276,7 +279,7 @@ export async function updateFlyMachine(
  * 1. GET each machine to obtain its current config.
  * 2. Rebuild the "app" container's secrets to exactly envVarNames
  *    (add new, remove deleted).  Proxy container is left untouched.
- * 3. PUT { config } — only the config sub-object, never the full machine
+ * 3. POST { config } — only the config sub-object, never the full machine
  *    response (which contains id, state, events, … that the update API
  *    does not accept and would cause a 422).
  *
