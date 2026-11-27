@@ -35,6 +35,9 @@ if (!process.env.PLATFORM_ADMIN_CLERK_IDS) {
 // the startup validation in index.ts (not used here, but deployRunner reads them).
 process.env.PROXY_IMAGE = `registry.fly.io/ssc-proxy@sha256:${"a".repeat(64)}`;
 const _testPort = process.env.TEST_PORT ?? "4099";
+// Route Fly API calls to this test server so HTTP method/path are enforced.
+// resolveBaseUrl() accepts localhost/127.0.0.1/::1 overrides in every env.
+process.env.FLY_API_BASE = `http://localhost:${_testPort}`;
 process.env.API_PUBLIC_URL = `http://localhost:${_testPort}`;
 process.env.WEB_URL = `http://localhost:${_testPort}`;
 process.env.SSC_VERIFY_BASE_URL = `http://localhost:${_testPort}`;
@@ -264,7 +267,7 @@ deployRunnerModule.runDeploy = async function (args: DeployArgs): Promise<void> 
 const flyModule = require("../src/services/flyClient");
 const flyAuthHeader = (flyModule as typeof import("../src/services/flyClient")).flyAuthHeader;
 
-interface FlyCall { fn: string; arg: string; body?: Record<string, unknown> }
+interface FlyCall { fn: string; arg: string; body?: Record<string, unknown>; method?: string; path?: string }
 const _flyCallLog: FlyCall[] = [];
 
 let _checkExistsResult = true;
@@ -342,17 +345,13 @@ flyModule.getMachine = async (appName: string, machineId: string) => {
     },
   };
 };
-flyModule.updateFlyMachine = async (appName: string, machineId: string, body: unknown) => {
-  // Record the full payload so tests can inspect the config structure and verify:
-  // - body is { config } not the raw machine response (no "id", "state", etc.)
-  // - app container secrets match current app_env_vars
-  // - proxy container secrets are unchanged
-  _flyCallLog.push({ fn: "updateFlyMachine", arg: appName, body: { machineId, payload: body } });
-  if (_updateFlyMachineFailMode) throw new Error("updateFlyMachine failed (test mode)");
-};
-// NOTE: updateFlyMachines is NOT stubbed here — the real function runs via
-// self-require in flyClient.ts, which calls the stubbed getMachine /
-// updateFlyMachine above.  This exercises buildUpdatedConfig in production code.
+// NOTE: updateFlyMachine is NOT stubbed at the function level — the real
+// function runs and makes an HTTP call to this server (FLY_API_BASE=localhost).
+// PUT /apps/{app}/machines/{id} → 404 (mirrors Fly: only POST is valid).
+// POST /apps/{app}/machines/{id} → records to call log, respects fail mode.
+// This enforces Fly's documented method contract in tests.
+// updateFlyMachines is also NOT stubbed — the real function runs via self-require
+// in flyClient.ts, which calls the stubbed getMachine + real updateFlyMachine above.
 
 flyModule.destroyFlyApp = async (appName: string) => {
   _flyCallLog.push({ fn: "destroyFlyApp", arg: appName });
@@ -851,6 +850,31 @@ app.post("/test/set-unset-fly-secret-fail", (req, res) => {
 app.post("/test/set-update-fly-machine-fail", (req, res) => {
   _updateFlyMachineFailMode = !!(req.body as { fail?: boolean }).fail;
   res.json({ ok: true });
+});
+
+// ── Fly Machine Update HTTP stub ───────────────────────────────────────────────
+// Fly's Update Machine API is POST /v1/apps/{app}/machines/{id}.
+// PUT on the same path is not a valid Fly API method — Fly returns 404.
+// The stub enforces this contract so tests fail if production code uses PUT.
+// Routes are under /apps/... (without /v1 prefix) because makeClient() uses
+// resolveBaseUrl() as the full baseURL and paths are appended to its origin.
+app.put("/apps/:appName/machines/:machineId", (_req, res) => {
+  res.status(404).json({ error: "not found" });
+});
+app.post("/apps/:appName/machines/:machineId", (req, res) => {
+  const { appName, machineId } = req.params as { appName: string; machineId: string };
+  _flyCallLog.push({
+    fn: "updateFlyMachine",
+    arg: appName,
+    body: { machineId, payload: req.body as Record<string, unknown> },
+    method: req.method,
+    path: req.path,
+  });
+  if (_updateFlyMachineFailMode) {
+    res.status(500).json({ error: "updateFlyMachine failed (test mode)" });
+    return;
+  }
+  res.json({ id: machineId, state: "started" });
 });
 
 // POST /test/set-app-container-secrets { secrets: [{env_var, name}] }
