@@ -189,7 +189,8 @@ describe("click Accept → success → setActive with session + org (ROOT CAUSE 
         organization: "org_xyz",
       }),
     );
-    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+    // Fix 2: navigates to /apps?org=org_xyz so DashboardShell can verify org is active.
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz");
   });
 });
 
@@ -468,7 +469,8 @@ describe("sessionStorage done: reload navigates without calling Clerk", () => {
 
     render(<AcceptInvitePage />);
 
-    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    // Fix 2: stored-done path navigates to appsDestination() = /apps?org=org_xyz
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz"));
 
     // No Clerk ticket or invitation calls should be made
     expect(mockTicket).not.toHaveBeenCalled();
@@ -680,6 +682,85 @@ describe("missing ticket → shows friendly open-link message", () => {
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert").textContent).toContain("Open the link from your invitation email");
+  });
+});
+
+// ── Fix 1 tests: __clerk_status present, no ticket ───────────────────────────
+// These cover the used-invitation link path: FAPI processes the ticket and
+// redirects to /accept-invite?__clerk_status=sign_in&org=org_xyz (no __clerk_ticket).
+
+// F1a: signed in + member of org → setActive + navigate to /apps
+describe("Fix1-a: used-link, signed in and member → switches org and navigates", () => {
+  it("calls setActive({ organization }) and navigates to /apps when user is a member", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockSignedIn();
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" }),
+    );
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+  });
+});
+
+// F1b: signed in + NOT member → shows "Invitation already used" card
+// Mutation (b): if the __clerk_status branch is removed and falls through to
+// showError("Open the link..."), this test fails because "Invitation already
+// used" would not appear.
+describe("Fix1-b: used-link, signed in but not member → Invitation already used (mutation-b guard)", () => {
+  it("shows 'Invitation already used' card when user is not a member", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockSignedIn();
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [], total_count: 0 });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/invitation has already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // "Go to my apps" link shown for a signed-in user
+    expect(screen.getByRole("link", { name: /go to my apps/i })).toBeInTheDocument();
+  });
+});
+
+// F1c: not signed in → shows "Invitation already used" with Sign in link
+describe("Fix1-c: used-link, not signed in → Invitation already used with Sign in link", () => {
+  it("shows 'Invitation already used' with Sign in link for a signed-out visitor", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/invitation has already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // "Sign in" link shown for a signed-out visitor
+    expect(screen.getByRole("link", { name: /sign in/i })).toBeInTheDocument();
   });
 });
 
