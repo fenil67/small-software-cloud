@@ -7476,7 +7476,11 @@ async function main(): Promise<void> {
       });
 
     // Helper: call MCP tool over stdio JSON-RPC
-    type McpResult = { text: string; isError: boolean };
+    // crashed: true means the MCP process itself failed before returning a result
+    // (missing deps, spawn error, timeout).  fail() is called once inside the
+    // helper and every caller must guard isError checks with !result.crashed so
+    // that a crash never silently satisfies an "expected error" assertion.
+    type McpResult = { text: string; isError: boolean; crashed?: true };
     async function callMcpTool(
       toolName: string,
       toolArgs: Record<string, string>,
@@ -7525,9 +7529,19 @@ async function main(): Promise<void> {
 
         child.stderr.on("data", () => {});
         child.on("close", () => {
-          if (!resolved) reject(new Error("MCP process closed without response"));
+          if (!resolved) {
+            resolved = true;
+            fail("AH: MCP process closed without response");
+            resolve({ text: "MCP process closed without response", isError: true, crashed: true });
+          }
         });
-        child.on("error", reject);
+        child.on("error", (e: Error) => {
+          if (!resolved) {
+            resolved = true;
+            fail("AH: MCP spawn error", e.message);
+            resolve({ text: e.message, isError: true, crashed: true });
+          }
+        });
 
         // JSON-RPC handshake
         const send = (msg: unknown) => {
@@ -7574,7 +7588,8 @@ async function main(): Promise<void> {
           if (!resolved) {
             resolved = true;
             child.kill("SIGTERM");
-            reject(new Error("MCP tool call timed out"));
+            fail("AH: MCP tool call timed out");
+            resolve({ text: "MCP tool call timed out", isError: true, crashed: true });
           }
         }, 15000);
       });
@@ -7728,7 +7743,7 @@ async function main(): Promise<void> {
         const { id, name } = await makeAhApp();
 
         const result = await callMcpTool("delete_app", { app_id: id, confirm_name: "wrong-name" });
-        result.isError
+        result.isError && !result.crashed
           ? ok("AH5b: MCP wrong name → isError true")
           : fail("AH5b: wrong name should return isError");
         result.text.includes("Confirmation name does not match")
@@ -7750,7 +7765,7 @@ async function main(): Promise<void> {
           app_id: "00000000-0000-0000-0000-000000000099",
           confirm_name: "whatever",
         });
-        result.isError
+        result.isError && !result.crashed
           ? ok("AH5c: MCP unknown id → isError true")
           : fail("AH5c: unknown id should be isError");
         result.text.includes("App not found")

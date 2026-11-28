@@ -17,20 +17,61 @@ jobs:
   api:
     name: API (typecheck + integration suite)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
+      # pnpm must be set up before setup-node so the pnpm cache is detected
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: apps/api/package-lock.json
+          cache: "pnpm"
 
-      - name: Install dependencies (api)
+      # Install workspace packages (packages/cli, packages/mcp, packages/client) so
+      # that tsx can resolve commander, @modelcontextprotocol/server, etc. when the
+      # test suite spawns CLI/MCP source files.  apps/api is also in the workspace
+      # but its authoritative lockfile is apps/api/package-lock.json (npm); we
+      # install its deps with npm ci below so CI uses the exact same versions that
+      # production builds use (see apps/api/Dockerfile: npm ci).
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Production installs apps/api with npm from apps/api/package-lock.json.
+      # Run npm ci here so typecheck and the integration suite use those exact
+      # versions, matching what the Dockerfile produces.
+      - name: Install api dependencies (npm)
         working-directory: apps/api
         run: npm ci
+
+      # Section J requires packages/client/dist/zip.js; build it explicitly.
+      - name: Build @ssc/client
+        run: pnpm --filter @ssc/client build
+
+      # Install flyctl pinned to the same version and SHA-256 used in the
+      # API Dockerfile. The binary is placed in ~/.local/bin which is added
+      # to GITHUB_PATH so subsequent steps and run-suite.sh find it.
+      # Required by:
+      #   • Section P (runs `flyctl deploy --help` against the real binary)
+      #   • Section AF (dist/index.js startup check at src/index.ts:38 runs
+      #     execFileSync("flyctl", ["version"], ...) — if flyctl is absent the
+      #     server exits 1 and spawnAndPollHealth times out)
+      - name: Install flyctl 0.5.1
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          wget -q -O /tmp/flyctl.tar.gz \
+            "https://github.com/superfly/flyctl/releases/download/v0.5.1/flyctl_0.5.1_Linux_x86_64.tar.gz"
+          echo "47803bc5dc3eb7c7a45626ff76f0082e8c5b5fb8b805efbe00469d04757e1b1b  /tmp/flyctl.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/flyctl.tar.gz -C "$HOME/.local/bin" flyctl
+          rm /tmp/flyctl.tar.gz
+          chmod 755 "$HOME/.local/bin/flyctl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/flyctl" version
 
       - name: Typecheck (api)
         working-directory: apps/api
