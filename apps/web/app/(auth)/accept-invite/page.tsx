@@ -6,7 +6,7 @@ import { useSignIn, useSignUp, useClerk, useUser, useSession } from "@clerk/next
 import { AuthCard } from "../../../components/auth/AuthCard";
 import { navigateHard } from "../../../lib/navigate";
 
-type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error" | "used_invitation";
+type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error";
 
 const SS_PREFIX = "accept-invite-v1:";
 
@@ -55,8 +55,6 @@ export default function AcceptInvitePage() {
   // Even if they became empty, hasRun.current prevents the effect from re-running.
   const ticket = params.get("__clerk_ticket") ?? params.get("__clerk_invitation_token") ?? "";
   const targetOrgId = params.get("org") ?? "";
-  // __clerk_status=complete means FAPI already processed a used invitation ticket.
-  const clerkStatus = params.get("__clerk_status") ?? "";
 
   const { signIn } = useSignIn();
   const { signUp } = useSignUp();
@@ -94,93 +92,6 @@ export default function AcceptInvitePage() {
     setState("error");
     // Record failure in sessionStorage so a reload doesn't re-run the ticket.
     if (ticket) ssSet(SS_PREFIX + ticket, `error:${code}`);
-  }
-
-  function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /** Checks org membership with paging. Caps at 20 pages (1 000 memberships). */
-  async function isMemberOf(u: NonNullable<typeof user>, orgId: string): Promise<boolean> {
-    const PAGE_SIZE = 50;
-    for (let page = 1; page <= 20; page++) {
-      const { data, total_count } = await u.getOrganizationMemberships({ pageSize: PAGE_SIZE, initialPage: page });
-      if (data.some((m: { organization: { id: string } }) => m.organization.id === orgId)) return true;
-      if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return false;
-    }
-    return false;
-  }
-
-  /**
-   * Polls for the target org membership to appear in Clerk (backend propagation
-   * can take several seconds after ticket acceptance), then switches active org
-   * and navigates to /apps.
-   *
-   * - sessionId non-null: called from finishSignIn/finishSignUp (new sign-in).
-   *   Activates the session first; if the user ref isn't available yet (Clerk
-   *   hasn't re-rendered React), falls back to the combined setActive call so
-   *   the user at least lands somewhere rather than seeing an error.
-   *
-   * - sessionId null: called from detectSignedInState/stored-done (already
-   *   signed in). The user ref is available, so full membership polling runs.
-   *
-   * On unrecoverable failure (membership never appears, setActive rejects)
-   * shows an error and does NOT navigate.
-   */
-  async function activateAndNavigate(sessionId: string | null) {
-    if (sessionId) {
-      try { await setActive({ session: sessionId }); } catch { /* may already be active */ }
-    }
-
-    if (!targetOrgId) {
-      setState("done");
-      ssSet(SS_PREFIX + ticket, "done");
-      safeNavigate("/apps");
-      return;
-    }
-
-    const currentUser = userRef.current;
-    if (!currentUser) {
-      // User ref not yet populated (React hasn't re-rendered after setActive).
-      // Fall back: attempt the combined call so the user at least lands with the
-      // new session active. The invited workspace may not switch on this attempt,
-      // but it's better than showing an error.
-      if (sessionId) {
-        try { await setActive({ session: sessionId, organization: targetOrgId }); } catch {}
-      }
-      setState("done");
-      ssSet(SS_PREFIX + ticket, "done");
-      safeNavigate("/apps");
-      return;
-    }
-
-    // Poll for membership to become visible (Clerk backend propagation delay)
-    const delays = [500, 1000, 1500, 2000, 2000]; // up to ~7 s total
-    let found = false;
-    for (let i = 0; i <= delays.length; i++) {
-      if (i > 0) await sleep(delays[i - 1]);
-      try {
-        await currentUser.reload();
-        found = await isMemberOf(currentUser, targetOrgId);
-        if (found) break;
-      } catch { /* transient error — keep polling */ }
-    }
-
-    if (!found) {
-      showError("You've joined the workspace, but we couldn't open it. Refresh to try again.");
-      return;
-    }
-
-    try {
-      await setActive({ organization: targetOrgId });
-    } catch {
-      showError("You've joined the workspace, but we couldn't open it. Refresh to try again.");
-      return;
-    }
-
-    setState("done");
-    ssSet(SS_PREFIX + ticket, "done");
-    safeNavigate("/apps");
   }
 
   // Strip ticket/org params from the address bar immediately on mount — BEFORE
@@ -256,8 +167,12 @@ export default function AcceptInvitePage() {
             return;
           }
         }
-        // Poll until new membership propagates to Clerk, then switch active org.
-        await activateAndNavigate(null);
+        setState("done");
+        ssSet(SS_PREFIX + ticket, "done");
+        try {
+          await setActive({ organization: targetOrgId });
+        } catch { /* non-fatal */ }
+        safeNavigate("/apps");
         return;
       }
 
@@ -297,8 +212,12 @@ export default function AcceptInvitePage() {
       }
       return;
     }
-    // Poll until new membership propagates to Clerk, then switch active org.
-    await activateAndNavigate(sessionId);
+    setState("done");
+    ssSet(SS_PREFIX + ticket, "done");
+    try {
+      await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
+    } catch { /* non-fatal */ }
+    safeNavigate("/apps");
   }
 
   async function finishSignUp(sessionId: string | null) {
@@ -309,8 +228,12 @@ export default function AcceptInvitePage() {
       showError(ticketErrorMsg(code), code);
       return;
     }
-    // Poll until new membership propagates to Clerk, then switch active org.
-    await activateAndNavigate(sessionId);
+    setState("done");
+    ssSet(SS_PREFIX + ticket, "done");
+    try {
+      await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
+    } catch { /* non-fatal */ }
+    safeNavigate("/apps");
   }
 
   /**
@@ -407,15 +330,8 @@ export default function AcceptInvitePage() {
     hasRun.current = true;
 
     if (!ticket) {
-      // __clerk_status=complete means FAPI processed a used invitation ticket and
-      // stripped __clerk_ticket before redirecting. Any other empty-ticket visit is
-      // a direct navigation without an invite link.
-      if (clerkStatus === "complete") {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setState("used_invitation");
-      } else {
-        showError("Open the link from your invitation email again.");
-      }
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      showError("Open the link from your invitation email again.");
       return;
     }
 
@@ -424,27 +340,7 @@ export default function AcceptInvitePage() {
     // a full reload before the new page has loaded.
     const stored = ssGet(SS_PREFIX + ticket);
     if (stored === "done") {
-      // If the user is still signed in and targetOrgId is known, verify they are
-      // still a member before navigating — they may have left since the last visit.
-      if (userId && targetOrgId) {
-        void (async () => {
-          const u = userRef.current;
-          if (!u) { safeNavigate("/apps"); return; }
-          try {
-            await u.reload();
-            const member = await isMemberOf(u, targetOrgId);
-            if (member) {
-              void activateAndNavigate(null);
-            } else {
-              setState("used_invitation");
-            }
-          } catch {
-            safeNavigate("/apps"); // fall back on error
-          }
-        })();
-      } else {
-        safeNavigate("/apps");
-      }
+      safeNavigate("/apps");
       return;
     }
     if (stored?.startsWith("error:")) {
@@ -533,26 +429,6 @@ export default function AcceptInvitePage() {
           >
             Go to my apps
           </a>
-        </div>
-      </AuthCard>
-    );
-  }
-
-  if (state === "used_invitation") {
-    return (
-      <AuthCard title="Invitation already used" subtitle="">
-        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-          <p style={{ margin: 0, fontSize: "13px", color: "var(--fg-2)", textAlign: "center" }}>
-            This invitation has already been used. If you left or were removed from the workspace, ask an admin to send you a new invitation.
-          </p>
-          <p style={{ margin: 0, fontSize: "13px", color: "var(--fg-3)", textAlign: "center" }}>
-            {userId ? (
-              /* eslint-disable-next-line @next/next/no-html-link-for-pages */
-              <a href="/apps" style={{ color: "var(--fg)", textDecoration: "underline" }}>Go to my apps</a>
-            ) : (
-              <a href="/sign-in" style={{ color: "var(--fg)", textDecoration: "underline" }}>Go to sign-in</a>
-            )}
-          </p>
         </div>
       </AuthCard>
     );
