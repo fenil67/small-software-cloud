@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 import AcceptInvitePage from "../page";
+import { useSearchParams } from "next/navigation";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -52,6 +53,8 @@ const {
   mockUserReload,
   mockAccept,
   mockUseUser,
+  mockUseSession,
+  mockUseClerk,
 } = vi.hoisted(() => ({
   mockSetActive: vi.fn(),
   mockSignOut: vi.fn(),
@@ -64,6 +67,8 @@ const {
   mockUserReload: vi.fn(),
   mockAccept: vi.fn(),
   mockUseUser: vi.fn(),
+  mockUseSession: vi.fn(),
+  mockUseClerk: vi.fn(),
 }));
 
 vi.mock("@clerk/nextjs", () => ({
@@ -84,8 +89,9 @@ vi.mock("@clerk/nextjs", () => ({
       createdSessionId: null,
     },
   })),
-  useClerk: vi.fn(() => ({ setActive: mockSetActive, signOut: mockSignOut })),
+  useClerk: mockUseClerk,
   useUser: mockUseUser,
+  useSession: mockUseSession,
 }));
 
 vi.mock("../../../../components/auth/AuthCard", () => ({
@@ -128,6 +134,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
   mockSetActive.mockResolvedValue(undefined);
+  mockSignOut.mockResolvedValue(undefined);
   mockUserReload.mockResolvedValue(undefined);
   mockTicket.mockResolvedValue({ error: null });
   mockFinalize.mockResolvedValue({ error: null });
@@ -136,6 +143,14 @@ beforeEach(() => {
   mockAccept.mockResolvedValue({});
   mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
   mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+  // Default useClerk: no signed-in sessions on the client
+  mockUseClerk.mockReturnValue({
+    setActive: mockSetActive,
+    signOut: mockSignOut,
+    client: { signedInSessions: [] },
+  });
+  // Default useSession: session with a known id
+  mockUseSession.mockReturnValue({ isLoaded: true, isSignedIn: true, session: { id: "session_xyz" } });
   // Clear sessionStorage between tests so the storage guard doesn't interfere
   if (typeof sessionStorage !== "undefined") sessionStorage.clear();
 });
@@ -174,30 +189,26 @@ describe("click Accept → success → setActive with session + org (ROOT CAUSE 
         organization: "org_xyz",
       }),
     );
-    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+    // Fix 2: navigates to /apps?org=org_xyz so DashboardShell can verify org is active.
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz");
   });
 });
 
-// ── 3. finishSignIn path: finalize fails + IS member → navigates (M-member) ───
-// This tests checkMembership in finishSignIn. We simulate the scenario where
-// the user is already signed in (Clerk's ticket() detected an existing session)
-// but finalize() errored. The user IS a member of the invited org.
-// Since the page auto-detects the signed-in state and goes through detectSignedInState,
-// and the user has no pending invitation but IS a member, it navigates.
+// ── 3. Signed in, valid ticket, no matching invite → wrong_account ────────────
+// With a valid __clerk_ticket present, no matching pending invitation means the
+// invitation belongs to a different account — show wrong_account regardless of
+// whether the signed-in user is already a member.
 
-describe("finishSignIn fallback: IS member of invited org → navigates (M-member)", () => {
-  it("navigates when user has no pending invitation but IS a member of the org", async () => {
+describe("valid ticket, signed in, no matching invite → wrong_account (Fix3)", () => {
+  it("shows wrong_account card when no pending invitation matches the org", async () => {
     mockSignedIn();
-    // No pending invitation for this org
     mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
-    // But IS a member
-    mockGetOrganizationMemberships.mockResolvedValue({
-      data: [{ organization: { id: "org_xyz" } }],
-    });
 
     render(<AcceptInvitePage />);
-    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
-    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
+
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    expect(mockSetActive).not.toHaveBeenCalled();
   });
 });
 
@@ -278,19 +289,51 @@ describe("signed in with two pending invitations → only matching one accepted"
   });
 });
 
-// ── 8. Signed in, ticket already used → already a member → navigates ──────────
+// ── 8. Valid ticket, signed in, member, no matching invite → wrong_account ────
+// Regression test for the fix: even when the user IS a member of the org,
+// a valid ticket with no matching pending invitation = wrong account.
 
-describe("signed in, already a member → navigates (ROOT CAUSE TEST 2)", () => {
-  it("navigates when no pending invitation but already a member", async () => {
+describe("valid ticket, signed in, IS member, no matching invite → wrong_account", () => {
+  it("shows wrong_account when already a member but no pending invitation matches", async () => {
     mockSignedIn();
     mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    // IS a member — but this should NOT trigger navigation any more
     mockGetOrganizationMemberships.mockResolvedValue({
       data: [{ organization: { id: "org_xyz" } }],
     });
 
     render(<AcceptInvitePage />);
 
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    expect(mockSetActive).not.toHaveBeenCalled();
+  });
+});
+
+// ── 8b. Matching invite on page 2 → accept called, navigate ──────────────────
+// Verifies findMatchingInvitationPaged fetches beyond page 1.
+
+describe("matching invite on page 2 → accept called, navigate (Fix3-page2)", () => {
+  it("accepts invitation found on the second page", async () => {
+    const mockAcceptOrg = vi.fn().mockResolvedValue({});
+    mockSignedIn();
+
+    // Page 1: 50 items (no match), total_count = 51 → triggers page 2
+    const page1Items = Array.from({ length: 50 }, (_, i) => ({
+      accept: vi.fn(),
+      publicOrganizationData: { id: `org_other_${i}` },
+    }));
+    mockGetOrganizationInvitations
+      .mockResolvedValueOnce({ data: page1Items, total_count: 51 })
+      .mockResolvedValueOnce({
+        data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
+        total_count: 51,
+      });
+
+    render(<AcceptInvitePage />);
+
     await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    expect(mockAcceptOrg).toHaveBeenCalled();
     expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
   });
 });
@@ -439,6 +482,39 @@ describe("URL-strip: ticket params removed from address bar on mount", () => {
   });
 });
 
+// ── 14b. URL-strip: __clerk_status and org stripped even without a ticket ─────
+// Root cause fix (staging loop): when there is no ticket but __clerk_status/org
+// are present, the strip effect must still run so router.refresh() (triggered
+// by setActive elsewhere) sees a clean URL and cannot re-trigger the branch.
+// Mutation: add `if (!ticket && !clerkStatus) return;` back to the strip effect →
+// replaceState is not called on the __clerk_status-only path → this test fails.
+
+describe("URL-strip: __clerk_status and org stripped on mount without a ticket", () => {
+  it("calls history.replaceState and resulting path has no __clerk_status or org when only those params are present", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    const replaceState = vi.spyOn(history, "replaceState");
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(replaceState).toHaveBeenCalled());
+
+    for (const call of replaceState.mock.calls) {
+      const url = String(call[2] ?? "");
+      expect(url).not.toContain("__clerk_status");
+      expect(url).not.toContain("org=");
+    }
+
+    replaceState.mockRestore();
+  });
+});
+
 // ── 15. sessionStorage "done": reload → navigate without calling Clerk ─────────
 // If the ticket was already processed successfully (e.g. from a prior load),
 // the page should navigate directly to /apps without re-running any Clerk calls.
@@ -453,7 +529,8 @@ describe("sessionStorage done: reload navigates without calling Clerk", () => {
 
     render(<AcceptInvitePage />);
 
-    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    // Fix 2: stored-done path navigates to appsDestination() = /apps?org=org_xyz
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz"));
 
     // No Clerk ticket or invitation calls should be made
     expect(mockTicket).not.toHaveBeenCalled();
@@ -586,5 +663,199 @@ describe("code-mapping guard: organization_invitation_revoked_code maps to 'canc
     // This would fail if the mapping returned the generic message
     expect(screen.getByRole("alert").textContent).not.toContain("Could not accept");
     expect(screen.getByRole("alert").textContent).toContain("cancelled");
+  });
+});
+
+// ── 22. Wrong account: sign-out calls signOut(sessionId only) + navigateHard ───
+// ROOT CAUSE FIX: Clerk's redirectUrl after signOut does not fire reliably
+// (same class as setActive navigation). Fix: await signOut({ sessionId }) with
+// NO redirectUrl, then call navigateHard ourselves with the ticket in the URL.
+
+describe("wrong account: sign-out calls signOut with sessionId only, then navigateHard with ticket URL", () => {
+  it("calls signOut({ sessionId }) without redirectUrl, then navigateHard with ticket URL", async () => {
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+
+    render(<AcceptInvitePage />);
+    const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
+    fireEvent.click(signOutBtn);
+
+    // signOut must be called with the active sessionId and no redirectUrl
+    await waitFor(() =>
+      expect(mockSignOut).toHaveBeenCalledWith({ sessionId: "session_xyz" }),
+    );
+    // navigateHard must carry the original ticket and org
+    await waitFor(() =>
+      expect(mockNavigateHard).toHaveBeenCalledWith(
+        expect.stringContaining("__clerk_ticket=ticket_abc"),
+      ),
+    );
+    expect(mockNavigateHard).toHaveBeenCalledWith(
+      expect.stringContaining("org=org_xyz"),
+    );
+  });
+});
+
+// ── 25. signOut throws → error shown in wrong_account card, button re-enabled ──
+
+describe("wrong account: signOut throws → error alert shown, button re-enabled", () => {
+  it("shows error alert and re-enables button when signOut rejects", async () => {
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+    mockSignOut.mockRejectedValueOnce(new Error("network error"));
+
+    render(<AcceptInvitePage />);
+    const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
+    fireEvent.click(signOutBtn);
+
+    // Error alert must appear inside the wrong_account card
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("Could not sign out");
+
+    // Button must be re-enabled (not disabled)
+    const btn = screen.getByRole("button", { name: /sign out and continue/i });
+    expect(btn).not.toBeDisabled();
+
+    // navigateHard must NOT have been called
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 23. Missing ticket → shows friendly "open the link" message ───────────────
+// When the page is opened without a ticket (e.g. user typed /accept-invite
+// directly), the error should say "Open the link from your invitation email".
+
+describe("missing ticket → shows friendly open-link message", () => {
+  it("shows 'Open the link' message when no ticket in URL", async () => {
+    // Override useSearchParams to return no ticket
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("Open the link from your invitation email");
+  });
+});
+
+// ── Fix 1 tests: __clerk_status present, no ticket ───────────────────────────
+// These cover the used-invitation link path: FAPI processes the ticket and
+// redirects to /accept-invite?__clerk_status=sign_in&org=org_xyz (no __clerk_ticket).
+
+// F1a: signed in + member of org → NO setActive, navigate to /apps?org= for DashboardShell
+// Mutation guard: putting setActive back in the member branch → this test fails
+// (mockSetActive assertion flips to .toHaveBeenCalled() which now passes, and
+//  the navigateHard assertion expects no-setActive behaviour).
+describe("Fix1-a: used-link, signed in and member → no setActive, navigate /apps?org= (loop fix)", () => {
+  it("does NOT call setActive; navigates to /apps?org=org_xyz so DashboardShell switches org", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockSignedIn();
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz"),
+    );
+    // setActive must NOT be called — calling it triggers Clerk router.refresh()
+    // which unmounts/remounts this page and restarts the loop.
+    expect(mockSetActive).not.toHaveBeenCalled();
+  });
+});
+
+// F1b: signed in + NOT member → shows "Invitation already used" card
+// Mutation (b): if the __clerk_status branch is removed and falls through to
+// showError("Open the link..."), this test fails because "Invitation already
+// used" would not appear.
+describe("Fix1-b: used-link, signed in but not member → Invitation already used (mutation-b guard)", () => {
+  it("shows 'Invitation already used' card when user is not a member", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockSignedIn();
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [], total_count: 0 });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/invitation has already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // "Go to my apps" link shown for a signed-in user
+    expect(screen.getByRole("link", { name: /go to my apps/i })).toBeInTheDocument();
+  });
+});
+
+// F1c: not signed in → shows "Invitation already used" with Sign in link
+describe("Fix1-c: used-link, not signed in → Invitation already used with Sign in link", () => {
+  it("shows 'Invitation already used' with Sign in link for a signed-out visitor", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/invitation has already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // "Sign in" link shown for a signed-out visitor
+    expect(screen.getByRole("link", { name: /sign in/i })).toBeInTheDocument();
+  });
+});
+
+// ── 24. Multi-session guard: signed-in sessions prevent ticket sign-in ─────────
+// If clerkClient.signedInSessions is non-empty but no active user (e.g. during
+// session switching), clicking Accept must show the Wrong account card, NOT call
+// signIn.ticket(). Without this guard a ticket sign-in would silently add a
+// second session.
+// Mutation M-wa: comment out the guard → signIn.ticket() IS called → test fails.
+
+describe("multi-session guard: existing sessions show wrong_account before ticket sign-in", () => {
+  it("shows wrong_account card and does not call ticket() when signedInSessions exist", async () => {
+    // No active user (Clerk shows user as null mid-session-switch)
+    mockNotSignedIn();
+    // But a signed-in session exists on the client
+    mockUseClerk.mockReturnValue({
+      setActive: mockSetActive,
+      signOut: mockSignOut,
+      client: {
+        signedInSessions: [{ id: "session_other", publicUserData: { identifier: "other@test.com" } }],
+      },
+    });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    // Wrong account card must appear
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    // ticket() must NEVER be called — that would have silently added a session
+    expect(mockTicket).not.toHaveBeenCalled();
   });
 });

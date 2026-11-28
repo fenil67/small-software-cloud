@@ -2,11 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { useSignIn, useSignUp, useClerk, useUser } from "@clerk/nextjs";
+import { useSignIn, useSignUp, useClerk, useUser, useSession } from "@clerk/nextjs";
 import { AuthCard } from "../../../components/auth/AuthCard";
 import { navigateHard } from "../../../lib/navigate";
 
-type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error";
+type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error" | "used_invitation";
 
 const SS_PREFIX = "accept-invite-v1:";
 
@@ -55,11 +55,15 @@ export default function AcceptInvitePage() {
   // Even if they became empty, hasRun.current prevents the effect from re-running.
   const ticket = params.get("__clerk_ticket") ?? params.get("__clerk_invitation_token") ?? "";
   const targetOrgId = params.get("org") ?? "";
+  // __clerk_status is set by FAPI when redirecting back after processing a ticket.
+  // Any non-empty value means the invitation flow came through FAPI (used ticket path).
+  const clerkStatus = params.get("__clerk_status") ?? "";
 
   const { signIn } = useSignIn();
   const { signUp } = useSignUp();
-  const { setActive, signOut } = useClerk();
+  const { setActive, signOut, client: clerkClient } = useClerk();
   const { user, isLoaded } = useUser();
+  const { session } = useSession();
   // Stable ref to latest user — read inside async callbacks to avoid stale closures.
   const userRef = useRef(user);
   // eslint-disable-next-line react-hooks/refs
@@ -69,6 +73,8 @@ export default function AcceptInvitePage() {
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [errorCode, setErrorCode] = useState<string>("");
   const [userEmail, setUserEmail] = useState<string>("");
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState("");
 
   // Run-once guard: prevents the detection effect from firing again if Clerk
   // briefly toggles isLoaded false→true after setActive (which would loop).
@@ -83,6 +89,12 @@ export default function AcceptInvitePage() {
     navigateHard(path);
   }
 
+  // Navigation destination for accept flows: include ?org= so DashboardShell
+  // can verify the org is active after a new session is established.
+  function appsDestination(): string {
+    return targetOrgId ? `/apps?org=${encodeURIComponent(targetOrgId)}` : "/apps";
+  }
+
   function showError(msg: string, code = "") {
     setErrorMsg(msg);
     setErrorCode(code);
@@ -91,20 +103,60 @@ export default function AcceptInvitePage() {
     if (ticket) ssSet(SS_PREFIX + ticket, `error:${code}`);
   }
 
-  // Strip ticket/org params from the address bar immediately on mount — BEFORE
-  // any async work. This ensures that when Clerk's ClerkProvider calls
-  // router.refresh() after setActive, the RSC re-fetch sees a clean URL and
-  // does not trigger the Clerk handshake redirect loop.
+  /**
+   * Check org membership with paging. Single sweep — no polling, no reload.
+   * Uses ClerkPaginationParams (pageSize/initialPage) and ClerkPaginatedResponse (total_count).
+   */
+  async function isMemberOfPaged(u: NonNullable<typeof user>, orgId: string): Promise<boolean> {
+    const PAGE_SIZE = 50;
+    for (let page = 1; page <= 20; page++) {
+      const { data, total_count } = await u.getOrganizationMemberships({ pageSize: PAGE_SIZE, initialPage: page });
+      if (data.some((m: { organization: { id: string } }) => m.organization.id === orgId)) return true;
+      if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return false;
+    }
+    return false;
+  }
+
+  /**
+   * Page through the user's pending invitations to find one for orgId.
+   * Returns the matching invitation object or null.
+   */
+  async function findMatchingInvitationPaged(u: NonNullable<typeof user>, orgId: string) {
+    type Inv = { accept(): Promise<unknown>; publicOrganizationData: { id: string } };
+    type InvUser = {
+      getOrganizationInvitations(params: {
+        status: "pending";
+        pageSize: number;
+        initialPage: number;
+      }): Promise<{ data: Inv[]; total_count: number }>;
+    };
+    const PAGE_SIZE = 50;
+    for (let page = 1; page <= 20; page++) {
+      const { data, total_count } = await (u as unknown as InvUser).getOrganizationInvitations({
+        status: "pending",
+        pageSize: PAGE_SIZE,
+        initialPage: page,
+      });
+      const match = data.find((inv) => inv.publicOrganizationData.id === orgId);
+      if (match) return match;
+      if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return null;
+    }
+    return null;
+  }
+
+  // Strip all invite-related params from the address bar immediately on mount —
+  // BEFORE any async work. ticket, targetOrgId, and clerkStatus are captured
+  // above from useSearchParams() at render time and remain valid after the strip.
+  // Strip runs unconditionally so it also covers the __clerk_status-only path
+  // (used-link redirect), where router.refresh() after setActive would
+  // otherwise find params still in the router state and re-trigger the branch.
   useEffect(() => {
-    if (!ticket) return;
     const url = new URL(window.location.href);
     url.searchParams.delete("__clerk_ticket");
     url.searchParams.delete("__clerk_invitation_token");
     url.searchParams.delete("__clerk_status");
     url.searchParams.delete("org");
-    // Use pathname+search (relative) so this is safe in all environments.
     history.replaceState(null, "", url.pathname + url.search);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 15-second hard timeout: if still in a pending state, show error.
@@ -150,8 +202,7 @@ export default function AcceptInvitePage() {
     const currentUser = userRef.current;
     if (!currentUser) return;
     try {
-      const { data: invitations } = await currentUser.getOrganizationInvitations({ status: "pending" });
-      const matching = invitations.find((inv) => inv.publicOrganizationData.id === targetOrgId);
+      const matching = await findMatchingInvitationPaged(currentUser, targetOrgId);
 
       if (matching) {
         try {
@@ -173,20 +224,9 @@ export default function AcceptInvitePage() {
         return;
       }
 
-      // No pending invitation — check if already a member
-      const { data: memberships } = await currentUser.getOrganizationMemberships();
-      const isMember = memberships.some((m) => m.organization.id === targetOrgId);
-      if (isMember) {
-        setState("done");
-        ssSet(SS_PREFIX + ticket, "done");
-        try {
-          await setActive({ organization: targetOrgId });
-        } catch { /* non-fatal */ }
-        safeNavigate("/apps");
-        return;
-      }
-
-      // Wrong account — show card immediately, do not loop
+      // No matching pending invitation for this org — with a valid __clerk_ticket
+      // present, this means the invitation belongs to a different account.
+      // Show wrong_account regardless of whether the signed-in user is already a member.
       setUserEmail(currentUser.primaryEmailAddress?.emailAddress ?? "");
       setState("wrong_account");
     } catch {
@@ -201,7 +241,7 @@ export default function AcceptInvitePage() {
       if (isMember) {
         setState("done");
         ssSet(SS_PREFIX + ticket, "done");
-        safeNavigate("/apps");
+        safeNavigate(appsDestination());
       } else {
         const code = extractCode(error);
         console.error("[accept-invite]", code);
@@ -211,10 +251,13 @@ export default function AcceptInvitePage() {
     }
     setState("done");
     ssSet(SS_PREFIX + ticket, "done");
+    // setActive is called ONLY here and in finishSignUp — the two ticket-based flows.
+    // The __clerk_status (used-link) path does NOT call setActive to avoid triggering
+    // Clerk's router.refresh() loop on the accept-invite page.
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    safeNavigate("/apps");
+    safeNavigate(appsDestination());
   }
 
   async function finishSignUp(sessionId: string | null) {
@@ -230,12 +273,53 @@ export default function AcceptInvitePage() {
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    safeNavigate("/apps");
+    safeNavigate(appsDestination());
+  }
+
+  /**
+   * Signs out only the active session, then navigates back to this page with
+   * the ticket in the URL so the signed-out Accept flow can proceed.
+   *
+   * We call navigateHard ourselves rather than relying on Clerk's redirectUrl,
+   * because Clerk's internal navigation does not reliably fire in this app
+   * (same issue as setActive with navigateHard documented in CLAUDE.md).
+   *
+   * ticket is read from the in-memory value captured at initial render (before
+   * history.replaceState stripped it from the URL), so it is always available
+   * here even though the address bar no longer shows it.
+   */
+  async function handleSignOutAndContinue() {
+    if (!ticket) {
+      showError("Open the link from your invitation email again.");
+      return;
+    }
+    setSigningOut(true);
+    setSignOutError("");
+    try {
+      await signOut({ sessionId: session?.id });
+    } catch {
+      setSigningOut(false);
+      setSignOutError("Could not sign out. Please try again.");
+      return;
+    }
+    const qs = `__clerk_ticket=${encodeURIComponent(ticket)}${targetOrgId ? `&org=${encodeURIComponent(targetOrgId)}` : ""}`;
+    navigateHard(`/accept-invite?${qs}`);
   }
 
   async function handleAccept() {
     if (!signIn || !signUp) return;
     setState("accepting");
+
+    // Multi-session guard: if any signed-in sessions exist on this client but
+    // no active user is set (e.g. mid-session-switch), do not proceed with the
+    // ticket sign-in — it would silently add a second session. Show the Wrong
+    // account card for the first existing session instead.
+    const signedInSessions = clerkClient?.signedInSessions ?? [];
+    if (signedInSessions.length > 0) {
+      setUserEmail(signedInSessions[0].publicUserData.identifier);
+      setState("wrong_account");
+      return;
+    }
 
     const { error: siError } = await signIn.ticket({ ticket });
 
@@ -286,8 +370,41 @@ export default function AcceptInvitePage() {
     hasRun.current = true;
 
     if (!ticket) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      showError("No invitation token found. This link may be invalid or expired.");
+      if (!clerkStatus) {
+        // No ticket and no __clerk_status: direct navigation without an invite link.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        showError("Open the link from your invitation email again.");
+        return;
+      }
+      // __clerk_status present (any value): arrived via FAPI from a used invitation link.
+      // Check if the signed-in user is already a member of the target org.
+      if (!userId) {
+        // Not signed in — show used-invitation card with sign-in link.
+        setState("used_invitation");
+        return;
+      }
+      // Signed in — check membership once (single sweep, no polling, no reload).
+      void (async () => {
+        const currentUser = userRef.current;
+        if (!currentUser) {
+          setState("used_invitation");
+          return;
+        }
+        try {
+          const isMember = targetOrgId ? await isMemberOfPaged(currentUser, targetOrgId) : false;
+          if (isMember) {
+            // Do NOT call setActive here: setActive triggers Clerk's router.refresh(),
+            // which can unmount/remount this page before navigateHard fires, restarting
+            // the loop. DashboardShell handles the org switch at /apps?org=.
+            setState("done");
+            safeNavigate(appsDestination());
+          } else {
+            setState("used_invitation");
+          }
+        } catch {
+          setState("used_invitation");
+        }
+      })();
       return;
     }
 
@@ -296,7 +413,7 @@ export default function AcceptInvitePage() {
     // a full reload before the new page has loaded.
     const stored = ssGet(SS_PREFIX + ticket);
     if (stored === "done") {
-      safeNavigate("/apps");
+      safeNavigate(appsDestination());
       return;
     }
     if (stored?.startsWith("error:")) {
@@ -358,6 +475,23 @@ export default function AcceptInvitePage() {
     );
   }
 
+  if (state === "used_invitation") {
+    return (
+      <AuthCard title="Invitation already used" subtitle="">
+        <p style={{ margin: 0, fontSize: "13px", color: "var(--fg-2)", textAlign: "center", marginBottom: "16px" }}>
+          This invitation has already been used. If you left or were removed from the workspace,
+          ask an admin to send you a new invitation.
+        </p>
+        <a
+          href={userId ? "/apps" : "/sign-in"}
+          className="w-full rounded-xl bg-surface-2 px-4 py-2.5 text-sm font-semibold text-fg transition-opacity hover:opacity-90 text-center block"
+        >
+          {userId ? "Go to my apps" : "Sign in"}
+        </a>
+      </AuthCard>
+    );
+  }
+
   if (state === "wrong_account") {
     return (
       <AuthCard title="Wrong account" subtitle="">
@@ -365,12 +499,18 @@ export default function AcceptInvitePage() {
           This invitation is for another account. You&apos;re signed in as {userEmail}.
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {signOutError && (
+            <p role="alert" style={{ margin: 0, fontSize: "13px", color: "var(--red)", textAlign: "center" }}>
+              {signOutError}
+            </p>
+          )}
           <button
             type="button"
-            onClick={() => void signOut({ redirectUrl: window.location.href })}
-            className="w-full rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg transition-opacity hover:opacity-90"
+            onClick={() => void handleSignOutAndContinue()}
+            disabled={signingOut}
+            className="w-full rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            Sign out and continue
+            {signingOut ? "Signing out\u2026" : "Sign out and continue"}
           </button>
           {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
           <a
