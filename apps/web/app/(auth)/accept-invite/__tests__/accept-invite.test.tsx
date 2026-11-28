@@ -171,10 +171,14 @@ describe("not signed in → shows Accept button", () => {
   });
 });
 
-// ── 2. Click Accept → success → setActive called with session + org ───────────
+// ── 2. Click Accept → success → navigates to /apps ────────────────────────────
+// When the user is not signed in and accepts via ticket sign-in, the new session
+// is activated and the page navigates to /apps after a successful finalize.
+// (Detailed org-switch polling is tested in tests 26–28 via the signed-in path
+// where userRef is populated and full polling can run.)
 
-describe("click Accept → success → setActive with session + org (ROOT CAUSE TEST)", () => {
-  it("setActive called with { session, organization } after success", async () => {
+describe("click Accept → success → navigates to /apps", () => {
+  it("navigates to /apps after successful ticket sign-in and finalize", async () => {
     mockNotSignedIn();
     mockTicket.mockResolvedValue({ error: null });
     mockFinalize.mockResolvedValue({ error: null });
@@ -183,13 +187,9 @@ describe("click Accept → success → setActive with session + org (ROOT CAUSE 
     const btn = await screen.findByRole("button", { name: /accept invitation/i });
     fireEvent.click(btn);
 
-    await waitFor(() =>
-      expect(mockSetActive).toHaveBeenCalledWith({
-        session: "session_123",
-        organization: "org_xyz",
-      }),
-    );
-    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    // setActive must be called at minimum with the new session
+    expect(mockSetActive).toHaveBeenCalledWith({ session: "session_123" });
   });
 });
 
@@ -262,6 +262,11 @@ describe("signed in → auto-accepts matching invitation", () => {
     mockGetOrganizationInvitations.mockResolvedValue({
       data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
     });
+    // After accept(), membership must appear on the first poll
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
 
     render(<AcceptInvitePage />);
 
@@ -283,6 +288,11 @@ describe("signed in with two pending invitations → only matching one accepted"
         { accept: mockAcceptOther, publicOrganizationData: { id: "org_other" } },
         { accept: mockAcceptXyz, publicOrganizationData: { id: "org_xyz" } },
       ],
+    });
+    // After accept(), membership must appear on the first poll
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
     });
 
     render(<AcceptInvitePage />);
@@ -358,13 +368,20 @@ describe("loop fix: detection runs once even when isLoaded toggles false→true 
     mockGetOrganizationInvitations.mockResolvedValue({
       data: [{ accept: mockAcceptInv, publicOrganizationData: { id: "org_xyz" } }],
     });
+    // After accept(), activateAndNavigate polls for membership — return it immediately
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
 
     const { rerender } = render(<AcceptInvitePage />);
 
     // Clerk loads: signed in with matching invitation
     mockSignedIn();
     rerender(<AcceptInvitePage />);
-    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"), {
+      timeout: 2000,
+    });
 
     // Simulate Clerk toggling isLoaded false→true (happens after setActive)
     mockUseUser.mockReturnValue({ isLoaded: false, isSignedIn: false, user: null });
@@ -711,5 +728,162 @@ describe("multi-session guard: existing sessions show wrong_account before ticke
     await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
     // ticket() must NEVER be called — that would have silently added a session
     expect(mockTicket).not.toHaveBeenCalled();
+  });
+});
+
+// ── 26. Membership appears after N polls → setActive(org) + navigate ──────────
+// Tests the full polling path via the signed-in flow: user has a pending
+// invitation, accepts it, then activateAndNavigate(null) is called. The user
+// ref is populated (already signed in), so membership polling runs.
+// First poll returns empty; subsequent polls return the new membership.
+// Mutation M-poll-org: drop setActive({ organization }) → test fails.
+
+describe("membership appears after N polls → setActive(org) + navigate (signed-in path)", () => {
+  it("retries polling and navigates once membership appears", async () => {
+    vi.useFakeTimers();
+    const mockAcceptOrg = vi.fn().mockResolvedValue({});
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({
+      data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
+    });
+    // First poll (at i=0, no delay) empty; subsequent polls return the membership
+    mockGetOrganizationMemberships
+      .mockResolvedValueOnce({ data: [], total_count: 0 })
+      .mockResolvedValue({ data: [{ organization: { id: "org_xyz" } }], total_count: 1 });
+
+    render(<AcceptInvitePage />);
+    // Detection effect fires synchronously → accept() → activateAndNavigate(null)
+    // i=0 poll: empty → sleep(500) queued
+    // runAllTimersAsync fires the sleep + all subsequent polls
+    await act(async () => { await vi.runAllTimersAsync(); });
+
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+  });
+});
+
+// ── 27. Membership never appears → error shown, no navigate ───────────────────
+// All polls return empty: activateAndNavigate shows the workspace-open error
+// and does NOT navigate (which would land in the wrong workspace).
+// Mutation M-poll-skip: skip the !found check and always navigate → test fails.
+
+describe("membership never appears → error shown, no navigate (signed-in path)", () => {
+  it("shows workspace-open error and does not navigate when membership never appears", async () => {
+    vi.useFakeTimers();
+    const mockAcceptOrg = vi.fn().mockResolvedValue({});
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({
+      data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
+    });
+    // All polls return empty
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [], total_count: 0 });
+
+    render(<AcceptInvitePage />);
+    // Fire all sleep timers (500+1000+1500+2000+2000 ms) and flush promise chains
+    await act(async () => { await vi.runAllTimersAsync(); });
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("couldn't open it");
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 28. setActive(org) fails → error shown, no navigate ───────────────────────
+// Membership found on the first poll, but setActive({ organization }) throws.
+// The page shows the workspace-open error rather than navigating.
+
+describe("setActive(org) fails → error shown, no navigate (signed-in path)", () => {
+  it("shows workspace-open error and does not navigate when setActive(org) rejects", async () => {
+    const mockAcceptOrg = vi.fn().mockResolvedValue({});
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({
+      data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
+    });
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
+    // setActive({ organization }) fails
+    mockSetActive.mockRejectedValueOnce(new Error("org switch failed"));
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("couldn't open it");
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 29. Stored done + NOT a member → used-invitation message ──────────────────
+// If the ticket was processed ("done") but the user has since left the org,
+// we must NOT redirect them into the wrong workspace — show the used-invitation
+// message instead.
+// Mutation M-stored-done: skip membership check on stored-done path and always
+// navigate → test fails.
+
+describe("stored done + not a member → used-invitation message", () => {
+  it("shows used-invitation message when stored=done but user is no longer a member", async () => {
+    mockSignedIn();
+    sessionStorage.setItem("accept-invite-v1:ticket_abc", "done");
+    // User is NOT a member of org_xyz (left after the original accept)
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [], total_count: 0 });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // /apps link present (user is signed in)
+    expect(screen.getByRole("link", { name: /go to my apps/i })).toBeInTheDocument();
+  });
+});
+
+// ── 30. Stored done + IS member → activateAndNavigate → /apps ─────────────────
+// If the ticket was processed ("done") and the user is still a member,
+// activateAndNavigate switches to the org and navigates normally.
+
+describe("stored done + IS member → activateAndNavigate → /apps", () => {
+  it("calls setActive(org) and navigates to /apps when stored=done and user is a member", async () => {
+    mockSignedIn();
+    sessionStorage.setItem("accept-invite-v1:ticket_abc", "done");
+    mockGetOrganizationMemberships.mockResolvedValue({
+      data: [{ organization: { id: "org_xyz" } }],
+      total_count: 1,
+    });
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
+  });
+});
+
+// ── 31. Used-ticket arrival (__clerk_status=complete, no ticket) ──────────────
+// When Clerk's FAPI processes a used invitation ticket it redirects to the app
+// with __clerk_status=complete and no __clerk_ticket. The page must show the
+// used-invitation message rather than the generic "Open the link" error.
+// Source: TicketStatus = 'sign_in' | 'sign_up' | 'complete' (Clerk shared types),
+//   "/v1/tickets/accept" listed as frontendApiRedirectPathsNoUserInput (Clerk url.js).
+
+describe("used-ticket arrival (__clerk_status=complete, no __clerk_ticket) → used-invitation message", () => {
+  it("shows used-invitation message when __clerk_status=complete and ticket is absent", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "complete";
+        if (k === "org") return "org_xyz";
+        return null; // no __clerk_ticket
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/already been used/i)).toBeInTheDocument(),
+    );
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    // /sign-in link present (user is NOT signed in)
+    expect(screen.getByRole("link", { name: /sign-in/i })).toBeInTheDocument();
   });
 });
