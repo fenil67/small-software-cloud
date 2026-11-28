@@ -455,6 +455,39 @@ describe("URL-strip: ticket params removed from address bar on mount", () => {
   });
 });
 
+// ── 14b. URL-strip: __clerk_status and org stripped even without a ticket ─────
+// Root cause fix (staging loop): when there is no ticket but __clerk_status/org
+// are present, the strip effect must still run so router.refresh() (triggered
+// by setActive elsewhere) sees a clean URL and cannot re-trigger the branch.
+// Mutation: add `if (!ticket && !clerkStatus) return;` back to the strip effect →
+// replaceState is not called on the __clerk_status-only path → this test fails.
+
+describe("URL-strip: __clerk_status and org stripped on mount without a ticket", () => {
+  it("calls history.replaceState and resulting path has no __clerk_status or org when only those params are present", async () => {
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "__clerk_status") return "sign_in";
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    const replaceState = vi.spyOn(history, "replaceState");
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(replaceState).toHaveBeenCalled());
+
+    for (const call of replaceState.mock.calls) {
+      const url = String(call[2] ?? "");
+      expect(url).not.toContain("__clerk_status");
+      expect(url).not.toContain("org=");
+    }
+
+    replaceState.mockRestore();
+  });
+});
+
 // ── 15. sessionStorage "done": reload → navigate without calling Clerk ─────────
 // If the ticket was already processed successfully (e.g. from a prior load),
 // the page should navigate directly to /apps without re-running any Clerk calls.
@@ -689,9 +722,12 @@ describe("missing ticket → shows friendly open-link message", () => {
 // These cover the used-invitation link path: FAPI processes the ticket and
 // redirects to /accept-invite?__clerk_status=sign_in&org=org_xyz (no __clerk_ticket).
 
-// F1a: signed in + member of org → setActive + navigate to /apps
-describe("Fix1-a: used-link, signed in and member → switches org and navigates", () => {
-  it("calls setActive({ organization }) and navigates to /apps when user is a member", async () => {
+// F1a: signed in + member of org → NO setActive, navigate to /apps?org= for DashboardShell
+// Mutation guard: putting setActive back in the member branch → this test fails
+// (mockSetActive assertion flips to .toHaveBeenCalled() which now passes, and
+//  the navigateHard assertion expects no-setActive behaviour).
+describe("Fix1-a: used-link, signed in and member → no setActive, navigate /apps?org= (loop fix)", () => {
+  it("does NOT call setActive; navigates to /apps?org=org_xyz so DashboardShell switches org", async () => {
     vi.mocked(useSearchParams).mockReturnValueOnce({
       get: (k: string) => {
         if (k === "__clerk_status") return "sign_in";
@@ -708,9 +744,11 @@ describe("Fix1-a: used-link, signed in and member → switches org and navigates
     render(<AcceptInvitePage />);
 
     await waitFor(() =>
-      expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" }),
+      expect(mockNavigateHard).toHaveBeenCalledWith("/apps?org=org_xyz"),
     );
-    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+    // setActive must NOT be called — calling it triggers Clerk router.refresh()
+    // which unmounts/remounts this page and restarts the loop.
+    expect(mockSetActive).not.toHaveBeenCalled();
   });
 });
 
