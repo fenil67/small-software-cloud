@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { useSignIn, useSignUp, useClerk, useUser } from "@clerk/nextjs";
+import { useSignIn, useSignUp, useClerk, useUser, useSession } from "@clerk/nextjs";
 import { AuthCard } from "../../../components/auth/AuthCard";
 import { navigateHard } from "../../../lib/navigate";
 
@@ -58,8 +58,9 @@ export default function AcceptInvitePage() {
 
   const { signIn } = useSignIn();
   const { signUp } = useSignUp();
-  const { setActive, signOut } = useClerk();
+  const { setActive, signOut, client: clerkClient } = useClerk();
   const { user, isLoaded } = useUser();
+  const { session } = useSession();
   // Stable ref to latest user — read inside async callbacks to avoid stale closures.
   const userRef = useRef(user);
   // eslint-disable-next-line react-hooks/refs
@@ -233,9 +234,30 @@ export default function AcceptInvitePage() {
     safeNavigate("/apps");
   }
 
+  /**
+   * Signs out only the active session and returns to this page with the ticket
+   * in the URL so the signed-out Accept flow can proceed.
+   * redirectUrl re-adds the ticket so the page loads it from searchParams again.
+   */
+  async function handleSignOutAndContinue() {
+    const qs = `__clerk_ticket=${encodeURIComponent(ticket)}${targetOrgId ? `&org=${encodeURIComponent(targetOrgId)}` : ""}`;
+    await signOut({ sessionId: session?.id, redirectUrl: `/accept-invite?${qs}` });
+  }
+
   async function handleAccept() {
     if (!signIn || !signUp) return;
     setState("accepting");
+
+    // Multi-session guard: if any signed-in sessions exist on this client but
+    // no active user is set (e.g. mid-session-switch), do not proceed with the
+    // ticket sign-in — it would silently add a second session. Show the Wrong
+    // account card for the first existing session instead.
+    const signedInSessions = clerkClient?.signedInSessions ?? [];
+    if (signedInSessions.length > 0) {
+      setUserEmail(signedInSessions[0].publicUserData.identifier);
+      setState("wrong_account");
+      return;
+    }
 
     const { error: siError } = await signIn.ticket({ ticket });
 
@@ -287,7 +309,7 @@ export default function AcceptInvitePage() {
 
     if (!ticket) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      showError("No invitation token found. This link may be invalid or expired.");
+      showError("Open the link from your invitation email again.");
       return;
     }
 
@@ -367,7 +389,7 @@ export default function AcceptInvitePage() {
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
           <button
             type="button"
-            onClick={() => void signOut({ redirectUrl: window.location.href })}
+            onClick={() => void handleSignOutAndContinue()}
             className="w-full rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg transition-opacity hover:opacity-90"
           >
             Sign out and continue
