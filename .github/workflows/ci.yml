@@ -2,14 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, staging, ci/**]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-api:
-    name: Build & Typecheck (api)
+  api:
+    name: API (typecheck + integration suite)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -26,15 +34,27 @@ jobs:
 
       - name: Typecheck (api)
         working-directory: apps/api
-        run: npm run typecheck
+        run: npx tsc --noEmit --incremental false
 
-      - name: Build (api)
-        working-directory: apps/api
-        run: npm run build
+      - name: Integration suite
+        # run-suite.sh resolves REPO relative to the script location, so it
+        # works correctly regardless of the calling working directory.
+        run: bash apps/api/scripts/run-suite.sh
 
-  build-web:
-    name: Build & Typecheck (web)
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-logs
+          path: |
+            /tmp/test-out.txt
+            /tmp/ts.log
+          if-no-files-found: ignore
+
+  web:
+    name: Web (typecheck + lint + test + build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -52,13 +72,24 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck (web)
-        run: pnpm --filter web run typecheck
+        run: pnpm --filter web exec tsc --noEmit --incremental false
+
+      - name: Lint (web)
+        run: pnpm --filter web run lint
+
+      - name: Test (web)
+        run: pnpm --filter web exec vitest run
+
+      - name: Build (web)
+        run: pnpm --filter web build
         env:
           NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
-      - name: Build (web)
-        run: pnpm --filter web run build
-        env:
-          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-logs
+          path: /tmp/test-out.txt
+          if-no-files-found: ignore

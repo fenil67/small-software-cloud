@@ -66,6 +66,8 @@ builds from repo root with Railpack (Node 20, pnpm 9, `pnpm install --frozen-loc
 
 ## The gate (run all, report each with counts)
 
+GitHub Actions runs the full gate automatically on push to `main`, `staging`, and `ci/**` branches, and on PRs to `main`/`staging` (`.github/workflows/ci.yml`). Still run it locally before marking work done.
+
 ```
 pnpm --filter web build
 pnpm --filter web exec vitest run          # web tests (count must go up when web code changes)
@@ -146,6 +148,7 @@ git status                                  # only files for this task
 
 - Last updated: 2026-11-28. Tests: API 1391, web 437.
 - Live: auth (Google, GitHub, email code), workspaces (create, switch, delete with full cleanup), apps, sharing with invite emails, API keys with scopes, account settings (profile, emails, connected accounts, sessions, reverification, delete account), admin overview and activity, kill switch, watchdog, staging environment. Workspace members and roles (feat/workspace-members, merged to staging). UI polish (feat/ui-polish, merged to staging). Build logs (feat/app-logs, merged to staging). Environment variables (feat/app-env, merged to staging).
+- Branch ci/run-tests: `.github/workflows/ci.yml` replaced. Two jobs (`api`, `web`), Node 20, pnpm 9. Triggers: push to main/staging/ci/**; PRs to main/staging. `api` job runs `npm ci`, typecheck (`--incremental false`), then `run-suite.sh` (Docker Postgres 18.6 on ubuntu-latest). `web` job runs pnpm frozen install, typecheck, lint, vitest, build. Both upload `/tmp/test-out.txt` + `/tmp/ts.log` on failure. No new secrets required beyond existing `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`. actionlint not available locally; workflow not run on GitHub.
 - Branch fix/unique-workspace-names: `OnboardingClient.handleCreate` calls `checkDuplicateName` (paged `getOrganizationMemberships`, `pageSize`/`initialPage`/`total_count`) before `createOrganization`. Duplicate (trimmed, case-insensitive) → "You already have a workspace with this name." error; membership load failure → "Could not load your workspaces." error. No other create/rename path exists in app code (confirmed: `createOrganization` only in `OnboardingClient`; `updateOrganization` only in Clerk node_modules). Tests: 5 new (exact match, different case + spaces, page-2 duplicate, unique name proceeds, membership fail). Mutation: remove duplicate check → 4 tests fail.
 - Repo search: `createOrganization` in app source: only `apps/web/app/(onboarding)/onboarding/OnboardingClient.tsx`. `updateOrganization`/rename: not present in app source.
 - Next (see Notion Work Board): admin users/workspaces/apps → utir.dev landing, Privacy, Terms, Docs → weeks 5-6 security (CI scans, integration suite in CI, internal red team) → closed beta.
