@@ -13,8 +13,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
+import { useSearchParams } from "next/navigation";
+import { useUser, useClerk } from "@clerk/nextjs";
 
 // ── Global mocks ──────────────────────────────────────────────────────────────
+
+const mockNavigateHard = vi.hoisted(() => vi.fn());
+vi.mock("../../../lib/navigate", () => ({ navigateHard: mockNavigateHard }));
 
 const mockRouterRefresh = vi.fn();
 const mockRouterReplace = vi.fn();
@@ -76,6 +81,7 @@ vi.mock("@clerk/nextjs", () => ({
   })),
   useClerk: vi.fn(() => ({
     signOut: mockSignOut,
+    setActive: mockSetActive,
     get session() { return { lastActiveOrganizationId: _mockSessionOrgId }; },
   })),
   useSession: vi.fn(() => ({ session: null })),
@@ -142,6 +148,7 @@ vi.mock("../../../app/(dashboard)/keys/actions", () => ({
 }));
 
 beforeEach(() => {
+  mockNavigateHard.mockReset();
   mockRouterRefresh.mockReset();
   mockRouterReplace.mockReset();
   mockRedirect.mockReset();
@@ -1014,7 +1021,7 @@ describe("Sidebar – workspace switch flow", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /beta inc/i }));
     });
-    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
   });
 
   it("trigger button shows Switching… and is disabled while in progress", async () => {
@@ -1105,7 +1112,7 @@ describe("OnboardingClient – BUG B: navigation after workspace creation", () =
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /continue/i }));
     });
-    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
   });
 
   it("failure shows error message and does not navigate", async () => {
@@ -1344,7 +1351,7 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     });
     // Mutation: remove the catch block → setActive throw propagates to outer catch →
     // error shown, navigation skipped → this assertion fails.
-    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
   });
 
   it("handleJoin: setActive called with redirectUrl: '/apps' (mutation: remove option → test fails)", async () => {
@@ -1382,7 +1389,7 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     render(<OnboardingClient firstName={null} />);
     const joinBtn = screen.getByRole("button", { name: /join/i });
     await act(async () => { fireEvent.click(joinBtn); });
-    await waitFor(() => expect(mockAssign).toHaveBeenCalledWith("/apps"));
+    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
   });
 
   it("createOrganization throws → error shown, does NOT navigate", async () => {
@@ -1561,6 +1568,149 @@ describe("DashboardLayout – sidebar fixed, main scrolls (Bug #5)", () => {
     const main = document.querySelector("main") as HTMLElement | null;
     expect(main).not.toBeNull();
     expect(main!.className).toContain("dashboard-main");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DashboardShell org-switch (Fix 2)
+// When /apps?org=<orgId> is loaded, DashboardShell checks membership and
+// switches the active org via setActive, then navigates to /apps (clean URL).
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("DashboardShell org-switch (Fix 2)", () => {
+  // DS1: ?org=org_bbb, member, active=org_aaa → setActive + navigateHard
+  it("DS1: member of target org, active org differs → setActive + navigateHard('/apps')", async () => {
+    _mockSessionOrgId = "org_aaa";
+    const mockGetMemberships = vi.fn().mockResolvedValue({
+      data: [{ organization: { id: "org_bbb" } }],
+      total_count: 1,
+    });
+    vi.mocked(useUser).mockReturnValueOnce({
+      user: { getOrganizationMemberships: mockGetMemberships },
+      isLoaded: true,
+      isSignedIn: true,
+    } as unknown as ReturnType<typeof useUser>);
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => k === "org" ? "org_bbb" : null,
+    } as ReturnType<typeof useSearchParams>);
+
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+
+    await waitFor(() =>
+      expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_bbb" }),
+    );
+    expect(mockNavigateHard).toHaveBeenCalledWith("/apps");
+  });
+
+  // DS2: ?org=org_aaa, same as active → no setActive, no navigateHard
+  it("DS2: target org same as active org → no setActive, no navigateHard", async () => {
+    _mockSessionOrgId = "org_aaa";
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => k === "org" ? "org_aaa" : null,
+    } as ReturnType<typeof useSearchParams>);
+
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+
+    // Let effects run; org-switch should be a no-op.
+    await act(async () => { /* settle effects */ });
+    expect(mockSetActive).not.toHaveBeenCalled();
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+
+  // DS3: ?org=org_bbb, not a member → dropOrgParam only, no setActive
+  it("DS3: not a member of target org → no setActive, no navigateHard", async () => {
+    _mockSessionOrgId = "org_aaa";
+    const mockGetMemberships = vi.fn().mockResolvedValue({
+      data: [],
+      total_count: 0,
+    });
+    vi.mocked(useUser).mockReturnValueOnce({
+      user: { getOrganizationMemberships: mockGetMemberships },
+      isLoaded: true,
+      isSignedIn: true,
+    } as unknown as ReturnType<typeof useUser>);
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => k === "org" ? "org_bbb" : null,
+    } as ReturnType<typeof useSearchParams>);
+
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+
+    await act(async () => { /* settle effects */ });
+    expect(mockSetActive).not.toHaveBeenCalled();
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+
+  // DS4: setActive throws → dropOrgParam, no navigateHard
+  it("DS4: member but setActive throws → no navigateHard (stays on page)", async () => {
+    _mockSessionOrgId = "org_aaa";
+    const mockGetMemberships = vi.fn().mockResolvedValue({
+      data: [{ organization: { id: "org_bbb" } }],
+      total_count: 1,
+    });
+    vi.mocked(useUser).mockReturnValueOnce({
+      user: { getOrganizationMemberships: mockGetMemberships },
+      isLoaded: true,
+      isSignedIn: true,
+    } as unknown as ReturnType<typeof useUser>);
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => k === "org" ? "org_bbb" : null,
+    } as ReturnType<typeof useSearchParams>);
+    mockSetActive.mockRejectedValueOnce(new Error("clerk_set_active_failed"));
+
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+
+    await waitFor(() => expect(mockSetActive).toHaveBeenCalled());
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+
+  // DS5: sessionStorage guard prevents re-activation for same org
+  // Mutation (a): remove the dsSsGet(ssKey) guard from DashboardShell →
+  // setActive would be called even with the key set → this test fails.
+  it("DS5: sessionStorage guard blocks re-activation (mutation-a guard)", async () => {
+    _mockSessionOrgId = "org_aaa";
+    const mockGetMemberships = vi.fn().mockResolvedValue({
+      data: [{ organization: { id: "org_bbb" } }],
+      total_count: 1,
+    });
+    vi.mocked(useUser).mockReturnValueOnce({
+      user: { getOrganizationMemberships: mockGetMemberships },
+      isLoaded: true,
+      isSignedIn: true,
+    } as unknown as ReturnType<typeof useUser>);
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => k === "org" ? "org_bbb" : null,
+    } as ReturnType<typeof useSearchParams>);
+
+    // Pre-seed sessionStorage as if this org was already activated in this tab.
+    sessionStorage.setItem("org-activate-v1:org_bbb", "1");
+
+    render(
+      <DashboardShell isAdmin={false} openAlertCount={0}>
+        <div>content</div>
+      </DashboardShell>,
+    );
+
+    await act(async () => { /* settle effects */ });
+
+    // Guard must prevent setActive and navigateHard from being called.
+    expect(mockSetActive).not.toHaveBeenCalled();
+    expect(mockNavigateHard).not.toHaveBeenCalled();
   });
 });
 

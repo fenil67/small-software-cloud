@@ -6,7 +6,7 @@ import { useSignIn, useSignUp, useClerk, useUser, useSession } from "@clerk/next
 import { AuthCard } from "../../../components/auth/AuthCard";
 import { navigateHard } from "../../../lib/navigate";
 
-type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error";
+type PageState = "init" | "ready" | "accepting" | "wrong_account" | "done" | "error" | "used_invitation";
 
 const SS_PREFIX = "accept-invite-v1:";
 
@@ -55,6 +55,9 @@ export default function AcceptInvitePage() {
   // Even if they became empty, hasRun.current prevents the effect from re-running.
   const ticket = params.get("__clerk_ticket") ?? params.get("__clerk_invitation_token") ?? "";
   const targetOrgId = params.get("org") ?? "";
+  // __clerk_status is set by FAPI when redirecting back after processing a ticket.
+  // Any non-empty value means the invitation flow came through FAPI (used ticket path).
+  const clerkStatus = params.get("__clerk_status") ?? "";
 
   const { signIn } = useSignIn();
   const { signUp } = useSignUp();
@@ -86,6 +89,12 @@ export default function AcceptInvitePage() {
     navigateHard(path);
   }
 
+  // Navigation destination for accept flows: include ?org= so DashboardShell
+  // can verify the org is active after a new session is established.
+  function appsDestination(): string {
+    return targetOrgId ? `/apps?org=${encodeURIComponent(targetOrgId)}` : "/apps";
+  }
+
   function showError(msg: string, code = "") {
     setErrorMsg(msg);
     setErrorCode(code);
@@ -94,12 +103,26 @@ export default function AcceptInvitePage() {
     if (ticket) ssSet(SS_PREFIX + ticket, `error:${code}`);
   }
 
-  // Strip ticket/org params from the address bar immediately on mount — BEFORE
+  /**
+   * Check org membership with paging. Single sweep — no polling, no reload.
+   * Uses ClerkPaginationParams (pageSize/initialPage) and ClerkPaginatedResponse (total_count).
+   */
+  async function isMemberOfPaged(u: NonNullable<typeof user>, orgId: string): Promise<boolean> {
+    const PAGE_SIZE = 50;
+    for (let page = 1; page <= 20; page++) {
+      const { data, total_count } = await u.getOrganizationMemberships({ pageSize: PAGE_SIZE, initialPage: page });
+      if (data.some((m: { organization: { id: string } }) => m.organization.id === orgId)) return true;
+      if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return false;
+    }
+    return false;
+  }
+
+  // Strip ticket/org/status params from the address bar immediately on mount — BEFORE
   // any async work. This ensures that when Clerk's ClerkProvider calls
   // router.refresh() after setActive, the RSC re-fetch sees a clean URL and
   // does not trigger the Clerk handshake redirect loop.
   useEffect(() => {
-    if (!ticket) return;
+    if (!ticket && !clerkStatus) return;
     const url = new URL(window.location.href);
     url.searchParams.delete("__clerk_ticket");
     url.searchParams.delete("__clerk_invitation_token");
@@ -204,7 +227,7 @@ export default function AcceptInvitePage() {
       if (isMember) {
         setState("done");
         ssSet(SS_PREFIX + ticket, "done");
-        safeNavigate("/apps");
+        safeNavigate(appsDestination());
       } else {
         const code = extractCode(error);
         console.error("[accept-invite]", code);
@@ -217,7 +240,7 @@ export default function AcceptInvitePage() {
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    safeNavigate("/apps");
+    safeNavigate(appsDestination());
   }
 
   async function finishSignUp(sessionId: string | null) {
@@ -233,7 +256,7 @@ export default function AcceptInvitePage() {
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
-    safeNavigate("/apps");
+    safeNavigate(appsDestination());
   }
 
   /**
@@ -330,8 +353,39 @@ export default function AcceptInvitePage() {
     hasRun.current = true;
 
     if (!ticket) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      showError("Open the link from your invitation email again.");
+      if (!clerkStatus) {
+        // No ticket and no __clerk_status: direct navigation without an invite link.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        showError("Open the link from your invitation email again.");
+        return;
+      }
+      // __clerk_status present (any value): arrived via FAPI from a used invitation link.
+      // Check if the signed-in user is already a member of the target org.
+      if (!userId) {
+        // Not signed in — show used-invitation card with sign-in link.
+        setState("used_invitation");
+        return;
+      }
+      // Signed in — check membership once (single sweep, no polling, no reload).
+      void (async () => {
+        const currentUser = userRef.current;
+        if (!currentUser) {
+          setState("used_invitation");
+          return;
+        }
+        try {
+          const isMember = targetOrgId ? await isMemberOfPaged(currentUser, targetOrgId) : false;
+          if (isMember) {
+            try { await setActive({ organization: targetOrgId }); } catch { /* non-fatal */ }
+            setState("done");
+            safeNavigate("/apps");
+          } else {
+            setState("used_invitation");
+          }
+        } catch {
+          setState("used_invitation");
+        }
+      })();
       return;
     }
 
@@ -340,7 +394,7 @@ export default function AcceptInvitePage() {
     // a full reload before the new page has loaded.
     const stored = ssGet(SS_PREFIX + ticket);
     if (stored === "done") {
-      safeNavigate("/apps");
+      safeNavigate(appsDestination());
       return;
     }
     if (stored?.startsWith("error:")) {
@@ -398,6 +452,23 @@ export default function AcceptInvitePage() {
         <p style={{ margin: 0, fontSize: "13px", color: "var(--fg-3)", textAlign: "center" }}>
           Invitation accepted. Redirecting…
         </p>
+      </AuthCard>
+    );
+  }
+
+  if (state === "used_invitation") {
+    return (
+      <AuthCard title="Invitation already used" subtitle="">
+        <p style={{ margin: 0, fontSize: "13px", color: "var(--fg-2)", textAlign: "center", marginBottom: "16px" }}>
+          This invitation has already been used. If you left or were removed from the workspace,
+          ask an admin to send you a new invitation.
+        </p>
+        <a
+          href={userId ? "/apps" : "/sign-in"}
+          className="w-full rounded-xl bg-surface-2 px-4 py-2.5 text-sm font-semibold text-fg transition-opacity hover:opacity-90 text-center block"
+        >
+          {userId ? "Go to my apps" : "Sign in"}
+        </a>
       </AuthCard>
     );
   }
