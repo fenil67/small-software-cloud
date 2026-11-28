@@ -194,26 +194,21 @@ describe("click Accept → success → setActive with session + org (ROOT CAUSE 
   });
 });
 
-// ── 3. finishSignIn path: finalize fails + IS member → navigates (M-member) ───
-// This tests checkMembership in finishSignIn. We simulate the scenario where
-// the user is already signed in (Clerk's ticket() detected an existing session)
-// but finalize() errored. The user IS a member of the invited org.
-// Since the page auto-detects the signed-in state and goes through detectSignedInState,
-// and the user has no pending invitation but IS a member, it navigates.
+// ── 3. Signed in, valid ticket, no matching invite → wrong_account ────────────
+// With a valid __clerk_ticket present, no matching pending invitation means the
+// invitation belongs to a different account — show wrong_account regardless of
+// whether the signed-in user is already a member.
 
-describe("finishSignIn fallback: IS member of invited org → navigates (M-member)", () => {
-  it("navigates when user has no pending invitation but IS a member of the org", async () => {
+describe("valid ticket, signed in, no matching invite → wrong_account (Fix3)", () => {
+  it("shows wrong_account card when no pending invitation matches the org", async () => {
     mockSignedIn();
-    // No pending invitation for this org
     mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
-    // But IS a member
-    mockGetOrganizationMemberships.mockResolvedValue({
-      data: [{ organization: { id: "org_xyz" } }],
-    });
 
     render(<AcceptInvitePage />);
-    await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
-    expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
+
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    expect(mockSetActive).not.toHaveBeenCalled();
   });
 });
 
@@ -294,19 +289,51 @@ describe("signed in with two pending invitations → only matching one accepted"
   });
 });
 
-// ── 8. Signed in, ticket already used → already a member → navigates ──────────
+// ── 8. Valid ticket, signed in, member, no matching invite → wrong_account ────
+// Regression test for the fix: even when the user IS a member of the org,
+// a valid ticket with no matching pending invitation = wrong account.
 
-describe("signed in, already a member → navigates (ROOT CAUSE TEST 2)", () => {
-  it("navigates when no pending invitation but already a member", async () => {
+describe("valid ticket, signed in, IS member, no matching invite → wrong_account", () => {
+  it("shows wrong_account when already a member but no pending invitation matches", async () => {
     mockSignedIn();
     mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    // IS a member — but this should NOT trigger navigation any more
     mockGetOrganizationMemberships.mockResolvedValue({
       data: [{ organization: { id: "org_xyz" } }],
     });
 
     render(<AcceptInvitePage />);
 
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+    expect(mockSetActive).not.toHaveBeenCalled();
+  });
+});
+
+// ── 8b. Matching invite on page 2 → accept called, navigate ──────────────────
+// Verifies findMatchingInvitationPaged fetches beyond page 1.
+
+describe("matching invite on page 2 → accept called, navigate (Fix3-page2)", () => {
+  it("accepts invitation found on the second page", async () => {
+    const mockAcceptOrg = vi.fn().mockResolvedValue({});
+    mockSignedIn();
+
+    // Page 1: 50 items (no match), total_count = 51 → triggers page 2
+    const page1Items = Array.from({ length: 50 }, (_, i) => ({
+      accept: vi.fn(),
+      publicOrganizationData: { id: `org_other_${i}` },
+    }));
+    mockGetOrganizationInvitations
+      .mockResolvedValueOnce({ data: page1Items, total_count: 51 })
+      .mockResolvedValueOnce({
+        data: [{ accept: mockAcceptOrg, publicOrganizationData: { id: "org_xyz" } }],
+        total_count: 51,
+      });
+
+    render(<AcceptInvitePage />);
+
     await waitFor(() => expect(mockNavigateHard).toHaveBeenCalledWith("/apps"));
+    expect(mockAcceptOrg).toHaveBeenCalled();
     expect(mockSetActive).toHaveBeenCalledWith({ organization: "org_xyz" });
   });
 });

@@ -117,6 +117,33 @@ export default function AcceptInvitePage() {
     return false;
   }
 
+  /**
+   * Page through the user's pending invitations to find one for orgId.
+   * Returns the matching invitation object or null.
+   */
+  async function findMatchingInvitationPaged(u: NonNullable<typeof user>, orgId: string) {
+    type Inv = { accept(): Promise<unknown>; publicOrganizationData: { id: string } };
+    type InvUser = {
+      getOrganizationInvitations(params: {
+        status: "pending";
+        pageSize: number;
+        initialPage: number;
+      }): Promise<{ data: Inv[]; total_count: number }>;
+    };
+    const PAGE_SIZE = 50;
+    for (let page = 1; page <= 20; page++) {
+      const { data, total_count } = await (u as unknown as InvUser).getOrganizationInvitations({
+        status: "pending",
+        pageSize: PAGE_SIZE,
+        initialPage: page,
+      });
+      const match = data.find((inv) => inv.publicOrganizationData.id === orgId);
+      if (match) return match;
+      if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return null;
+    }
+    return null;
+  }
+
   // Strip all invite-related params from the address bar immediately on mount —
   // BEFORE any async work. ticket, targetOrgId, and clerkStatus are captured
   // above from useSearchParams() at render time and remain valid after the strip.
@@ -175,8 +202,7 @@ export default function AcceptInvitePage() {
     const currentUser = userRef.current;
     if (!currentUser) return;
     try {
-      const { data: invitations } = await currentUser.getOrganizationInvitations({ status: "pending" });
-      const matching = invitations.find((inv) => inv.publicOrganizationData.id === targetOrgId);
+      const matching = await findMatchingInvitationPaged(currentUser, targetOrgId);
 
       if (matching) {
         try {
@@ -198,20 +224,9 @@ export default function AcceptInvitePage() {
         return;
       }
 
-      // No pending invitation — check if already a member
-      const { data: memberships } = await currentUser.getOrganizationMemberships();
-      const isMember = memberships.some((m) => m.organization.id === targetOrgId);
-      if (isMember) {
-        setState("done");
-        ssSet(SS_PREFIX + ticket, "done");
-        try {
-          await setActive({ organization: targetOrgId });
-        } catch { /* non-fatal */ }
-        safeNavigate("/apps");
-        return;
-      }
-
-      // Wrong account — show card immediately, do not loop
+      // No matching pending invitation for this org — with a valid __clerk_ticket
+      // present, this means the invitation belongs to a different account.
+      // Show wrong_account regardless of whether the signed-in user is already a member.
       setUserEmail(currentUser.primaryEmailAddress?.emailAddress ?? "");
       setState("wrong_account");
     } catch {
