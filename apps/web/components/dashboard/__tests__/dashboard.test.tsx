@@ -53,6 +53,7 @@ const mockSetActive = vi.fn();
 const mockSignOut = vi.fn();
 const mockCreateOrganization = vi.fn();
 const mockGetToken = vi.fn().mockResolvedValue("test-token");
+const mockGetOrgMembershipsOnboarding = vi.fn();
 // _mockSessionOrgId is read by the useClerk().session getter — update it in tests
 // to simulate clerk.session (SignedInSessionResource.lastActiveOrganizationId) changing.
 let _mockSessionOrgId: string | null = "org_aaa";
@@ -77,6 +78,7 @@ vi.mock("@clerk/nextjs", () => ({
       firstName: "Alice",
       lastName: "Smith",
       primaryEmailAddress: { emailAddress: "alice@example.com" },
+      getOrganizationMemberships: mockGetOrgMembershipsOnboarding,
     },
   })),
   useClerk: vi.fn(() => ({
@@ -165,6 +167,7 @@ beforeEach(() => {
   mockApiFetch.mockReset().mockResolvedValue([]);
   mockGetToken.mockReset().mockResolvedValue("test-token");
   mockCreateOrganization.mockReset();
+  mockGetOrgMembershipsOnboarding.mockReset().mockResolvedValue({ data: [], total_count: 0 });
   if (typeof localStorage !== "undefined" && typeof localStorage.clear === "function") localStorage.clear();
   if (typeof sessionStorage !== "undefined" && typeof sessionStorage.clear === "function") sessionStorage.clear();
 });
@@ -1401,6 +1404,86 @@ describe("OnboardingClient – BUG B v2: setActive/session errors do not block n
     });
     expect(await screen.findByRole("alert")).toBeInTheDocument();
     expect(mockAssign).not.toHaveBeenCalled();
+  });
+});
+
+// ── OnboardingClient – unique workspace name enforcement ─────────────────────
+
+describe("OnboardingClient – unique workspace names", () => {
+  it("duplicate name (exact match) → error shown, createOrganization not called", async () => {
+    mockGetOrgMembershipsOnboarding.mockResolvedValue({
+      data: [{ organization: { name: "My Workspace" } }],
+      total_count: 1,
+    });
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("already have a workspace with this name");
+    expect(mockCreateOrganization).not.toHaveBeenCalled();
+  });
+
+  it("duplicate name (different case + extra spaces) → error, no create", async () => {
+    mockGetOrgMembershipsOnboarding.mockResolvedValue({
+      data: [{ organization: { name: "My Workspace" } }],
+      total_count: 1,
+    });
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "  MY WORKSPACE  " } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("already have a workspace with this name");
+    expect(mockCreateOrganization).not.toHaveBeenCalled();
+  });
+
+  it("duplicate on page 2 → error, no create", async () => {
+    const page1Items = Array.from({ length: 50 }, (_, i) => ({
+      organization: { name: `Workspace ${i}` },
+    }));
+    mockGetOrgMembershipsOnboarding
+      .mockResolvedValueOnce({ data: page1Items, total_count: 51 })
+      .mockResolvedValueOnce({
+        data: [{ organization: { name: "My Workspace" } }],
+        total_count: 51,
+      });
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("already have a workspace with this name");
+    expect(mockCreateOrganization).not.toHaveBeenCalled();
+  });
+
+  it("unique name → createOrganization called as normal", async () => {
+    mockGetOrgMembershipsOnboarding.mockResolvedValue({
+      data: [{ organization: { name: "Other Workspace" } }],
+      total_count: 1,
+    });
+    mockCreateOrganization.mockResolvedValue({ id: "org_new" });
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    await waitFor(() => expect(mockCreateOrganization).toHaveBeenCalledWith({ name: "My Workspace" }));
+  });
+
+  it("membership load fails → error shown, no create", async () => {
+    mockGetOrgMembershipsOnboarding.mockRejectedValue(new Error("network error"));
+    render(<OnboardingClient firstName={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "My Workspace" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alert").textContent).toContain("Could not load your workspaces");
+    expect(mockCreateOrganization).not.toHaveBeenCalled();
   });
 });
 

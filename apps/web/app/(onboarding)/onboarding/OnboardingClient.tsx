@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { useOrganizationList, useClerk } from "@clerk/nextjs";
+import { useOrganizationList, useClerk, useUser } from "@clerk/nextjs";
 import { Logo } from "../../../components/brand/Logo";
 import { ThemeSwitch } from "../../../components/theme/ThemeSwitch";
 import { navigateHard } from "../../../lib/navigate";
@@ -18,6 +18,7 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
   const { createOrganization, setActive, userInvitations } = useOrganizationList({
     userInvitations: { pageSize: 10 },
   });
+  const { user } = useUser();
 
   const defaultName = forceNew ? "" : (firstName ? `${firstName}'s workspace` : "");
   const [name, setName] = useState(defaultName);
@@ -27,6 +28,29 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
 
   const trimmed = name.trim();
 
+  /**
+   * Page through the user's org memberships to check for a name collision.
+   * Returns "duplicate" if a match is found, "ok" if not, "error" on failure.
+   * Uses ClerkPaginationParams (pageSize/initialPage) + total_count.
+   */
+  async function checkDuplicateName(candidateName: string): Promise<"duplicate" | "ok" | "error"> {
+    if (!user) return "error";
+    const normalized = candidateName.trim().toLowerCase();
+    const PAGE_SIZE = 50;
+    try {
+      for (let page = 1; page <= 20; page++) {
+        const { data, total_count } = await user.getOrganizationMemberships({ pageSize: PAGE_SIZE, initialPage: page });
+        if (data.some((m: { organization: { name: string } }) => m.organization.name.trim().toLowerCase() === normalized)) {
+          return "duplicate";
+        }
+        if (data.length < PAGE_SIZE || page * PAGE_SIZE >= total_count) return "ok";
+      }
+      return "ok";
+    } catch {
+      return "error";
+    }
+  }
+
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!trimmed) { setError("Workspace name is required."); return; }
@@ -34,6 +58,15 @@ export function OnboardingClient({ firstName, forceNew = false }: Props) {
     setError(undefined);
     setLoading(true);
     try {
+      const dupCheck = await checkDuplicateName(trimmed);
+      if (dupCheck === "duplicate") {
+        setError("You already have a workspace with this name.");
+        return;
+      }
+      if (dupCheck === "error") {
+        setError("Could not load your workspaces. Please try again.");
+        return;
+      }
       console.info("[workspace] create start");
       const org = await createOrganization?.({ name: trimmed });
       if (!org) throw new Error("create_failed");
