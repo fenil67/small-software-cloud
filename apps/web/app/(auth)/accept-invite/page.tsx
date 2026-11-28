@@ -117,20 +117,19 @@ export default function AcceptInvitePage() {
     return false;
   }
 
-  // Strip ticket/org/status params from the address bar immediately on mount — BEFORE
-  // any async work. This ensures that when Clerk's ClerkProvider calls
-  // router.refresh() after setActive, the RSC re-fetch sees a clean URL and
-  // does not trigger the Clerk handshake redirect loop.
+  // Strip all invite-related params from the address bar immediately on mount —
+  // BEFORE any async work. ticket, targetOrgId, and clerkStatus are captured
+  // above from useSearchParams() at render time and remain valid after the strip.
+  // Strip runs unconditionally so it also covers the __clerk_status-only path
+  // (used-link redirect), where router.refresh() after setActive would
+  // otherwise find params still in the router state and re-trigger the branch.
   useEffect(() => {
-    if (!ticket && !clerkStatus) return;
     const url = new URL(window.location.href);
     url.searchParams.delete("__clerk_ticket");
     url.searchParams.delete("__clerk_invitation_token");
     url.searchParams.delete("__clerk_status");
     url.searchParams.delete("org");
-    // Use pathname+search (relative) so this is safe in all environments.
     history.replaceState(null, "", url.pathname + url.search);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 15-second hard timeout: if still in a pending state, show error.
@@ -237,6 +236,9 @@ export default function AcceptInvitePage() {
     }
     setState("done");
     ssSet(SS_PREFIX + ticket, "done");
+    // setActive is called ONLY here and in finishSignUp — the two ticket-based flows.
+    // The __clerk_status (used-link) path does NOT call setActive to avoid triggering
+    // Clerk's router.refresh() loop on the accept-invite page.
     try {
       await setActive({ session: sessionId ?? undefined, organization: targetOrgId || undefined });
     } catch { /* non-fatal */ }
@@ -376,9 +378,11 @@ export default function AcceptInvitePage() {
         try {
           const isMember = targetOrgId ? await isMemberOfPaged(currentUser, targetOrgId) : false;
           if (isMember) {
-            try { await setActive({ organization: targetOrgId }); } catch { /* non-fatal */ }
+            // Do NOT call setActive here: setActive triggers Clerk's router.refresh(),
+            // which can unmount/remount this page before navigateHard fires, restarting
+            // the loop. DashboardShell handles the org switch at /apps?org=.
             setState("done");
-            safeNavigate("/apps");
+            safeNavigate(appsDestination());
           } else {
             setState("used_invitation");
           }
