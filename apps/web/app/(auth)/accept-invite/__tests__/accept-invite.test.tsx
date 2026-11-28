@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 import AcceptInvitePage from "../page";
+import { useSearchParams } from "next/navigation";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -52,6 +53,8 @@ const {
   mockUserReload,
   mockAccept,
   mockUseUser,
+  mockUseSession,
+  mockUseClerk,
 } = vi.hoisted(() => ({
   mockSetActive: vi.fn(),
   mockSignOut: vi.fn(),
@@ -64,6 +67,8 @@ const {
   mockUserReload: vi.fn(),
   mockAccept: vi.fn(),
   mockUseUser: vi.fn(),
+  mockUseSession: vi.fn(),
+  mockUseClerk: vi.fn(),
 }));
 
 vi.mock("@clerk/nextjs", () => ({
@@ -84,8 +89,9 @@ vi.mock("@clerk/nextjs", () => ({
       createdSessionId: null,
     },
   })),
-  useClerk: vi.fn(() => ({ setActive: mockSetActive, signOut: mockSignOut })),
+  useClerk: mockUseClerk,
   useUser: mockUseUser,
+  useSession: mockUseSession,
 }));
 
 vi.mock("../../../../components/auth/AuthCard", () => ({
@@ -128,6 +134,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
   mockSetActive.mockResolvedValue(undefined);
+  mockSignOut.mockResolvedValue(undefined);
   mockUserReload.mockResolvedValue(undefined);
   mockTicket.mockResolvedValue({ error: null });
   mockFinalize.mockResolvedValue({ error: null });
@@ -136,6 +143,14 @@ beforeEach(() => {
   mockAccept.mockResolvedValue({});
   mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
   mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+  // Default useClerk: no signed-in sessions on the client
+  mockUseClerk.mockReturnValue({
+    setActive: mockSetActive,
+    signOut: mockSignOut,
+    client: { signedInSessions: [] },
+  });
+  // Default useSession: session with a known id
+  mockUseSession.mockReturnValue({ isLoaded: true, isSignedIn: true, session: { id: "session_xyz" } });
   // Clear sessionStorage between tests so the storage guard doesn't interfere
   if (typeof sessionStorage !== "undefined") sessionStorage.clear();
 });
@@ -586,5 +601,92 @@ describe("code-mapping guard: organization_invitation_revoked_code maps to 'canc
     // This would fail if the mapping returned the generic message
     expect(screen.getByRole("alert").textContent).not.toContain("Could not accept");
     expect(screen.getByRole("alert").textContent).toContain("cancelled");
+  });
+});
+
+// ── 22. Wrong account: sign-out calls signOut with sessionId + ticket in URL ───
+// ROOT CAUSE FIX: previously signOut used redirectUrl: window.location.href
+// (stripped of ticket) → page reloaded with no ticket → error. Now we pass
+// sessionId to sign out only the active session, and include the ticket in the
+// redirectUrl so the signed-out Accept flow can proceed.
+
+describe("wrong account: sign-out button calls signOut with sessionId and ticket in redirectUrl", () => {
+  it("calls signOut({ sessionId, redirectUrl }) with ticket and org in redirectUrl", async () => {
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+    // Session with a known id
+    mockUseSession.mockReturnValue({ isLoaded: true, isSignedIn: true, session: { id: "session_xyz" } });
+
+    render(<AcceptInvitePage />);
+    const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
+    fireEvent.click(signOutBtn);
+
+    await waitFor(() =>
+      expect(mockSignOut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: "session_xyz",
+          redirectUrl: expect.stringContaining("__clerk_ticket=ticket_abc"),
+        }),
+      ),
+    );
+    expect(mockSignOut).toHaveBeenCalledWith(
+      expect.objectContaining({ redirectUrl: expect.stringContaining("org=org_xyz") }),
+    );
+    // Should NOT redirect to /apps — that's left to the next page load
+    expect(mockNavigateHard).not.toHaveBeenCalled();
+  });
+});
+
+// ── 23. Missing ticket → shows friendly "open the link" message ───────────────
+// When the page is opened without a ticket (e.g. user typed /accept-invite
+// directly), the error should say "Open the link from your invitation email".
+
+describe("missing ticket → shows friendly open-link message", () => {
+  it("shows 'Open the link' message when no ticket in URL", async () => {
+    // Override useSearchParams to return no ticket
+    vi.mocked(useSearchParams).mockReturnValueOnce({
+      get: (k: string) => {
+        if (k === "org") return "org_xyz";
+        return null;
+      },
+    } as ReturnType<typeof useSearchParams>);
+    mockNotSignedIn();
+
+    render(<AcceptInvitePage />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("Open the link from your invitation email");
+  });
+});
+
+// ── 24. Multi-session guard: signed-in sessions prevent ticket sign-in ─────────
+// If clerkClient.signedInSessions is non-empty but no active user (e.g. during
+// session switching), clicking Accept must show the Wrong account card, NOT call
+// signIn.ticket(). Without this guard a ticket sign-in would silently add a
+// second session.
+// Mutation M-wa: comment out the guard → signIn.ticket() IS called → test fails.
+
+describe("multi-session guard: existing sessions show wrong_account before ticket sign-in", () => {
+  it("shows wrong_account card and does not call ticket() when signedInSessions exist", async () => {
+    // No active user (Clerk shows user as null mid-session-switch)
+    mockNotSignedIn();
+    // But a signed-in session exists on the client
+    mockUseClerk.mockReturnValue({
+      setActive: mockSetActive,
+      signOut: mockSignOut,
+      client: {
+        signedInSessions: [{ id: "session_other", publicUserData: { identifier: "other@test.com" } }],
+      },
+    });
+
+    render(<AcceptInvitePage />);
+    const btn = await screen.findByRole("button", { name: /accept invitation/i });
+    fireEvent.click(btn);
+
+    // Wrong account card must appear
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    // ticket() must NEVER be called — that would have silently added a session
+    expect(mockTicket).not.toHaveBeenCalled();
   });
 });
