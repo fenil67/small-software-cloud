@@ -604,36 +604,59 @@ describe("code-mapping guard: organization_invitation_revoked_code maps to 'canc
   });
 });
 
-// ── 22. Wrong account: sign-out calls signOut with sessionId + ticket in URL ───
-// ROOT CAUSE FIX: previously signOut used redirectUrl: window.location.href
-// (stripped of ticket) → page reloaded with no ticket → error. Now we pass
-// sessionId to sign out only the active session, and include the ticket in the
-// redirectUrl so the signed-out Accept flow can proceed.
+// ── 22. Wrong account: sign-out calls signOut(sessionId only) + navigateHard ───
+// ROOT CAUSE FIX: Clerk's redirectUrl after signOut does not fire reliably
+// (same class as setActive navigation). Fix: await signOut({ sessionId }) with
+// NO redirectUrl, then call navigateHard ourselves with the ticket in the URL.
 
-describe("wrong account: sign-out button calls signOut with sessionId and ticket in redirectUrl", () => {
-  it("calls signOut({ sessionId, redirectUrl }) with ticket and org in redirectUrl", async () => {
+describe("wrong account: sign-out calls signOut with sessionId only, then navigateHard with ticket URL", () => {
+  it("calls signOut({ sessionId }) without redirectUrl, then navigateHard with ticket URL", async () => {
     mockSignedIn();
     mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
     mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
-    // Session with a known id
-    mockUseSession.mockReturnValue({ isLoaded: true, isSignedIn: true, session: { id: "session_xyz" } });
 
     render(<AcceptInvitePage />);
     const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
     fireEvent.click(signOutBtn);
 
+    // signOut must be called with the active sessionId and no redirectUrl
     await waitFor(() =>
-      expect(mockSignOut).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionId: "session_xyz",
-          redirectUrl: expect.stringContaining("__clerk_ticket=ticket_abc"),
-        }),
+      expect(mockSignOut).toHaveBeenCalledWith({ sessionId: "session_xyz" }),
+    );
+    // navigateHard must carry the original ticket and org
+    await waitFor(() =>
+      expect(mockNavigateHard).toHaveBeenCalledWith(
+        expect.stringContaining("__clerk_ticket=ticket_abc"),
       ),
     );
-    expect(mockSignOut).toHaveBeenCalledWith(
-      expect.objectContaining({ redirectUrl: expect.stringContaining("org=org_xyz") }),
+    expect(mockNavigateHard).toHaveBeenCalledWith(
+      expect.stringContaining("org=org_xyz"),
     );
-    // Should NOT redirect to /apps — that's left to the next page load
+  });
+});
+
+// ── 25. signOut throws → error shown in wrong_account card, button re-enabled ──
+
+describe("wrong account: signOut throws → error alert shown, button re-enabled", () => {
+  it("shows error alert and re-enables button when signOut rejects", async () => {
+    mockSignedIn();
+    mockGetOrganizationInvitations.mockResolvedValue({ data: [] });
+    mockGetOrganizationMemberships.mockResolvedValue({ data: [] });
+    mockSignOut.mockRejectedValueOnce(new Error("network error"));
+
+    render(<AcceptInvitePage />);
+    const signOutBtn = await screen.findByRole("button", { name: /sign out and continue/i });
+    fireEvent.click(signOutBtn);
+
+    // Error alert must appear inside the wrong_account card
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toContain("Could not sign out");
+
+    // Button must be re-enabled (not disabled)
+    const btn = screen.getByRole("button", { name: /sign out and continue/i });
+    expect(btn).not.toBeDisabled();
+
+    // navigateHard must NOT have been called
     expect(mockNavigateHard).not.toHaveBeenCalled();
   });
 });

@@ -70,6 +70,8 @@ export default function AcceptInvitePage() {
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [errorCode, setErrorCode] = useState<string>("");
   const [userEmail, setUserEmail] = useState<string>("");
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState("");
 
   // Run-once guard: prevents the detection effect from firing again if Clerk
   // briefly toggles isLoaded false→true after setActive (which would loop).
@@ -235,13 +237,33 @@ export default function AcceptInvitePage() {
   }
 
   /**
-   * Signs out only the active session and returns to this page with the ticket
-   * in the URL so the signed-out Accept flow can proceed.
-   * redirectUrl re-adds the ticket so the page loads it from searchParams again.
+   * Signs out only the active session, then navigates back to this page with
+   * the ticket in the URL so the signed-out Accept flow can proceed.
+   *
+   * We call navigateHard ourselves rather than relying on Clerk's redirectUrl,
+   * because Clerk's internal navigation does not reliably fire in this app
+   * (same issue as setActive with navigateHard documented in CLAUDE.md).
+   *
+   * ticket is read from the in-memory value captured at initial render (before
+   * history.replaceState stripped it from the URL), so it is always available
+   * here even though the address bar no longer shows it.
    */
   async function handleSignOutAndContinue() {
+    if (!ticket) {
+      showError("Open the link from your invitation email again.");
+      return;
+    }
+    setSigningOut(true);
+    setSignOutError("");
+    try {
+      await signOut({ sessionId: session?.id });
+    } catch {
+      setSigningOut(false);
+      setSignOutError("Could not sign out. Please try again.");
+      return;
+    }
     const qs = `__clerk_ticket=${encodeURIComponent(ticket)}${targetOrgId ? `&org=${encodeURIComponent(targetOrgId)}` : ""}`;
-    await signOut({ sessionId: session?.id, redirectUrl: `/accept-invite?${qs}` });
+    navigateHard(`/accept-invite?${qs}`);
   }
 
   async function handleAccept() {
@@ -387,12 +409,18 @@ export default function AcceptInvitePage() {
           This invitation is for another account. You&apos;re signed in as {userEmail}.
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {signOutError && (
+            <p role="alert" style={{ margin: 0, fontSize: "13px", color: "var(--red)", textAlign: "center" }}>
+              {signOutError}
+            </p>
+          )}
           <button
             type="button"
             onClick={() => void handleSignOutAndContinue()}
-            className="w-full rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg transition-opacity hover:opacity-90"
+            disabled={signingOut}
+            className="w-full rounded-xl bg-btn-bg px-4 py-2.5 text-sm font-semibold text-btn-fg transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            Sign out and continue
+            {signingOut ? "Signing out\u2026" : "Sign out and continue"}
           </button>
           {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
           <a
